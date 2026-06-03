@@ -198,7 +198,7 @@ class PlanExecuteEngine:
         raise RuntimeError(f"所有模型均调用失败: {last_error}")
 
     def _parse_json(self, text: str) -> dict[str, Any]:
-        """从 LLM 输出中提取 JSON。"""
+        """从 LLM 输出中提取 JSON，兼容多种格式。"""
         text = text.strip()
         if "```json" in text:
             start = text.find("```json") + 7
@@ -211,14 +211,35 @@ class PlanExecuteEngine:
             if end != -1:
                 text = text[start:end].strip()
 
+        data = None
         try:
-            return json.loads(text)
+            data = json.loads(text)
         except json.JSONDecodeError:
             brace_start = text.find("{")
             brace_end = text.rfind("}")
             if brace_start != -1 and brace_end != -1:
                 try:
-                    return json.loads(text[brace_start:brace_end + 1])
+                    data = json.loads(text[brace_start:brace_end + 1])
                 except json.JSONDecodeError:
                     pass
+
+        if data is None:
             return {"analysis": text, "steps": []}
+
+        # 标准化字段名（兼容不同 LLM 的输出格式）
+        analysis = data.get("analysis", data.get("task", data.get("summary", "")))
+
+        raw_steps = data.get("steps", [])
+        normalized_steps = []
+        for i, step in enumerate(raw_steps):
+            if isinstance(step, dict):
+                normalized_steps.append({
+                    "id": step.get("id", step.get("step_number", step.get("num", i + 1))),
+                    "task": step.get("task", step.get("description", step.get("step", str(step)))),
+                    "tool": step.get("tool", step.get("action", None)),
+                    "params": step.get("params", step.get("parameters", {})),
+                })
+            elif isinstance(step, str):
+                normalized_steps.append({"id": i + 1, "task": step, "tool": None, "params": {}})
+
+        return {"analysis": analysis, "steps": normalized_steps}
