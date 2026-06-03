@@ -371,6 +371,12 @@ class REPL:
             self._run_plan_execute_engine(optimized, model_ids)
         elif mode == "reflection":
             self._run_reflection_engine(optimized, model_ids)
+        elif mode == "plan-react":
+            self._run_plan_react_engine(optimized, model_ids)
+        elif mode == "plan-reflection":
+            self._run_plan_reflection_engine(optimized, model_ids)
+        elif mode == "react-reflection":
+            self._run_react_reflection_engine(optimized, model_ids)
         else:
             # direct 模式 — 直接调 LLM
             self._run_direct(optimized, model_ids)
@@ -438,6 +444,51 @@ class REPL:
             self.status_bar.set_last_model(model_ids[0])
         except Exception as e:
             console.print(f"[error]❌ Reflection 引擎执行失败: {e}[/error]")
+
+    def _run_plan_react_engine(self, user_input: str, model_ids: list[str]) -> None:
+        """Plan + React 组合引擎模式。"""
+        from omniagent.engine.combined_engines import PlanReactEngine
+
+        console.print("[cyan]📋🔄 Plan+React 模式: 全局规划 → 每步 ReAct 执行[/cyan]")
+
+        engine = PlanReactEngine(model_priority=model_ids, max_steps=10, react_iterations=5)
+        try:
+            result = engine.run(user_input, context=self.agent_context)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            console.print(Panel(result, title="[command]Plan+React 结果[/command]", border_style="green"))
+            self.status_bar.set_last_model(model_ids[0])
+        except Exception as e:
+            console.print(f"[error]❌ Plan+React 引擎执行失败: {e}[/error]")
+
+    def _run_plan_reflection_engine(self, user_input: str, model_ids: list[str]) -> None:
+        """Plan + Reflection 组合引擎模式。"""
+        from omniagent.engine.combined_engines import PlanReflectionEngine
+
+        console.print("[cyan]📋🔍 Plan+Reflection 模式: 规划执行 → 反思修正[/cyan]")
+
+        engine = PlanReflectionEngine(model_priority=model_ids, max_steps=10, review_rounds=2)
+        try:
+            result = engine.run(user_input, context=self.agent_context)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            console.print(Panel(result, title="[command]Plan+Reflection 结果[/command]", border_style="green"))
+            self.status_bar.set_last_model(model_ids[0])
+        except Exception as e:
+            console.print(f"[error]❌ Plan+Reflection 引擎执行失败: {e}[/error]")
+
+    def _run_react_reflection_engine(self, user_input: str, model_ids: list[str]) -> None:
+        """ReAct + Reflection 组合引擎模式。"""
+        from omniagent.engine.combined_engines import ReactReflectionEngine
+
+        console.print("[cyan]🔄🔍 React+Reflection 模式: ReAct 探索 → 反思审查[/cyan]")
+
+        engine = ReactReflectionEngine(model_priority=model_ids, react_iterations=8, review_rounds=2)
+        try:
+            result = engine.run(user_input, context=self.agent_context)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            console.print(Panel(result, title="[command]React+Reflection 结果[/command]", border_style="green"))
+            self.status_bar.set_last_model(model_ids[0])
+        except Exception as e:
+            console.print(f"[error]❌ React+Reflection 引擎执行失败: {e}[/error]")
 
     def _stream_response(self, model_id: str, messages: list[dict[str, str]]) -> None:
         """流式输出模型回复。"""

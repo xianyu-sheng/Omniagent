@@ -261,7 +261,7 @@ def _cmd_set_role(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
 register_command(
     "/mode",
     "切换或查看当前思考范式",
-    "/mode [mode_name]\n可用: direct, plan-execute, react, reflection",
+    "/mode [mode_name]\n可用: direct, plan-execute, react, reflection,\n      plan-react, plan-reflection, react-reflection",
 )
 
 @_handler("/mode")

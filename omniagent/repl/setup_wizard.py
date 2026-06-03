@@ -313,6 +313,8 @@ def _mode_scene(mode_name: str) -> str:
         "plan-execute": "复杂任务、多步骤编程",
         "react": "探索性任务、试错调试",
         "reflection": "高质量输出、代码审查",
-        "plan-react": "策略+灵活兼顾",
+        "plan-react": "全局规划+灵活执行",
+        "plan-reflection": "规划执行+质量保证",
+        "react-reflection": "探索执行+审查修正",
     }
     return scenes.get(mode_name, "")

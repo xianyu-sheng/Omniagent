@@ -56,6 +56,18 @@ BUILTIN_MODES: dict[str, ThinkingMode] = {
         name="reflection",
         description="执行后自我审查并修正，适合高质量代码生成",
     ),
+    "plan-react": ThinkingMode(
+        name="plan-react",
+        description="全局规划 + 每步 ReAct 执行，适合复杂多步骤任务",
+    ),
+    "plan-reflection": ThinkingMode(
+        name="plan-reflection",
+        description="规划执行 + 反思修正，适合需要高质量输出的任务",
+    ),
+    "react-reflection": ThinkingMode(
+        name="react-reflection",
+        description="ReAct 探索 + 反思审查，适合需要工具且要求高质量的任务",
+    ),
 }
 
 
