@@ -716,6 +716,87 @@ def _cmd_verbose(*, args: str, session_state: dict, **kwargs: Any) -> str:
     return "❌ 无法获取 REPL 状态"
 
 
+# /mcp ──────────────────────────────────────────────────
+
+register_command("/mcp", "管理 MCP 服务器连接", "/mcp [add|list|tools|remove] [args]")
+
+@_handler("/mcp")
+def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
+    repl = session_state.get("_repl")
+    if not repl:
+        return "❌ 无法获取 REPL 状态"
+
+    from omniagent.mcp.registry import MCPRegistry
+
+    parts = args.strip().split()
+    sub = parts[0] if parts else "list"
+
+    # 确保注册表存在
+    if not hasattr(repl, '_mcp_registry') or repl._mcp_registry is None:
+        repl._mcp_registry = MCPRegistry()
+        repl.agent_context.set("_mcp_registry", repl._mcp_registry)
+
+    registry = repl._mcp_registry
+
+    if sub == "add":
+        if len(parts) < 3:
+            return "用法: /mcp add <name> <command_or_url> [args...]\n示例:\n  /mcp add fs npx -y @modelcontextprotocol/server-filesystem .\n  /mcp add web http://localhost:3000/sse"
+        name = parts[1]
+        target = parts[2]
+        extra_args = parts[3:] if len(parts) > 3 else []
+
+        try:
+            if target.startswith("http"):
+                registry.add_server(name, url=target)
+            else:
+                registry.add_server(name, command=target, args=extra_args)
+
+            # 发现工具
+            tools = registry.discover_tools()
+            tool_count = len(tools.get(name, []))
+            return f"✅ MCP 服务器 '{name}' 已连接\n发现 {tool_count} 个工具"
+        except Exception as e:
+            return f"❌ 连接失败: {e}"
+
+    elif sub == "list":
+        if not registry.clients:
+            return "当前无 MCP 服务器。使用 /mcp add 添加。"
+        lines = ["═══ MCP 服务器 ═══\n"]
+        for name, client in registry.clients.items():
+            info = client.server_info
+            tool_count = len(client.tools)
+            lines.append(f"  {name}: {info.get('name', 'unknown')} v{info.get('version', '?')} ({tool_count} 工具)")
+        return "\n".join(lines)
+
+    elif sub == "tools":
+        if not registry.tool_map:
+            registry.discover_tools()
+        if not registry.tool_map:
+            return "无可用 MCP 工具"
+        lines = ["═══ MCP 工具 ═══\n"]
+        for global_name, (server, tool) in sorted(registry.tool_map.items()):
+            if ":" in global_name:
+                desc = tool.get("description", "")[:60]
+                lines.append(f"  {global_name}: {desc}")
+        return "\n".join(lines)
+
+    elif sub == "remove":
+        if len(parts) < 2:
+            return "用法: /mcp remove <name>"
+        name = parts[1]
+        if name in registry.clients:
+            registry.clients[name].close()
+            del registry.clients[name]
+            # 重建工具映射
+            registry.tool_map.clear()
+            registry.discover_tools()
+            return f"✅ MCP 服务器 '{name}' 已移除"
+        return f"❌ 未找到 MCP 服务器 '{name}'"
+
+    else:
+        return "用法: /mcp [add|list|tools|remove] [args]"
+
+
 # /status ──────────────────────────────────────────────────
 
 register_command("/status", "显示详细状态信息", "/status")

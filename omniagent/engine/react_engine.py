@@ -124,6 +124,31 @@ BUILTIN_TOOLS = {
         "description": "批量编辑多个文件（每个编辑独立验证）",
         "params": {"edits": "[{\"file_path\": \"a.py\", \"old_text\": \"...\", \"new_text\": \"...\"}, ...]"},
     },
+    "code_index": {
+        "name": "code_index",
+        "description": "搜索项目中的代码符号（函数、类、变量），基于 AST 索引",
+        "params": {"search_pattern": "要搜索的符号名或关键词", "file_path": "索引目录（可选，默认当前目录）"},
+    },
+    "ast_analyze": {
+        "name": "ast_analyze",
+        "description": "分析 Python 文件的代码结构（函数签名、类、复杂度、未使用导入）",
+        "params": {"file_path": "Python 文件路径"},
+    },
+    "refactor": {
+        "name": "refactor",
+        "description": "代码重构：跨文件重命名符号、清理未使用导入、分析重构建议",
+        "params": {"refactor_action": "rename|clean_imports|analyze", "old_name": "旧名（rename用）", "new_name": "新名（rename用）", "file_path": "文件路径（clean_imports/analyze用）"},
+    },
+    "diff_preview": {
+        "name": "diff_preview",
+        "description": "预览文件修改的 diff（不实际修改），用于确认后再操作",
+        "params": {"file_path": "文件路径", "old_text": "原文本（编辑模式）", "new_text": "新文本"},
+    },
+    "mcp_call": {
+        "name": "mcp_call",
+        "description": "调用外部 MCP 服务器工具（需先通过 /mcp add 添加服务器）",
+        "params": {"tool_name": "MCP工具名（格式: server:tool 或 tool）", "tool_args": "{参数字典}"},
+    },
 }
 
 

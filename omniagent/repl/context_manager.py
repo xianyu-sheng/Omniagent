@@ -183,18 +183,34 @@ class ContextManager:
         return summary
 
     def _llm_summary(self, model_priority: list[str], messages: list | None = None) -> str:
-        """使用 LLM 生成对话摘要。"""
+        """使用 LLM 生成智能对话摘要。"""
         try:
             from omniagent.utils.llm_client import chat_completion
 
             target = messages or self.history
             recent = target[-20:]  # 最多取 20 条
-            conversation = "\n".join(
-                f"[{t.role}] {t.content[:300]}" for t in recent
-            )
+
+            # 分层压缩：工具结果摘要优先，用户指令其次，LLM 思考最后
+            priority_parts = []
+            normal_parts = []
+            for t in recent:
+                text = t.content[:300]
+                if t.role == "user":
+                    normal_parts.append(f"[用户] {text}")
+                elif "tool" in t.role.lower() or "observation" in text.lower():
+                    priority_parts.append(f"[工具结果] {text}")
+                else:
+                    normal_parts.append(f"[助手] {text}")
+
+            conversation = "\n".join(priority_parts + normal_parts)
 
             msgs = [
-                {"role": "system", "content": "请用中文简洁地总结以下对话的要点，保留关键信息、代码片段和技术决策。不超过 500 字。"},
+                {"role": "system", "content": (
+                    "请用中文简洁总结以下对话。"
+                    "重点保留：1) 用户的核心需求 2) 执行的操作和结果 "
+                    "3) 创建/修改的文件路径 4) 遇到的错误和解决方案 "
+                    "5) 关键代码片段。不超过 500 字。"
+                )},
                 {"role": "user", "content": conversation},
             ]
 
@@ -210,23 +226,52 @@ class ContextManager:
             return self._auto_summary(messages=messages)
 
     def _auto_summary(self, messages: list | None = None) -> str:
-        """自动生成摘要（简单实现：保留关键信息）。"""
+        """智能自动摘要（保留关键信息）。"""
         target = messages or self.history
-        user_msgs = [t for t in target if t.role == "user"]
-        assistant_msgs = [t for t in target if t.role == "assistant"]
+
+        # 提取关键信息
+        file_paths = set()
+        errors = []
+        operations = []
+        user_requests = []
+
+        import re
+        path_pattern = re.compile(r'[\w/\\.-]+\.(?:py|js|ts|html|css|json|yaml|yml|toml|md|txt|sh|go|rs)')
+
+        for t in target:
+            content = t.content
+            # 提取文件路径
+            file_paths.update(path_pattern.findall(content))
+            # 提取错误
+            if "error" in content.lower() or "错误" in content or "失败" in content:
+                errors.append(content[:150])
+            # 提取用户请求
+            if t.role == "user":
+                user_requests.append(content[:200])
+            # 提取操作
+            if any(kw in content.lower() for kw in ["创建", "写入", "修改", "删除", "created", "written", "modified"]):
+                operations.append(content[:150])
 
         parts = []
-        if user_msgs:
-            recent_user = user_msgs[-3:]
-            parts.append("用户最近的请求:")
-            for msg in recent_user:
-                parts.append(f"  - {msg.content[:200]}")
 
-        if assistant_msgs:
-            recent_asst = assistant_msgs[-2:]
-            parts.append("助手最近的回复:")
-            for msg in recent_asst:
-                parts.append(f"  - {msg.content[:300]}")
+        if user_requests:
+            parts.append("用户需求:")
+            for req in user_requests[-3:]:
+                parts.append(f"  - {req}")
+
+        if file_paths:
+            paths = list(file_paths)[:10]
+            parts.append(f"涉及文件: {', '.join(paths)}")
+
+        if operations:
+            parts.append("执行的操作:")
+            for op in operations[-3:]:
+                parts.append(f"  - {op}")
+
+        if errors:
+            parts.append("遇到的问题:")
+            for err in errors[-2:]:
+                parts.append(f"  - {err}")
 
         return "\n".join(parts) if parts else "（无对话内容）"
 
