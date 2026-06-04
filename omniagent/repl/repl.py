@@ -198,7 +198,7 @@ class REPL:
 多行输入: [bold cyan]Shift+Enter[/bold cyan] 换行，[bold cyan]Enter[/bold cyan] 发送
 [bold red]Ctrl+C[/bold red] 或 [bold red]Ctrl+D[/bold red] 退出。
 """
-        console.print(Panel(welcome, title="🚀 OmniAgent", border_style="cyan"))
+        console.print(Panel(welcome, title="OmniAgent", border_style="cyan"))
 
     def _read_input(self) -> str:
         """读取用户输入。Shift+Enter 换行，Enter 发送。

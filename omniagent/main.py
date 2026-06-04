@@ -7,9 +7,28 @@ OmniAgent-CLI 主入口。
 
 from __future__ import annotations
 
+import sys
+
+# ── 设置 UTF-8 编码（必须在其他导入之前）──
+if sys.platform == "win32":
+    import os
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    # 启用 Windows ANSI 支持
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleOutputCP(65001)  # UTF-8
+        kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+
 import argparse
 import logging
-import sys
 from pathlib import Path
 
 from rich.console import Console
