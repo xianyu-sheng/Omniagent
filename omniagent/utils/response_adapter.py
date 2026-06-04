@@ -143,6 +143,95 @@ def _normalize_step(step: Any, index: int) -> dict:
 
 
 # ── JSON 提取 ─────────────────────────────────────────────────
+
+def _repair_json(text: str) -> str | None:
+    """尝试修复被截断或格式不完整的 JSON。
+
+    策略：
+    1. 截断未完成的值（去掉尾部不完整的 key/value）
+    2. 关闭所有未闭合的 { 和 [
+    3. 去掉尾部多余的逗号
+    """
+    if not text or not text.strip():
+        return None
+
+    text = text.strip()
+
+    # 1. 分析引号状态，找到最后一个未闭合的字符串
+    in_string = False
+    escape_next = False
+    last_quote_pos = -1
+    for i, c in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if c == '\\':
+            escape_next = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            last_quote_pos = i
+
+    # 2. 如果字符串未闭合，说明被截断了
+    if in_string and last_quote_pos >= 0:
+        prefix = text[:last_quote_pos]
+
+        # 去掉不完整的字符串
+        text = prefix.rstrip().rstrip(',')
+
+        # 检查是否留下了一个孤立的 key: （值被截断的情况）
+        # 如果去掉不完整字符串后，末尾是 ":"，说明截断了值，需要连 key 一起去掉
+        # 例如: ...,"search_pattern": → 应该去掉整个 "search_pattern":
+        stripped = text.rstrip()
+        if stripped.endswith(':'):
+            # 去掉冒号和前面的 key
+            text = stripped[:-1].rstrip().rstrip(',')
+            # 如果 key 带引号，去掉引号
+            if text.endswith('"'):
+                # 找到这个引号的匹配引号
+                key_end = len(text) - 1
+                key_start = text.rfind('"', 0, key_end)
+                if key_start != -1:
+                    text = text[:key_start].rstrip().rstrip(',')
+
+    # 3. 去掉尾部逗号
+    text = text.rstrip().rstrip(',')
+
+    # 4. 用栈追踪未闭合的括号（保持正确的嵌套顺序）
+    bracket_stack: list[str] = []
+    in_str = False
+    esc = False
+    for c in text:
+        if esc:
+            esc = False
+            continue
+        if c == '\\':
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == '{':
+            bracket_stack.append('{')
+        elif c == '[':
+            bracket_stack.append('[')
+        elif c == '}':
+            if bracket_stack and bracket_stack[-1] == '{':
+                bracket_stack.pop()
+        elif c == ']':
+            if bracket_stack and bracket_stack[-1] == '[':
+                bracket_stack.pop()
+
+    # 5. 按正确的逆序关闭未闭合的括号
+    close_map = {'{': '}', '[': ']'}
+    for bracket in reversed(bracket_stack):
+        text += close_map.get(bracket, '')
+
+    return text
+
+
 def _extract_json(text: str) -> dict | None:
     """从 LLM 输出中提取 JSON 对象，处理 markdown 代码块和多余文字。"""
     text = text.strip()
@@ -153,7 +242,13 @@ def _extract_json(text: str) -> dict | None:
         try:
             return json.loads(m.group(1), strict=False)
         except json.JSONDecodeError:
-            pass
+            # 尝试修复截断的 JSON
+            repaired = _repair_json(m.group(1))
+            if repaired:
+                try:
+                    return json.loads(repaired, strict=False)
+                except json.JSONDecodeError:
+                    pass
 
     # 尝试 ``` ... ``` 代码块（无 json 标记）
     m = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
@@ -161,7 +256,12 @@ def _extract_json(text: str) -> dict | None:
         try:
             return json.loads(m.group(1), strict=False)
         except json.JSONDecodeError:
-            pass
+            repaired = _repair_json(m.group(1))
+            if repaired:
+                try:
+                    return json.loads(repaired, strict=False)
+                except json.JSONDecodeError:
+                    pass
 
     # 直接尝试解析
     try:
@@ -177,6 +277,16 @@ def _extract_json(text: str) -> dict | None:
             return json.loads(text[brace_start:brace_end + 1], strict=False)
         except json.JSONDecodeError:
             pass
+
+    # 最后手段：从第一个 { 开始，尝试修复截断的 JSON
+    if brace_start != -1:
+        candidate = text[brace_start:]
+        repaired = _repair_json(candidate)
+        if repaired:
+            try:
+                return json.loads(repaired, strict=False)
+            except json.JSONDecodeError:
+                pass
 
     return None
 
