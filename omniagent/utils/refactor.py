@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import re
-import ast
 from pathlib import Path
 from typing import Any
 
@@ -68,32 +67,42 @@ class RefactorEngine:
                 continue
             files_to_edit.setdefault(ref.file_path, []).append((ref.line, ref.col))
 
-        # 逐文件替换
+        # 逐文件替换（使用列位置精确定位）
         for file_path, positions in files_to_edit.items():
             try:
                 content = Path(file_path).read_text(encoding="utf-8")
                 lines = content.splitlines(keepends=True)
 
-                # 从后往前替换，避免偏移
+                # 去重并按位置从后往前排序
+                unique_positions = sorted(set(positions), reverse=True)
+
                 modified = False
-                for line_no, col in sorted(positions, reverse=True):
-                    if line_no <= len(lines):
-                        line = lines[line_no - 1]
-                        # 精确替换（词边界）
-                        new_line = re.sub(
-                            r'\b' + re.escape(old_name) + r'\b',
-                            new_name,
-                            line,
-                        )
-                        if new_line != line:
-                            lines[line_no - 1] = new_line
-                            modified = True
-                            changes.append({
-                                "file": file_path,
-                                "line": line_no,
-                                "old": line.rstrip(),
-                                "new": new_line.rstrip(),
-                            })
+                for line_no, col in unique_positions:
+                    if line_no < 1 or line_no > len(lines):
+                        continue
+                    line = lines[line_no - 1]
+                    # 精确替换：只替换指定列位置的匹配
+                    prefix = line[:col]
+                    suffix = line[col:]
+                    # 验证指定位置确实是目标符号
+                    if not re.match(r'\b' + re.escape(old_name) + r'\b', suffix):
+                        continue
+                    new_suffix = re.sub(
+                        r'\b' + re.escape(old_name) + r'\b',
+                        new_name,
+                        suffix,
+                        count=1,
+                    )
+                    if new_suffix != suffix:
+                        new_line = prefix + new_suffix
+                        lines[line_no - 1] = new_line
+                        modified = True
+                        changes.append({
+                            "file": file_path,
+                            "line": line_no,
+                            "old": line.rstrip(),
+                            "new": new_line.rstrip(),
+                        })
 
                 if modified and not dry_run:
                     new_content = "".join(lines)
@@ -140,21 +149,39 @@ class RefactorEngine:
         for unused_name in analysis.unused_imports:
             for i, line in enumerate(lines):
                 stripped = line.strip()
-                # 匹配 import X 或 from Y import X
-                if re.match(rf'^import\s+{re.escape(unused_name)}(\s|$|,)', stripped):
+                # 匹配 import X（整行删除）
+                if re.match(rf'^import\s+{re.escape(unused_name)}(\s*$)', stripped):
                     removed.append({"line": i + 1, "text": stripped})
                     lines[i] = ""
                     break
-                elif re.match(rf'^from\s+\S+\s+import\s+.*\b{re.escape(unused_name)}\b', stripped):
-                    # from X import a, b, c — 只移除单个名字
+                # 匹配 import X, Y, Z（只移除 X）
+                elif re.match(rf'^import\s+.*\b{re.escape(unused_name)}\b', stripped):
+                    # 移除 import 语句中的单个名字
                     new_line = re.sub(
-                        rf',?\s*{re.escape(unused_name)}\s*,?\s*',
-                        lambda m: ',' if m.group().startswith(',') else '',
+                        rf',\s*{re.escape(unused_name)}\b|\b{re.escape(unused_name)}\s*,',
+                        '',
                         line,
                     )
-                    # 清理多余的逗号
-                    new_line = re.sub(r'import\s*,', 'import ', new_line)
-                    new_line = re.sub(r',\s*\n', '\n', new_line)
+                    if new_line.strip() != stripped:
+                        removed.append({"line": i + 1, "text": stripped})
+                        lines[i] = new_line
+                        break
+                # 匹配 from Y import X（如果是唯一导入，删整行）
+                elif re.match(rf'^from\s+\S+\s+import\s+{re.escape(unused_name)}\s*$', stripped):
+                    removed.append({"line": i + 1, "text": stripped})
+                    lines[i] = ""
+                    break
+                # 匹配 from Y import a, X, b（只移除 X）
+                elif re.match(rf'^from\s+\S+\s+import\s+.*\b{re.escape(unused_name)}\b', stripped):
+                    # 精确移除名字，保留其他导入
+                    new_line = re.sub(
+                        rf',\s*{re.escape(unused_name)}\b|\b{re.escape(unused_name)}\s*,\s*',
+                        ', ',
+                        line,
+                    )
+                    # 清理可能的 "import ," 或尾部逗号
+                    new_line = re.sub(r'import\s*,\s*', 'import ', new_line)
+                    new_line = re.sub(r',\s*([)\n])', r'\1', new_line)
                     if new_line.strip() != stripped:
                         removed.append({"line": i + 1, "text": stripped})
                         lines[i] = new_line

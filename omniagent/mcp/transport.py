@@ -96,34 +96,63 @@ class StdioTransport(MCPTransport):
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"MCP 响应解析失败: {e}")
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """发送请求并等待响应。"""
-        self._request_id += 1
-        message = {
-            "jsonrpc": "2.0",
-            "id": self._request_id,
-            "method": method,
-        }
-        if params:
-            message["params"] = params
+    def request(self, method: str, params: dict[str, Any] | None = None, max_retries: int = 50) -> dict[str, Any]:
+        """发送请求并等待响应（原子操作）。"""
+        with self._lock:
+            if not self._proc or self._proc.poll() is not None:
+                raise RuntimeError("MCP 子进程未运行")
 
-        self.send(message)
+            self._request_id += 1
+            request_id = self._request_id
+            message = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+            }
+            if params:
+                message["params"] = params
 
-        # 等待响应（匹配 id）
-        while True:
-            response = self.receive()
-            if response.get("id") == self._request_id:
-                return response
-            # 通知消息，忽略
-            if "id" not in response:
-                logger.debug(f"MCP 通知: {response.get('method', 'unknown')}")
-                continue
+            data = json.dumps(message) + "\n"
+            try:
+                self._proc.stdin.write(data)
+                self._proc.stdin.flush()
+            except Exception as e:
+                raise RuntimeError(f"MCP 发送失败: {e}")
+
+            # 等待响应（匹配 id），带重试上限
+            for _ in range(max_retries):
+                try:
+                    line = self._proc.stdout.readline()
+                    if not line:
+                        raise RuntimeError("MCP 子进程无输出")
+                    response = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"MCP 响应解析失败: {e}")
+
+                if response.get("id") == request_id:
+                    return response
+                if "id" not in response:
+                    logger.debug(f"MCP 通知: {response.get('method', 'unknown')}")
+                    continue
+
+            raise RuntimeError(f"MCP 请求超时：未在 {max_retries} 次重试内收到响应")
 
     def close(self) -> None:
         """关闭子进程。"""
         if self._proc:
             try:
                 self._proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                self._proc.stderr.close()
+            except Exception:
+                pass
+            try:
                 self._proc.terminate()
                 self._proc.wait(timeout=5)
             except Exception:

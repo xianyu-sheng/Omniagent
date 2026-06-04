@@ -153,6 +153,17 @@ class CodeIndex:
             lang = self._ext_to_lang(ext)
             symbols = self._index_regex(content, str_path, lang)
 
+        # 移除旧索引条目（如果重新索引同一文件）
+        old_symbols = self.file_symbols.get(str_path, [])
+        for old_sym in old_symbols:
+            if old_sym.name in self.symbols:
+                self.symbols[old_sym.name] = [
+                    s for s in self.symbols[old_sym.name]
+                    if s.file_path != str_path
+                ]
+                if not self.symbols[old_sym.name]:
+                    del self.symbols[old_sym.name]
+
         self.file_symbols[str_path] = symbols
         for sym in symbols:
             self.symbols.setdefault(sym.name, []).append(sym)
@@ -254,9 +265,12 @@ class CodeIndex:
             # 语法错误，降级到正则
             return self._index_regex(content, file_path, "generic")
 
+        # 预计算父类映射，避免 O(F*N) 性能问题
+        parent_map = self._build_parent_map(tree)
+
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
-                parent = self._get_parent_class(tree, node)
+                parent = parent_map.get(id(node))
                 decorators = [self._get_decorator_name(d) for d in node.decorator_list]
                 sig = self._build_signature(node)
                 symbols.append(Symbol(
@@ -311,13 +325,14 @@ class CodeIndex:
     def _index_regex(self, content: str, file_path: str, lang: str) -> list[Symbol]:
         """用正则索引非 Python 文件。"""
         symbols = []
-        patterns = _LANG_PATTERNS.get(lang, _LANG_PATTERNS.get("javascript", []))
+        # 未知语言不使用任何模式（避免错误匹配）
+        patterns = _LANG_PATTERNS.get(lang, [])
 
         for i, line in enumerate(content.splitlines(), 1):
             for pattern, kind in patterns:
                 for match in re.finditer(pattern, line):
                     name = match.group(1)
-                    if name and len(name) > 1:
+                    if name and len(name) >= 1:
                         symbols.append(Symbol(
                             name=name,
                             kind=kind,
@@ -328,23 +343,61 @@ class CodeIndex:
 
         return symbols
 
-    def _get_parent_class(self, tree: ast.Module, func_node) -> str | None:
-        """获取函数所属的类名。"""
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                for child in ast.walk(node):
-                    if child is func_node:
-                        return node.name
-        return None
+    @staticmethod
+    def _build_parent_map(tree: ast.Module) -> dict[int, str]:
+        """预计算 AST 节点到所属类名的映射。O(N) 单次遍历。"""
+        parent_map: dict[int, str] = {}
 
-    def _build_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-        """构建函数签名字符串。"""
+        def _walk_class(cls_node: ast.ClassDef, class_name: str) -> None:
+            for child in ast.iter_child_nodes(cls_node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    parent_map[id(child)] = class_name
+                # 不递归进入嵌套类
+                if not isinstance(child, ast.ClassDef):
+                    _walk_class_inner(child, class_name)
+
+        def _walk_class_inner(node, class_name: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    parent_map[id(child)] = class_name
+                if not isinstance(child, ast.ClassDef):
+                    _walk_class_inner(child, class_name)
+
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.ClassDef):
+                _walk_class(node, node.name)
+
+        return parent_map
+
+    @staticmethod
+    def _build_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+        """构建函数签名字符串，包含所有参数类型。"""
         try:
             args = node.args
             parts = []
-            for arg in args.args:
-                if arg.arg != "self" and arg.arg != "cls":
+
+            # positional-only args (Python 3.8+)
+            for arg in getattr(args, 'posonlyargs', []):
+                if arg.arg not in ("self", "cls"):
                     parts.append(arg.arg)
+
+            # positional args
+            for arg in args.args:
+                if arg.arg not in ("self", "cls"):
+                    parts.append(arg.arg)
+
+            # *args
+            if args.vararg:
+                parts.append(f"*{args.vararg.arg}")
+
+            # keyword-only args
+            for arg in args.kwonlyargs:
+                parts.append(f"{arg.arg}")
+
+            # **kwargs
+            if args.kwarg:
+                parts.append(f"**{args.kwarg.arg}")
+
             return ", ".join(parts)
         except Exception:
             return ""

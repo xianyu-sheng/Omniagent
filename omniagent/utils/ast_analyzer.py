@@ -101,10 +101,30 @@ class ASTAnalyzer:
             content = path.read_text(encoding="utf-8")
             encoding = "utf-8"
         except UnicodeDecodeError:
-            content = path.read_text(encoding="latin-1")
-            encoding = "latin-1"
+            try:
+                content = path.read_text(encoding="latin-1")
+                encoding = "latin-1"
+            except Exception:
+                return self._error_result(str(path), f"文件读取失败: {path}")
+        except FileNotFoundError:
+            return self._error_result(str(path), f"文件不存在: {path}")
+        except PermissionError:
+            return self._error_result(str(path), f"无权限读取: {path}")
+        except Exception as e:
+            return self._error_result(str(path), f"文件读取失败: {e}")
 
         return self.analyze_code(content, str(path), encoding)
+
+    @staticmethod
+    def _error_result(file_path: str, error: str) -> AnalysisResult:
+        """生成错误结果。"""
+        return AnalysisResult(
+            file_path=file_path, language="python", encoding="utf-8",
+            syntax_valid=False, syntax_errors=[error],
+            functions=[], classes=[], top_level_vars=[],
+            imports=[], unused_imports=[], complexity=0,
+            lines=0, blank_lines=0, comment_lines=0, docstring_lines=0,
+        )
 
     def analyze_code(self, code: str, file_path: str = "<string>", encoding: str = "utf-8") -> AnalysisResult:
         """分析代码字符串。"""
@@ -160,7 +180,7 @@ class ASTAnalyzer:
             errors.append(f"行 {e.lineno}: {e.msg}")
         return errors
 
-    def extract_signatures(self, code: str) -> list[dict[str, str]]:
+    def extract_signatures(self, code: str) -> list[dict[str, str | bool]]:
         """提取所有函数签名。"""
         try:
             tree = ast.parse(code)
@@ -171,12 +191,40 @@ class ASTAnalyzer:
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = []
+                # positional-only
+                for arg in getattr(node.args, 'posonlyargs', []):
+                    if arg.arg not in ("self", "cls"):
+                        a = arg.arg
+                        if arg.annotation:
+                            a += f": {ast.unparse(arg.annotation)}"
+                        args.append(a)
+                # positional
                 for arg in node.args.args:
                     if arg.arg not in ("self", "cls"):
                         a = arg.arg
                         if arg.annotation:
                             a += f": {ast.unparse(arg.annotation)}"
                         args.append(a)
+                # *args
+                if node.args.vararg:
+                    va = node.args.vararg
+                    a = f"*{va.arg}"
+                    if va.annotation:
+                        a += f": {ast.unparse(va.annotation)}"
+                    args.append(a)
+                # keyword-only
+                for arg in node.args.kwonlyargs:
+                    a = arg.arg
+                    if arg.annotation:
+                        a += f": {ast.unparse(arg.annotation)}"
+                    args.append(a)
+                # **kwargs
+                if node.args.kwarg:
+                    ka = node.args.kwarg
+                    a = f"**{ka.arg}"
+                    if ka.annotation:
+                        a += f": {ast.unparse(ka.annotation)}"
+                    args.append(a)
                 ret = ""
                 if node.returns:
                     ret = ast.unparse(node.returns)
@@ -276,8 +324,8 @@ class ASTAnalyzer:
             is_async=isinstance(node, ast.AsyncFunctionDef),
             is_method=is_method,
             complexity=complexity,
-            local_vars=list(set(local_vars)),
-            calls=list(set(calls)),
+            local_vars=list(dict.fromkeys(local_vars)),
+            calls=list(dict.fromkeys(calls)),
         )
 
     def _extract_top_vars(self, tree: ast.Module) -> list[str]:
@@ -335,11 +383,18 @@ class ASTAnalyzer:
         return unused
 
     def _calc_complexity(self, tree: ast.Module) -> int:
-        """计算文件总圈复杂度。"""
+        """计算文件总圈复杂度。避免函数内节点被重复计算。"""
         total = 0
+        counted_nodes: set[int] = set()
+
         for node in ast.walk(tree):
+            if id(node) in counted_nodes:
+                continue
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 total += self._node_complexity(node)
+                # 标记函数内所有子节点为已计算
+                for child in ast.walk(node):
+                    counted_nodes.add(id(child))
             elif isinstance(node, (ast.If, ast.While, ast.For, ast.AsyncFor)):
                 total += 1
         return total

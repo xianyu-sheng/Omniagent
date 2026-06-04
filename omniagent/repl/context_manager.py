@@ -68,9 +68,9 @@ class ContextManager:
         估算 token 数。
         规则：
         - 中文字符约 2 token/字
-        - 英文约 1 token/4 字符（即 0.25 token/char）
-        - 代码/JSON 密度更高
-        - 始终不低于 len(text)/4（防止无空格长串被低估）
+        - 英文约 1.3 token/word
+        - 代码/JSON 按更高密度
+        - 始终不低于 len(text)/3（防止无空格长串被低估）
         """
         if not text:
             return 0

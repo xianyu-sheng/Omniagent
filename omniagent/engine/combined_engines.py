@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from omniagent.engine.callbacks import ConsoleCallback, EngineCallback, SilentCallback
+from omniagent.engine.callbacks import EngineCallback
 from omniagent.engine.context import AgentContext
 from omniagent.engine.plan_execute_engine import PlanExecuteEngine
 from omniagent.engine.react_engine import ReActEngine, BUILTIN_TOOLS

@@ -939,13 +939,22 @@ register_command("/tools", "查看所有可用工具类型", "/tools")
 @_handler("/tools")
 def _cmd_tools(**kwargs: Any) -> str:
     tools_info = [
-        ("command", "执行终端命令", "action='dir' 或 action='python test.py'"),
+        ("command", "执行终端命令", "action='dir'"),
         ("write_file", "写入文件", "file_path, content"),
         ("read_file", "读取文件", "file_path"),
-        ("list_files", "目录遍历（glob 模式）", "file_path='.', pattern='*.py', max_depth=5"),
-        ("search_files", "文件内容搜索（grep）", "file_path='.', search_pattern='TODO', file_filter='*.py'"),
-        ("git", "Git 操作", "git_command='status|diff|log|add|commit|branch'"),
-        ("web_fetch", "抓取网页内容", "url='https://example.com'"),
+        ("edit_file", "精确编辑文件（查找替换）", "file_path, old_text, new_text"),
+        ("create_directory", "创建目录", "file_path"),
+        ("list_files", "目录遍历（glob 模式）", "file_path, pattern, max_depth"),
+        ("search_files", "文件内容搜索", "file_path, search_pattern, file_filter"),
+        ("git", "Git 操作", "git_command='status|diff|log|add|commit'"),
+        ("web_fetch", "抓取网页内容", "url"),
+        ("batch_write", "批量写入多个文件", "files=[{path, content}, ...]"),
+        ("batch_edit", "批量编辑多个文件", "edits=[{file_path, old_text, new_text}, ...]"),
+        ("code_index", "代码符号搜索（AST 索引）", "search_pattern, file_path"),
+        ("ast_analyze", "Python 代码结构分析", "file_path"),
+        ("refactor", "重构：重命名/清理导入/分析", "refactor_action, old_name, new_name"),
+        ("diff_preview", "预览文件修改 diff", "file_path, old_text, new_text"),
+        ("mcp_call", "调用 MCP 外部工具", "tool_name, tool_args"),
     ]
 
     lines = ["可用工具类型:\n"]
@@ -954,7 +963,6 @@ def _cmd_tools(**kwargs: Any) -> str:
         lines.append(f"    参数: {params}")
         lines.append("")
     lines.append("工具可在 YAML 工作流中通过 action_type 字段使用。")
-    lines.append("也可在 REPL 中通过 /code 命令间接使用。")
     return "\n".join(lines)
 
 
