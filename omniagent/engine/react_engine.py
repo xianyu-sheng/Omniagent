@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from omniagent.engine.context import AgentContext
+from omniagent.engine.tool_tracker import ToolExecutionTracker
 from omniagent.nodes.tool_node import ToolNode
 from omniagent.utils.llm_client import chat_completion
 from omniagent.utils.response_adapter import parse_react
@@ -84,6 +85,11 @@ BUILTIN_TOOLS = {
             "new_text": "替换后的文本",
         },
     },
+    "create_directory": {
+        "name": "create_directory",
+        "description": "创建目录（含父目录）",
+        "params": {"file_path": "目录路径"},
+    },
 }
 
 
@@ -122,6 +128,7 @@ class ReActEngine:
             最终答案文本
         """
         ctx = context or AgentContext()
+        tracker = ToolExecutionTracker()
         messages = [{"role": "system", "content": self.system_prompt}]
         # 注入对话历史（最近 10 条，排除 system 消息）
         history = ctx.get_conversation_messages()
@@ -132,6 +139,10 @@ class ReActEngine:
         else:
             logger.warning("ReAct: 无对话历史可注入！")
         messages.append({"role": "user", "content": user_input})
+
+        # 判断输入是否需要工具操作
+        requires_tools = self._input_requires_tools(user_input)
+        no_tool_streak = 0  # 连续未执行工具的轮次
 
         for i in range(self.max_iterations):
             logger.info(f"ReAct 迭代 {i + 1}/{self.max_iterations}")
@@ -144,8 +155,37 @@ class ReActEngine:
             parsed = self._parse_response(response)
 
             if "final_answer" in parsed:
-                logger.info(f"ReAct 完成，共 {i + 1} 次迭代")
-                return parsed["final_answer"]
+                # ── 关键验证：如果需要工具但未执行，拒绝接受 final_answer ──
+                if requires_tools and not tracker.has_executions():
+                    no_tool_streak += 1
+                    if no_tool_streak <= 2:
+                        force_msg = (
+                            "⚠️ 你还没有使用任何工具就声称完成了任务。"
+                            "请使用工具（如 write_file、command、create_directory 等）"
+                            "实际执行操作，而不是仅在文字中描述。"
+                            "如果你确实不需要工具，请在 final_answer 中明确说明原因。"
+                        )
+                        messages.append({"role": "user", "content": force_msg})
+                        logger.warning(f"ReAct: LLM 未执行工具就声称完成，强制要求工具调用 (第 {no_tool_streak} 次)")
+                        continue
+                    else:
+                        # 连续 3 次拒绝工具，附带警告返回
+                        answer = parsed["final_answer"]
+                        warning = (
+                            "\n\n⚠️ **警告**: 本次回答未经工具执行验证。"
+                            "LLM 声称完成了任务但未实际调用任何工具，"
+                            "文件操作可能未真正执行。"
+                        )
+                        logger.warning("ReAct: LLM 连续拒绝工具调用，附带警告返回")
+                        return answer + warning
+
+                logger.info(f"ReAct 完成，共 {i + 1} 次迭代，工具调用 {len(tracker.calls)} 次")
+                # 在最终答案末尾附加工具执行摘要
+                answer = parsed["final_answer"]
+                if tracker.has_executions():
+                    summary = tracker.execution_summary()
+                    logger.info(f"ReAct 工具执行摘要: {summary}")
+                return answer
 
             if "action" in parsed:
                 # 执行工具
@@ -156,12 +196,13 @@ class ReActEngine:
                 logger.info(f"ReAct 思考: {thought}")
                 logger.info(f"ReAct 行动: {action}({action_input})")
 
-                observation = self._execute_tool(action, action_input, ctx)
+                observation = self._execute_tool(action, action_input, ctx, tracker)
 
                 # 将观察结果加入对话
                 obs_msg = f"Observation: {observation}"
                 messages.append({"role": "user", "content": obs_msg})
                 logger.info(f"ReAct 观察: {observation[:200]}")
+                no_tool_streak = 0
             else:
                 # LLM 没有给出有效输出，直接返回
                 return parsed.get("thought", response)
@@ -183,11 +224,20 @@ class ReActEngine:
         """解析 LLM 的 JSON 输出（委托给 response_adapter 中间件）。"""
         return parse_react(response)
 
-    def _execute_tool(self, action: str, action_input: dict, context: AgentContext) -> str:
+    def _execute_tool(
+        self,
+        action: str,
+        action_input: dict,
+        context: AgentContext,
+        tracker: ToolExecutionTracker | None = None,
+    ) -> str:
         """执行工具并返回结果。"""
         tool_info = self.tools.get(action)
         if not tool_info:
-            return f"错误: 未知工具 '{action}'，可用工具: {list(self.tools.keys())}"
+            error_msg = f"错误: 未知工具 '{action}'，可用工具: {list(self.tools.keys())}"
+            if tracker:
+                tracker.record(action, action_input, False, error_msg, error=error_msg)
+            return error_msg
 
         try:
             logger.info(f"执行工具: {action}, 参数: {action_input}")
@@ -199,18 +249,64 @@ class ReActEngine:
             result = node.execute(context)
             logger.info(f"工具结果: {str(result)[:200]}")
 
-            if result.get("success"):
+            success = result.get("success", False)
+            error = result.get("error")
+
+            if success:
                 # 提取主要内容
+                summary = ""
                 for key in ("content", "stdout", "output", "files"):
                     if key in result and result[key]:
                         val = result[key]
                         if isinstance(val, list):
-                            return "\n".join(str(v) for v in val[:50])
-                        return str(val)[:3000]
-                return str(result)[:3000]
+                            summary = "\n".join(str(v) for v in val[:50])
+                        else:
+                            summary = str(val)[:3000]
+                        break
+                if not summary:
+                    summary = str(result)[:3000]
+
+                if tracker:
+                    tracker.record(action, action_input, True, summary[:200])
+                return summary
             else:
-                return f"工具执行失败: {result.get('error', result)}"
+                error_detail = f"工具执行失败: {error or result}"
+                if tracker:
+                    tracker.record(action, action_input, False, error_detail, error=str(error))
+                return error_detail
 
         except Exception as e:
+            error_msg = f"工具执行异常: {e}"
             logger.error(f"工具执行异常: {action}({action_input}) -> {e}")
-            return f"工具执行异常: {e}"
+            if tracker:
+                tracker.record(action, action_input, False, error_msg, error=str(e))
+            return error_msg
+
+    @staticmethod
+    def _input_requires_tools(text: str) -> bool:
+        """判断用户输入是否大概率需要工具执行。
+
+        与 repl.py 的 _detect_tool_need 类似，但更宽松 —
+        宁可误判需要工具（多一次确认），也不漏判。
+        """
+        tool_keywords = [
+            # 文件操作
+            "文件", "文件夹", "目录", "创建", "写入", "保存", "新建", "生成",
+            "读取", "查看", "修改", "编辑", "删除", "替换",
+            "写", "建", "做", "搭",
+            "file", "folder", "directory", "create", "write", "save",
+            "read", "edit", "delete", "modify", "replace", "make", "build",
+            # 命令执行
+            "执行", "运行", "命令", "脚本", "程序",
+            "run", "execute", "command", "script",
+            # Git
+            "git", "commit", "push", "pull", "clone",
+            # 搜索
+            "搜索", "查找", "grep", "find", "search",
+            # 路径模式
+            ".py", ".js", ".ts", ".html", ".css", ".json", ".yaml",
+            ".md", ".txt", ".sh", ".bat",
+            "src/", "test", "lib/", "app/",
+        ]
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in tool_keywords)

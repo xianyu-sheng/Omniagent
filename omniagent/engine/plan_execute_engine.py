@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from omniagent.engine.context import AgentContext
+from omniagent.engine.tool_tracker import ToolExecutionTracker
 from omniagent.nodes.tool_node import ToolNode
 from omniagent.utils.llm_client import chat_completion
 from omniagent.utils.response_adapter import parse_plan
@@ -64,6 +65,7 @@ class PlanExecuteEngine:
             最终执行结果
         """
         ctx = context or AgentContext()
+        tracker = ToolExecutionTracker()
 
         # Phase 1: Planning
         logger.info("Plan-Execute Phase 1: 规划中...")
@@ -95,11 +97,11 @@ class PlanExecuteEngine:
 
             if tool and tool != "null":
                 # 使用工具执行
-                result = self._execute_step_with_tool(tool, params, ctx)
+                result = self._execute_step_with_tool(tool, params, ctx, tracker)
             else:
-                # 使用 LLM 执行
+                # 使用 LLM 执行 — 会验证文件操作声明
                 result = self._execute_step_with_llm(
-                    step_id, len(steps), step_task, prev_results, user_input
+                    step_id, len(steps), step_task, prev_results, user_input, tracker
                 )
 
             results.append({
@@ -111,8 +113,8 @@ class PlanExecuteEngine:
             ctx.set(f"step_{step_id}_result", result)
             logger.info(f"步骤 {step_id} 完成: {result[:100]}")
 
-        # 汇总结果
-        summary = self._summarize(user_input, plan.get("analysis", ""), results)
+        # 汇总结果 — 附加工具执行摘要
+        summary = self._summarize(user_input, plan.get("analysis", ""), results, tracker)
         return summary
 
     def _plan(self, user_input: str, context: AgentContext | None = None) -> dict[str, Any]:
@@ -139,30 +141,51 @@ class PlanExecuteEngine:
         logger.info(f"解析后: steps={len(result.get('steps', []))}, analysis={result.get('analysis', '')[:100]}")
         return result
 
-    def _execute_step_with_tool(self, tool: str, params: dict, context: AgentContext) -> str:
+    def _execute_step_with_tool(
+        self, tool: str, params: dict, context: AgentContext,
+        tracker: ToolExecutionTracker | None = None,
+    ) -> str:
         """使用工具执行步骤。"""
         try:
             node = ToolNode(f"plan_{tool}", action_type=tool, **params)
             result = node.execute(context)
 
-            if result.get("success"):
+            success = result.get("success", False)
+            error = result.get("error")
+
+            if success:
+                summary = ""
                 for key in ("content", "stdout", "output", "files"):
                     if key in result and result[key]:
                         val = result[key]
                         if isinstance(val, list):
-                            return "\n".join(str(v) for v in val[:30])
-                        return str(val)[:2000]
-                return "执行成功"
+                            summary = "\n".join(str(v) for v in val[:30])
+                        else:
+                            summary = str(val)[:2000]
+                        break
+                if not summary:
+                    summary = "执行成功"
+
+                if tracker:
+                    tracker.record(tool, params, True, summary[:200])
+                return summary
             else:
-                return f"执行失败: {result.get('error', result)}"
+                error_detail = f"执行失败: {error or result}"
+                if tracker:
+                    tracker.record(tool, params, False, error_detail, error=str(error))
+                return error_detail
 
         except Exception as e:
-            return f"执行异常: {e}"
+            error_msg = f"执行异常: {e}"
+            if tracker:
+                tracker.record(tool, params, False, error_msg, error=str(e))
+            return error_msg
 
     def _execute_step_with_llm(
         self, step_id: int, total: int, task: str, prev_results: str, original: str,
+        tracker: ToolExecutionTracker | None = None,
     ) -> str:
-        """使用 LLM 执行不需要工具的步骤。"""
+        """使用 LLM 执行不需要工具的步骤。会验证文件操作声明。"""
         prompt = EXECUTE_PROMPT.format(
             step_id=step_id, total_steps=total,
             step_task=task, previous_results=prev_results,
@@ -171,18 +194,99 @@ class PlanExecuteEngine:
             {"role": "system", "content": f"原始任务: {original}"},
             {"role": "user", "content": prompt},
         ]
-        return self._call_llm(messages)
+        result = self._call_llm(messages)
 
-    def _summarize(self, original: str, analysis: str, results: list[dict]) -> str:
+        # ── 验证 LLM 是否声明了文件操作但实际未执行 ──
+        result = self._verify_llm_file_claims(result, tracker)
+        return result
+
+    @staticmethod
+    def _verify_llm_file_claims(
+        llm_output: str, tracker: ToolExecutionTracker | None = None,
+    ) -> str:
+        """检查 LLM 输出中是否声称创建/写入了文件，但实际未通过工具执行。
+
+        如果检测到未验证的文件声明，追加警告信息。
+        """
+        import re
+
+        # 检测文件操作声明的关键词
+        claim_patterns = [
+            r"(?:已|已经|成功)?(?:创建|新建|生成|写入|保存)(?:了)?",
+            r"(?:created|written|saved|generated|initialized|made)",
+            r"(?:文件|目录|文件夹)(?:已|已经)",
+        ]
+
+        has_claim = any(re.search(p, llm_output, re.IGNORECASE) for p in claim_patterns)
+        if not has_claim:
+            return llm_output
+
+        # 提取提到的文件路径
+        file_patterns = [
+            r'[\w/\\.-]+\.(?:py|js|ts|html|css|json|yaml|yml|toml|md|txt|sh|bat|ps1|go|rs|java|c|cpp|h)',
+            r'(?:src|lib|app|test|tests|dist|build|bin|config|docs)[/\\][\w/\\.-]+',
+        ]
+        mentioned_files = set()
+        for pattern in file_patterns:
+            mentioned_files.update(re.findall(pattern, llm_output))
+
+        if not mentioned_files:
+            return llm_output
+
+        # 检查哪些文件真的通过工具创建了
+        verified_files = set()
+        if tracker:
+            for call in tracker.calls:
+                if call.success and call.tool_name in ("write_file", "create_directory"):
+                    fp = call.params.get("file_path", "")
+                    if fp:
+                        verified_files.add(fp)
+
+        # 对每个提到的文件，验证是否真的存在或被工具创建
+        unverified = []
+        for f in mentioned_files:
+            if f in verified_files:
+                continue
+            from pathlib import Path
+            if not Path(f).exists():
+                unverified.append(f)
+
+        if unverified:
+            warning = (
+                f"\n\n⚠️ **注意**: 以上内容中提到了创建文件 "
+                f"`{'`, `'.join(unverified)}`，"
+                f"但这些文件未经工具验证，可能并未实际创建。"
+                f"如需真正创建文件，请使用 write_file 工具。"
+            )
+            return llm_output + warning
+
+        return llm_output
+
+    def _summarize(
+        self, original: str, analysis: str, results: list[dict],
+        tracker: ToolExecutionTracker | None = None,
+    ) -> str:
         """汇总所有步骤的结果。"""
         results_text = "\n".join(
             f"步骤 {r['step_id']} ({r['task']}): {r['result'][:300]}"
             for r in results
         )
 
+        # 构建工具执行摘要
+        tool_summary = ""
+        if tracker and tracker.has_executions():
+            tool_summary = f"\n\n工具执行记录:\n{tracker.detail_log()}"
+
         messages = [
-            {"role": "system", "content": "请根据以下执行结果，给出简洁的最终总结。"},
-            {"role": "user", "content": f"原始任务: {original}\n\n分析: {analysis}\n\n执行结果:\n{results_text}"},
+            {"role": "system", "content": (
+                "请根据以下执行结果，给出简洁的最终总结。"
+                "如果某些步骤声称创建了文件但没有对应的工具执行记录，"
+                "请在总结中明确指出这些文件可能并未实际创建。"
+            )},
+            {"role": "user", "content": (
+                f"原始任务: {original}\n\n分析: {analysis}\n\n"
+                f"执行结果:\n{results_text}{tool_summary}"
+            )},
         ]
         return self._call_llm(messages)
 

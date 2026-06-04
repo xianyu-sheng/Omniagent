@@ -373,6 +373,14 @@ class REPL:
                 ))
                 if system_hint:
                     self.ctx_mgr.add_system_message(f"[指令上下文] {system_hint}")
+            elif intent is not None:
+                # 有明确任务意图，但提示词质量已足够好
+                console.print("[dim]✅ 提示词质量良好，无需优化[/dim]")
+                if system_hint:
+                    self.ctx_mgr.add_system_message(f"[指令上下文] {system_hint}")
+            else:
+                # 通用对话，无明确任务意图
+                console.print("[dim]💬 通用对话[/dim]")
         else:
             optimized = user_input
 
@@ -421,10 +429,24 @@ class REPL:
         for model_id in model_ids:
             try:
                 if self.streaming:
-                    self._stream_response(model_id, messages)
+                    response_text = self._stream_response(model_id, messages)
                 else:
-                    self._blocking_response(model_id, messages)
+                    response_text = self._blocking_response(model_id, messages)
                 self.status_bar.set_last_model(model_id)
+
+                # ── 响应后验证：检测 LLM 是否声称执行了文件操作 ──
+                if response_text and self._detect_file_claim(response_text):
+                    console.print()
+                    console.print(Panel(
+                        "[yellow]⚠️  检测到回复中声称执行了文件操作，"
+                        "但当前为 Direct 模式，未实际调用任何工具。\n"
+                        "文件可能并未真正创建。[/yellow]\n\n"
+                        "[dim]提示: 使用 /mode react 切换到 ReAct 模式，"
+                        "或在输入中包含具体文件名以自动启用工具执行。[/dim]",
+                        title="[warning]工具执行警告[/warning]",
+                        border_style="yellow",
+                    ))
+
                 return
             except Exception as e:
                 last_error = e
@@ -522,8 +544,8 @@ class REPL:
         except Exception as e:
             console.print(f"[error]❌ React+Reflection 引擎执行失败: {e}[/error]")
 
-    def _stream_response(self, model_id: str, messages: list[dict[str, str]]) -> None:
-        """流式输出模型回复。"""
+    def _stream_response(self, model_id: str, messages: list[dict[str, str]]) -> str:
+        """流式输出模型回复。返回完整响应文本。"""
         from omniagent.utils.llm_client import chat_completion_stream
 
         console.print()
@@ -539,9 +561,10 @@ class REPL:
         self.ctx_mgr.add_assistant_message(response_text, model_used=model_id)
 
         console.print(f"[dim]└─ {model_id}[/dim]")
+        return response_text
 
-    def _blocking_response(self, model_id: str, messages: list[dict[str, str]]) -> None:
-        """阻塞式输出模型回复。"""
+    def _blocking_response(self, model_id: str, messages: list[dict[str, str]]) -> str:
+        """阻塞式输出模型回复。返回响应文本。"""
         from omniagent.utils.llm_client import chat_completion
 
         console.print(f"[dim]调用 {model_id}...[/dim]")
@@ -555,6 +578,7 @@ class REPL:
             title=f"[assistant]Assistant[/assistant] [dim]({model_id})[/dim]",
             border_style="green",
         ))
+        return response
 
     @staticmethod
     def _detect_intent(text: str) -> str | None:
@@ -596,6 +620,14 @@ class REPL:
         # 列出文件
         re.compile(r"(?:列出|显示|查看).{0,15}(?:文件|目录|文件夹|文件列表)", re.I),
         re.compile(r"(?:list|ls|dir|tree).{0,15}(?:file|dir|folder)", re.I),
+        # 目录/文件夹操作
+        re.compile(r"(?:创建|新建|建|mkdir).{0,10}(?:目录|文件夹|folder|dir)", re.I),
+        re.compile(r"(?:create|make|mkdir).{0,10}(?:dir|folder|directory)", re.I),
+        # 通用编程任务（容易涉及文件操作）
+        re.compile(r"(?:帮我|请|给).{0,5}(?:写|做|创建|实现|开发|搭|建).{0,20}(?:一个|个|项目|工程|脚本|程序|代码)", re.I),
+        re.compile(r"(?:help\s+me|please).{0,10}(?:write|create|build|implement|develop|make).{0,20}(?:a|an|the|project|script|app|code)", re.I),
+        # 安装/包管理
+        re.compile(r"(?:安装|install).{0,15}(?:包|库|依赖|package|pip|npm|yarn|cargo)", re.I),
     ]
 
     @classmethod
@@ -605,6 +637,20 @@ class REPL:
             if pattern.search(text):
                 return True
         return False
+
+    _FILE_CLAIM_KEYWORDS: list[str] = [
+        "已创建", "已经创建", "已生成", "已经生成", "已写入", "已经写入",
+        "已保存", "已经保存", "已新建", "已经新建", "已建立", "已经建立",
+        "创建了", "生成了", "写入了", "保存了", "新建了",
+        "created", "written", "saved", "generated",
+        "文件已", "目录已", "文件夹已",
+    ]
+
+    @classmethod
+    def _detect_file_claim(cls, text: str) -> bool:
+        """检测 LLM 回复中是否声称执行了文件操作。"""
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in cls._FILE_CLAIM_KEYWORDS)
 
     def _inject_project_context(self) -> None:
         """首次对话时注入项目上下文（类型、文件树、规则）。"""
