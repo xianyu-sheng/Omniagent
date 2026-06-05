@@ -126,12 +126,12 @@ BUILTIN_TOOLS = {
     "batch_write": {
         "name": "batch_write",
         "description": "一次性写入多个文件（原子操作，全部成功或全部回滚）。适合创建多文件项目结构。",
-        "params": {"files": "文件列表，格式: [{"path": "a.py", "content": "文件内容"}, ...]"},
+        "params": {"files": "文件列表，格式: [{path: a.py, content: 文件内容}, ...]"},
     },
     "batch_edit": {
         "name": "batch_edit",
         "description": "一次性编辑多个文件，每个编辑操作独立执行和验证。适合跨文件重构。",
-        "params": {"edits": "编辑列表，格式: [{"file_path": "a.py", "old_text": "原文", "new_text": "新文"}, ...]"},
+        "params": {"edits": "编辑列表，格式: [{file_path: a.py, old_text: 原文, new_text: 新文}, ...]"},
     },
     "code_index": {
         "name": "code_index",
@@ -156,14 +156,14 @@ BUILTIN_TOOLS = {
     "mcp_call": {
         "name": "mcp_call",
         "description": "调用通过 MCP 协议连接的外部工具服务器。需要先用 /mcp add 命令添加服务器并发现可用工具。",
-        "params": {"tool_name": "MCP 工具名，格式为 server:tool 或 tool", "tool_args": "工具参数字典，如 {"query": "搜索词"}"},
+        "params": {"tool_name": "MCP 工具名，格式为 server:tool 或 tool", "tool_args": "工具参数字典"},
     },
     "github_fetch": {
         "name": "github_fetch",
         "description": "GitHub 仓库专用操作工具。list_files: 列出仓库中所有文件路径（通过 GitHub API）；fetch_file: 获取指定文件的源码内容；fetch_readme: 自动查找并获取 README 文件。仅支持公开仓库。",
         "params": {"repo": "仓库标识，格式为 owner/repo（如 facebook/react）", "github_action": "list_files（列出文件）| fetch_file（获取文件）| fetch_readme（获取README）", "github_path": "文件路径（仅 fetch_file 时需要，如 src/index.js）", "branch": "分支名（可选，默认 main，失败时自动尝试 master）"},
     },
-}}
+}
 
 
 class ReActEngine:
