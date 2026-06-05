@@ -325,34 +325,96 @@ class REPL:
 
         lines: list[str] = []
         current_line: list[str] = []
+        cursor_pos: int = 0  # 光标在 current_line 中的位置索引
+
+        def _redraw_from_cursor() -> None:
+            """从光标位置重绘到行尾。"""
+            # 打印光标右侧的所有字符
+            tail = "".join(current_line[cursor_pos:])
+            if tail:
+                sys.stdout.write(tail)
+            # 清除行尾残留字符（多出一个空格用于覆盖）
+            sys.stdout.write(" ")
+            # 把光标移回到正确位置
+            back = len(tail) + 1
+            if back > 0:
+                sys.stdout.write(f"\033[{back}D")
+            sys.stdout.flush()
 
         while True:
             ch = msvcrt.getwch()
 
             if ch in ('\r', '\n'):
                 if shift_held():
+                    # 多行模式：跳到行尾再换行
+                    if cursor_pos < len(current_line):
+                        sys.stdout.write(f"\033[{len(current_line) - cursor_pos}C")
+                        cursor_pos = len(current_line)
                     lines.append("".join(current_line))
                     current_line = []
+                    cursor_pos = 0
                     sys.stdout.write("\n\033[90m...\033[0m ")
                     sys.stdout.flush()
                 else:
+                    # 跳到行尾再回车（避免残留）
+                    if cursor_pos < len(current_line):
+                        sys.stdout.write(f"\033[{len(current_line) - cursor_pos}C")
                     break
 
             elif ch == '\x03':
                 raise KeyboardInterrupt
 
             elif ch in ('\x08', '\x7f'):
-                if current_line:
-                    deleted = current_line.pop()
-                    erase_char(deleted)
+                # Backspace: 删除光标左侧字符
+                if cursor_pos > 0:
+                    deleted = current_line.pop(cursor_pos - 1)
+                    cursor_pos -= 1
+                    # 光标左移一格
+                    sys.stdout.write('\033[1D')
+                    # 重绘后面的字符并清除行尾
+                    _redraw_from_cursor()
 
             elif ch in ('\x00', '\xe0'):
-                msvcrt.getwch()  # 消耗第二字节
+                # 扩展键序列（方向键、Home/End 等）
+                second = msvcrt.getwch()
+                if second == 'K':        # ← 左箭头
+                    if cursor_pos > 0:
+                        cursor_pos -= 1
+                        sys.stdout.write('\033[1D')
+                        sys.stdout.flush()
+                elif second == 'M':      # → 右箭头
+                    if cursor_pos < len(current_line):
+                        cursor_pos += 1
+                        sys.stdout.write('\033[1C')
+                        sys.stdout.flush()
+                elif second == 'H':      # Home
+                    if cursor_pos > 0:
+                        sys.stdout.write(f"\033[{cursor_pos}D")
+                        cursor_pos = 0
+                        sys.stdout.flush()
+                elif second == 'O':      # End
+                    if cursor_pos < len(current_line):
+                        sys.stdout.write(f"\033[{len(current_line) - cursor_pos}C")
+                        cursor_pos = len(current_line)
+                        sys.stdout.flush()
+                elif second == 'S':      # Delete
+                    if cursor_pos < len(current_line):
+                        current_line.pop(cursor_pos)
+                        _redraw_from_cursor()
 
             elif ch and ord(ch) >= 0x20:
-                current_line.append(ch)
-                sys.stdout.write(ch)
-                sys.stdout.flush()
+                # 可见字符：在光标位置插入
+                if cursor_pos >= len(current_line):
+                    # 追加到末尾（常见情况，快速路径）
+                    current_line.append(ch)
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
+                else:
+                    # 插入到中间位置
+                    current_line.insert(cursor_pos, ch)
+                    # 重绘插入点之后的内容
+                    _redraw_from_cursor()
+                cursor_pos += 1
 
         if current_line:
             lines.append("".join(current_line))
