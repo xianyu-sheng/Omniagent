@@ -52,7 +52,7 @@ class TestProjectContext:
         """加载 .omniagent/rules.md。"""
         rules_dir = tmp_path / ".omniagent"
         rules_dir.mkdir()
-        (rules_dir / "rules.md").write_text("使用 Python 3.12\n遵循 PEP 8")
+        (rules_dir / "rules.md").write_text("使用 Python 3.12\n遵循 PEP 8", encoding="utf-8")
         (tmp_path / "pyproject.toml").write_text("")
 
         pc = ProjectContext()
@@ -126,7 +126,7 @@ class TestProjectContext:
         # 添加规则文件后刷新
         rules_dir = tmp_path / ".omniagent"
         rules_dir.mkdir()
-        (rules_dir / "rules.md").write_text("新规则")
+        (rules_dir / "rules.md").write_text("新规则", encoding="utf-8")
         pc.refresh()
         assert "新规则" in pc.rules
 

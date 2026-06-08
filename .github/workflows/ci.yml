@@ -11,6 +11,7 @@ jobs:
     runs-on: windows-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
 
@@ -34,17 +35,8 @@ jobs:
       - name: Compile package
         run: python -m compileall omniagent evals
 
-      - name: Test core and tools
-        run: python -m pytest tests/test_core.py tests/test_tools.py -q --tb=short
-
-      - name: Test REPL
-        run: python -m pytest tests/test_repl.py -q --tb=short
-
-      - name: Test evals and callbacks
-        run: python -m pytest tests/test_evals.py tests/test_callbacks.py -q --tb=short
-
-      - name: Test project utilities
-        run: python -m pytest tests/test_code_editor.py tests/test_code_index.py tests/test_memory.py tests/test_project_context.py tests/test_prompt_optimizer.py tests/test_response_adapter.py tests/test_shortcuts.py tests/test_skills.py -q --tb=short
+      - name: Run tests
+        run: python -m pytest tests -q --tb=short
 
       - name: Run mock eval
         run: python evals/runner.py --mode mock --output evals/reports/mock_report.md
