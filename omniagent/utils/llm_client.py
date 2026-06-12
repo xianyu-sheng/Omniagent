@@ -400,6 +400,256 @@ def _stream_openai_compat(
                     continue
 
 
+# ── 异步调用接口 ──────────────────────────────────────────
+
+async def chat_completion_async(
+    model_id: str,
+    messages: list[dict[str, str]],
+    *,
+    credentials: dict[str, Any] | None = None,
+    max_tokens: int = 4096,
+    temperature: float = 0.7,
+    timeout: float = 120.0,
+    max_retries: int = 3,
+) -> str:
+    """异步 chat completion 调用（带重试）。
+
+    与 chat_completion 功能相同，但使用 httpx.AsyncClient 实现非阻塞调用。
+    """
+    import asyncio
+
+    endpoint = build_endpoint(model_id, credentials)
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            if endpoint.provider == "anthropic":
+                return await _call_anthropic_async(endpoint, messages, max_tokens, temperature, timeout)
+            else:
+                return await _call_openai_compat_async(endpoint, messages, max_tokens, temperature, timeout)
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status == 429:
+                wait = 2 ** attempt
+                logger.warning(f"[{model_id}] 429 限流，等待 {wait}s 后重试 (第 {attempt + 1}/{max_retries} 次)")
+                await asyncio.sleep(wait)
+                last_error = e
+            elif 500 <= status < 600:
+                wait = 2 ** attempt
+                logger.warning(f"[{model_id}] {status} 服务端错误，等待 {wait}s 后重试 (第 {attempt + 1}/{max_retries} 次)")
+                await asyncio.sleep(wait)
+                last_error = e
+            else:
+                raise
+
+        except (
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.RemoteProtocolError,
+            httpx.WriteError,
+            httpx.PoolTimeout,
+        ) as e:
+            wait = min(2 ** attempt, 8)
+            logger.warning(f"[{model_id}] 网络错误 ({type(e).__name__}): {e}，等待 {wait}s 后重试 (第 {attempt + 1}/{max_retries} 次)")
+            await asyncio.sleep(wait)
+            last_error = e
+
+    raise last_error
+
+
+async def _call_openai_compat_async(
+    endpoint: ModelEndpoint,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+) -> str:
+    """OpenAI 兼容格式异步调用。"""
+    url = _openai_compat_url(endpoint, "chat/completions")
+    headers = {
+        "Authorization": f"Bearer {endpoint.api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": endpoint.model_name,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+        finish = data["choices"][0].get("finish_reason", "")
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or msg.get("thinking") or ""
+
+        if content:
+            logger.info(f"API 响应: content={content[:300]}")
+        elif reasoning:
+            logger.info(f"API 响应: content=空, reasoning_content={reasoning[:300]}")
+        else:
+            logger.warning(f"API 响应: content 和 reasoning_content 均为空! finish_reason={finish}")
+
+        if not content and reasoning:
+            content = reasoning
+
+        if finish == "length":
+            logger.warning(f"API 响应被截断 (finish_reason=length)，考虑增大 max_tokens")
+
+        return content
+
+
+async def _call_anthropic_async(
+    endpoint: ModelEndpoint,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+) -> str:
+    """Anthropic 原生 API 格式异步调用。"""
+    url = f"{endpoint.base_url}/v1/messages"
+    headers = {
+        "x-api-key": endpoint.api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    system_text = ""
+    chat_messages = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_text = msg["content"]
+        else:
+            chat_messages.append(msg)
+
+    payload: dict[str, Any] = {
+        "model": endpoint.model_name,
+        "messages": chat_messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if system_text:
+        payload["system"] = system_text
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["content"][0]["text"]
+
+
+async def chat_completion_stream_async(
+    model_id: str,
+    messages: list[dict[str, str]],
+    *,
+    credentials: dict[str, Any] | None = None,
+    max_tokens: int = 4096,
+    temperature: float = 0.7,
+    timeout: float = 300.0,
+):
+    """异步流式 chat completion。返回 async generator。"""
+    endpoint = build_endpoint(model_id, credentials)
+
+    if endpoint.provider == "anthropic":
+        async for chunk in _stream_anthropic_async(endpoint, messages, max_tokens, temperature, timeout):
+            yield chunk
+    else:
+        async for chunk in _stream_openai_compat_async(endpoint, messages, max_tokens, temperature, timeout):
+            yield chunk
+
+
+async def _stream_openai_compat_async(
+    endpoint: ModelEndpoint,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+):
+    """OpenAI 兼容格式异步流式调用。"""
+    url = _openai_compat_url(endpoint, "chat/completions")
+    headers = {
+        "Authorization": f"Bearer {endpoint.api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": endpoint.model_name,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True,
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, json=payload, headers=headers) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk["choices"][0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+
+
+async def _stream_anthropic_async(
+    endpoint: ModelEndpoint,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+):
+    """Anthropic 原生格式异步流式调用。"""
+    url = f"{endpoint.base_url}/v1/messages"
+    headers = {
+        "x-api-key": endpoint.api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    system_text = ""
+    chat_messages = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_text = msg["content"]
+        else:
+            chat_messages.append(msg)
+
+    payload: dict[str, Any] = {
+        "model": endpoint.model_name,
+        "messages": chat_messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True,
+    }
+    if system_text:
+        payload["system"] = system_text
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, json=payload, headers=headers) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                try:
+                    event = json.loads(data_str)
+                    if event.get("type") == "content_block_delta":
+                        delta = event.get("delta", {})
+                        text = delta.get("text")
+                        if text:
+                            yield text
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+
 def _stream_anthropic(
     endpoint: ModelEndpoint,
     messages: list[dict[str, str]],
