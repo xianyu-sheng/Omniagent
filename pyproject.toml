@@ -14,6 +14,7 @@ dependencies = [
     "prompt_toolkit>=3.0.0",
     "pyyaml>=6.0",
     "rich>=13.0.0",
+    "textual>=0.50.0",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,7 @@ dev = [
 [project.scripts]
 omniagent = "omniagent.main:cli"
 omniagent-core = "omniagent.core.app:run"
+omniagent-tui = "omniagent.tui.app:start_tui"
 
 # ════════════════════════════════════════════════════════════
 # KamaClaude 借鉴: 工程质量管理
