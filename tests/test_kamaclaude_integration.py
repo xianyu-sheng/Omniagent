@@ -814,7 +814,13 @@ print(f"  📈 Pass rate: {OK/total*100:.1f}%" if total > 0 else "  📈 N/A")
 
 if FAIL > 0:
     print("\n  ⚠️  FIXES NEEDED — see failures above")
-    sys.exit(1)
 else:
     print("\n  🎉 ALL TESTS PASSED — KamaClaude fusion verified!")
-    sys.exit(0)
+
+
+def test_kamaclaude_integration_report() -> None:
+    assert FAIL == 0
+
+
+if __name__ == "__main__":
+    sys.exit(1 if FAIL > 0 else 0)
