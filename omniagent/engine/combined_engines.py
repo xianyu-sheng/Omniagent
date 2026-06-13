@@ -60,7 +60,7 @@ class PlanReactEngine:
             return f"规划阶段失败: {e}"
         steps = plan.get("steps", [])
         analysis = plan.get("analysis", "")
-        logger.info(f"Plan 结果: steps={len(steps)}, analysis={analysis[:200] if analysis else '(空)'}")
+        logger.debug(f"Plan 结果: steps={len(steps)}, analysis={analysis[:200] if analysis else '(空)'}")
 
         if not steps:
             console.print(f"[yellow]  ⚠ 未生成步骤，analysis={analysis[:200] if analysis else '(空)'}[/yellow]")
@@ -209,11 +209,11 @@ class PlanReflectionEngine:
         ctx = context or AgentContext()
 
         # Phase 1: Plan-Execute 执行
-        logger.info("PlanReflection Phase 1: 规划并执行")
+        logger.debug("PlanReflection Phase 1: 规划并执行")
         initial_output = self.planner.run(user_input, context=ctx)
 
         # Phase 2: Reflection 审查和修正
-        logger.info("PlanReflection Phase 2: 反思审查")
+        logger.debug("PlanReflection Phase 2: 反思审查")
         try:
             final_output = self.reflector.run(
                 f"原始任务: {user_input}\n\n执行结果:\n{initial_output}", context=ctx
@@ -260,11 +260,11 @@ class ReactReflectionEngine:
         ctx = context or AgentContext()
 
         # Phase 1: ReAct 探索和执行
-        logger.info("ReactReflection Phase 1: ReAct 探索执行")
+        logger.debug("ReactReflection Phase 1: ReAct 探索执行")
         initial_output = self.reactor.run(user_input, context=ctx)
 
         # Phase 2: Reflection 审查和修正
-        logger.info("ReactReflection Phase 2: 反思审查")
+        logger.debug("ReactReflection Phase 2: 反思审查")
         try:
             final_output = self.reflector.run(
                 f"原始任务: {user_input}\n\n执行结果:\n{initial_output}", context=ctx

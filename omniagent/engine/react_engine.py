@@ -275,7 +275,7 @@ class ReActEngine:
         if history:
             recent = [m for m in history if m.get("role") != "system"][-10:]
             messages.extend(recent)
-            logger.info(f"ReAct 注入 {len(recent)} 条对话历史")
+            logger.debug(f"ReAct 注入 {len(recent)} 条对话历史")
         else:
             logger.warning("ReAct: 无对话历史可注入！")
         messages.append({"role": "user", "content": user_input})
@@ -285,7 +285,7 @@ class ReActEngine:
         no_tool_streak = 0  # 连续未执行工具的轮次
 
         for i in range(self.max_iterations):
-            logger.info(f"ReAct 迭代 {i + 1}/{self.max_iterations}")
+            logger.debug(f"ReAct 迭代 {i + 1}/{self.max_iterations}")
 
             # 调用 LLM
             response = self._call_llm(messages)
@@ -327,11 +327,11 @@ class ReActEngine:
                         self.callback.on_finish(answer + warning)
                         return answer + warning
 
-                logger.info(f"ReAct 完成，共 {i + 1} 次迭代，工具调用 {len(tracker.calls)} 次")
+                logger.debug(f"ReAct 完成，共 {i + 1} 次迭代，工具调用 {len(tracker.calls)} 次")
                 answer = final_answer
                 if tracker.has_executions():
                     summary = tracker.execution_summary()
-                    logger.info(f"ReAct 工具执行摘要: {summary}")
+                    logger.debug(f"ReAct 工具执行摘要: {summary}")
                 self.callback.on_finish(answer)
                 return answer
 
@@ -340,8 +340,8 @@ class ReActEngine:
                 action = parsed["action"]
                 action_input = parsed.get("action_input", {})
 
-                logger.info(f"ReAct 思考: {thought}")
-                logger.info(f"ReAct 行动: {action}({action_input})")
+                logger.debug(f"ReAct 思考: {thought}")
+                logger.debug(f"ReAct 行动: {action}({action_input})")
                 self.callback.on_act(action, action_input)
 
                 observation = self._execute_tool(action, action_input, ctx, tracker)
@@ -350,7 +350,7 @@ class ReActEngine:
                 # 将观察结果加入对话
                 obs_msg = f"Observation: {observation}"
                 messages.append({"role": "user", "content": obs_msg})
-                logger.info(f"ReAct 观察: {observation[:200]}")
+                logger.debug(f"ReAct 观察: {observation[:200]}")
                 no_tool_streak = 0
             else:
                 # LLM 没有给出有效输出，尝试从最后一条观察中提取
@@ -418,14 +418,14 @@ class ReActEngine:
 
         try:
             action_input = ToolNode.normalize_params(action_input)
-            logger.info(f"执行工具: {action}, 参数: {action_input}")
+            logger.debug(f"执行工具: {action}, 参数: {action_input}")
             node = ToolNode(
                 f"react_{action}",
                 action_type=action,
                 **action_input,
             )
             result = node.execute(context)
-            logger.info(f"工具结果: {str(result)[:200]}")
+            logger.debug(f"工具结果: {str(result)[:200]}")
 
             success = result.get("success", False)
             error = result.get("error")

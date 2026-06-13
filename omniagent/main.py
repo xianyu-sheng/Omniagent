@@ -107,6 +107,9 @@ def cli() -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # 抑制第三方库的 INFO 日志（httpx, urllib3 等）
+    for noisy in ("httpx", "httpcore", "urllib3", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     cmd = args.command_or_workflow
 

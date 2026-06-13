@@ -43,7 +43,7 @@ def register_dynamic_tool(name: str, handler, description: str, params: dict) ->
         "description": description,
         "params": params,
     }
-    logger.info(f"[DynamicTool] 注册工具: {name}")
+    logger.debug(f"[DynamicTool] 注册工具: {name}")
 
 
 def get_dynamic_tool_schema(name: str) -> dict | None:
@@ -446,7 +446,7 @@ class ToolNode(BaseNode):
         else:
             shell_exec = ["/bin/bash", "-c", resolved_cmd]
 
-        logger.info(f"[{self.id}] 执行命令: {resolved_cmd}")
+        logger.debug(f"[{self.id}] 执行命令: {resolved_cmd}")
 
         try:
             proc = subprocess.run(
@@ -467,7 +467,7 @@ class ToolNode(BaseNode):
                 "success": proc.returncode == 0,
             }
             self._write_output(context, proc.stdout.strip())
-            logger.info(f"[{self.id}] 命令完成，返回码: {proc.returncode}")
+            logger.debug(f"[{self.id}] 命令完成，返回码: {proc.returncode}")
             return result
 
         except subprocess.TimeoutExpired:
@@ -507,7 +507,7 @@ class ToolNode(BaseNode):
         path.parent.mkdir(parents=True, exist_ok=True)
 
         mode = "a" if self.append else "w"
-        logger.info(f"[{self.id}] {'追加' if self.append else '写入'}文件: {path}")
+        logger.debug(f"[{self.id}] {'追加' if self.append else '写入'}文件: {path}")
 
         with open(path, mode, encoding=self.encoding) as f:
             f.write(content)
@@ -549,14 +549,14 @@ class ToolNode(BaseNode):
             return f"写入验证失败: 无法获取文件大小"
 
         if file_size > MAX_VERIFY_SIZE:
-            logger.info(f"文件 {path} 大小 {file_size} 字节，跳过内容回读验证")
+            logger.debug(f"文件 {path} 大小 {file_size} 字节，跳过内容回读验证")
             return None
 
         try:
             actual = path.read_text(encoding=self.encoding)
         except UnicodeDecodeError:
             # 二进制文件无法以文本方式读取，只验证大小
-            logger.info(f"文件 {path} 为二进制格式，跳过内容验证")
+            logger.debug(f"文件 {path} 为二进制格式，跳过内容验证")
             return None
         except Exception as e:
             return f"写入后读取验证失败: {e}"
@@ -647,7 +647,7 @@ class ToolNode(BaseNode):
         # 安全验证
         path = self._validate_path(dir_path, for_write=True)
 
-        logger.info(f"[{self.id}] 创建目录: {path}")
+        logger.debug(f"[{self.id}] 创建目录: {path}")
 
         try:
             path.mkdir(parents=True, exist_ok=True)
@@ -1185,7 +1185,7 @@ class ToolNode(BaseNode):
         except OSError:
             pass
 
-        logger.info(f"[{self.id}] 读取文件: {path}")
+        logger.debug(f"[{self.id}] 读取文件: {path}")
 
         # 分段读取：start_line（从 1 开始）和 max_lines
         start_line = getattr(self, '_extra_start_line', None)
@@ -1256,7 +1256,7 @@ class ToolNode(BaseNode):
             "pattern": pattern, "files": files, "count": len(files), "success": True,
         }
         self._write_output(context, display)
-        logger.info(f"[{self.id}] 列出 {len(files)} 个文件: {path}")
+        logger.debug(f"[{self.id}] 列出 {len(files)} 个文件: {path}")
         return result
 
     def _walk_with_depth(self, base: Path, pattern: str, max_depth: int):
@@ -1343,7 +1343,7 @@ class ToolNode(BaseNode):
             "files_scanned": files_scanned, "success": True,
         }
         self._write_output(context, display)
-        logger.info(f"[{self.id}] 搜索到 {len(matches)} 处匹配: {search_pattern}")
+        logger.debug(f"[{self.id}] 搜索到 {len(matches)} 处匹配: {search_pattern}")
         return result
 
     # ── Git 操作 ──────────────────────────────────────────
@@ -1379,7 +1379,7 @@ class ToolNode(BaseNode):
         else:
             cmd = ["git"] + git_cmd.split() + (extra_args.split() if extra_args else [])
 
-        logger.info(f"[{self.id}] git {' '.join(cmd[1:])}")
+        logger.debug(f"[{self.id}] git {' '.join(cmd[1:])}")
 
         try:
             proc = subprocess.run(
@@ -1424,7 +1424,7 @@ class ToolNode(BaseNode):
                 "error": "禁止访问内网/元数据地址",
             }
 
-        logger.info(f"[{self.id}] 抓取网页: {url}")
+        logger.debug(f"[{self.id}] 抓取网页: {url}")
 
         try:
             import httpx
@@ -1465,7 +1465,7 @@ class ToolNode(BaseNode):
         city = self._resolve_template(getattr(self, "city", ""), context) or "Beijing"
         lang = self._resolve_template(getattr(self, "lang", ""), context) or "zh"
 
-        logger.info(f"[{self.id}] 查询天气: {city}")
+        logger.debug(f"[{self.id}] 查询天气: {city}")
 
         try:
             from omniagent.utils.weather import get_weather, format_weather_report
@@ -1559,7 +1559,7 @@ class ToolNode(BaseNode):
         branch = self._resolve_template(self.branch, context) or "main"
         github_path = self._resolve_template(self.github_path, context) or ""
 
-        logger.info(f"[{self.id}] GitHub {action}: {repo} (branch={branch}, path={github_path})")
+        logger.debug(f"[{self.id}] GitHub {action}: {repo} (branch={branch}, path={github_path})")
 
         try:
             import httpx
@@ -1738,7 +1738,7 @@ class ToolNode(BaseNode):
 
                 register_dynamic_tool(tool_name, make_handler(func), description or f"自定义工具: {tool_name}", params_raw)
                 msg = f"✅ 工具 '{tool_name}' 注册成功（Python 函数: {python_function}）"
-                logger.info(f"[register_tool] {msg}")
+                logger.debug(f"[register_tool] {msg}")
                 return {"action_type": "register_tool", "success": True, "content": msg}
 
             except Exception as e:
@@ -1771,7 +1771,7 @@ class ToolNode(BaseNode):
 
             register_dynamic_tool(tool_name, cmd_handler, description or f"自定义命令: {tool_name}", params_raw)
             msg = f"✅ 工具 '{tool_name}' 注册成功（命令模板: {command_template}）"
-            logger.info(f"[register_tool] {msg}")
+            logger.debug(f"[register_tool] {msg}")
             return {"action_type": "register_tool", "success": True, "content": msg}
 
         return {"action_type": "register_tool", "success": False,

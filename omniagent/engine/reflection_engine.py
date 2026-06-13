@@ -95,7 +95,7 @@ class ReflectionEngine:
         feedback = ""
 
         for round_num in range(1, self.max_rounds + 1):
-            logger.info(f"Reflection 第 {round_num} 轮")
+            logger.debug(f"Reflection 第 {round_num} 轮")
 
             # Execute
             output = self._execute(user_input, feedback, context)
@@ -108,18 +108,18 @@ class ReflectionEngine:
             self.callback.on_review(score, passed, review.get("feedback", "")[:200])
 
             if passed:
-                logger.info(f"审查通过 (分数: {score})")
+                logger.debug(f"审查通过 (分数: {score})")
                 self.callback.on_finish(output)
                 return output
 
             feedback = review.get("feedback", "请改进输出质量")
             issues = review.get("issues", [])
-            logger.info(f"审查未通过: {feedback}")
+            logger.debug(f"审查未通过: {feedback}")
 
             if issues:
                 feedback += "\n具体问题:\n" + "\n".join(f"- {i}" for i in issues)
 
-        logger.info(f"达到最大修正轮次 ({self.max_rounds})，返回最后一轮输出")
+        logger.debug(f"达到最大修正轮次 ({self.max_rounds})，返回最后一轮输出")
         self.callback.on_warning(f"达到最大修正轮次 ({self.max_rounds})")
         self.callback.on_finish(output)
         return output

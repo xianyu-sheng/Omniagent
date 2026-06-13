@@ -55,7 +55,7 @@ class ToolExecutionTracker:
         )
         self.calls.append(call)
         status = "成功" if success else "失败"
-        logger.info(f"[Tracker] {tool_name} -> {status}: {result_summary[:100]}")
+        logger.debug(f"[Tracker] {tool_name} -> {status}: {result_summary[:100]}")
 
     def has_executions(self) -> bool:
         """是否有任何工具被实际执行过。"""
