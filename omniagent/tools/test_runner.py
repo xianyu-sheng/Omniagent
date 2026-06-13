@@ -7,6 +7,7 @@ Agent 写完代码后自动运行测试验证:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import subprocess
@@ -147,26 +148,18 @@ class PytestTool(BaseTool):
                 re.IGNORECASE,
             )
         if short_match:
-            try:
+            with contextlib.suppress(IndexError, ValueError):
                 result["passed"] = int(short_match.group(1))
-            except (IndexError, ValueError):
-                pass
-            try:
+            with contextlib.suppress(IndexError, ValueError):
                 result["failed"] = int(short_match.group(2))
-            except (IndexError, ValueError):
-                pass
-            try:
+            with contextlib.suppress(IndexError, ValueError):
                 result["errors"] = int(short_match.group(3))
-            except (IndexError, ValueError):
-                result["errors"] = 0
 
         # 匹配跳过的测试
         skipped_match = re.search(r"(\d+)\s+skipped", output, re.IGNORECASE)
         if skipped_match:
-            try:
+            with contextlib.suppress(IndexError, ValueError):
                 result["skipped"] = int(skipped_match.group(1))
-            except (IndexError, ValueError):
-                pass
 
         # 匹配单行摘要
         summary_match = re.search(r"(=+.*=+)", output)
@@ -214,7 +207,7 @@ class TestCommandTool(BaseTool):
 
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         test_cmd = str(params.get("command", "")).strip()
-        timeout_s = int(params.get("timeout_seconds", 120))
+        timeout_s = int(str(params.get("timeout_seconds", 120)))
 
         if not test_cmd:
             return ToolResult.schema_error("run_test 需要 command 参数")
@@ -248,10 +241,9 @@ class TestCommandTool(BaseTool):
                 returncode=0,
                 stdout=output[:5000],
             )
-        else:
-            return ToolResult.ok(
-                f"测试失败 (exit={proc.returncode})\n\nSTDOUT:\n{output[:2000]}\n\nSTDERR:\n{errors[:2000]}",
-                returncode=proc.returncode,
-                stdout=output[:5000],
-                stderr=errors[:5000],
-            )
+        return ToolResult.ok(
+            f"测试失败 (exit={proc.returncode})\n\nSTDOUT:\n{output[:2000]}\n\nSTDERR:\n{errors[:2000]}",
+            returncode=proc.returncode,
+            stdout=output[:5000],
+            stderr=errors[:5000],
+        )

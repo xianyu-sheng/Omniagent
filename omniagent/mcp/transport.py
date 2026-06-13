@@ -34,15 +34,29 @@ class MCPTransport:
 
 
 class StdioTransport(MCPTransport):
-    """通过子进程 stdio 通信。"""
+    """通过子进程 stdio 通信，支持崩溃自动重启。
 
-    def __init__(self, command: str, args: list[str] | None = None, env: dict[str, str] | None = None) -> None:
+    当子进程意外退出时，后续请求会自动重启子进程（最多 max_restarts 次）。
+    """
+
+    def __init__(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        *,
+        max_restarts: int = 3,
+        restart_delay: float = 1.0,
+    ) -> None:
         self.command = command
         self.args = args or []
         self.env = env
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._request_id = 0
+        self._max_restarts = max_restarts
+        self._restart_delay = restart_delay
+        self._restart_count = 0
         self._start()
 
     def _start(self) -> None:
@@ -68,10 +82,40 @@ class StdioTransport(MCPTransport):
         except Exception as e:
             raise RuntimeError(f"MCP 子进程启动失败: {e}")
 
+    def _ensure_running(self) -> None:
+        """确保子进程在运行。崩溃时自动重启（最多 max_restarts 次）。"""
+        if self._proc is not None and self._proc.poll() is None:
+            return  # 正常运行中
+
+        # 需要重启
+        if self._restart_count >= self._max_restarts:
+            raise RuntimeError(
+                f"MCP 子进程已达到最大重启次数 ({self._max_restarts})，"
+                f"请检查命令: {self.command}"
+            )
+
+        self._restart_count += 1
+        if self._restart_delay > 0 and self._restart_count > 1:
+            import time
+            time.sleep(self._restart_delay * self._restart_count)
+
+        logger.warning(
+            f"MCP 子进程已退出，正在重启 (第 {self._restart_count}/{self._max_restarts} 次)..."
+        )
+        self._start()
+
+    def is_running(self) -> bool:
+        """检查子进程是否在运行。"""
+        return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def restart_count(self) -> int:
+        """返回重启次数。"""
+        return self._restart_count
+
     def send(self, message: dict[str, Any]) -> None:
         """发送 JSON-RPC 消息。"""
-        if not self._proc or self._proc.poll() is not None:
-            raise RuntimeError("MCP 子进程未运行")
+        self._ensure_running()
 
         data = json.dumps(message) + "\n"
         with self._lock:
@@ -83,8 +127,7 @@ class StdioTransport(MCPTransport):
 
     def receive(self) -> dict[str, Any]:
         """接收 JSON-RPC 消息。"""
-        if not self._proc or self._proc.poll() is not None:
-            raise RuntimeError("MCP 子进程未运行")
+        self._ensure_running()
 
         with self._lock:
             try:
@@ -99,8 +142,7 @@ class StdioTransport(MCPTransport):
     def request(self, method: str, params: dict[str, Any] | None = None, max_retries: int = 50) -> dict[str, Any]:
         """发送请求并等待响应（原子操作）。"""
         with self._lock:
-            if not self._proc or self._proc.poll() is not None:
-                raise RuntimeError("MCP 子进程未运行")
+            self._ensure_running()
 
             self._request_id += 1
             request_id = self._request_id

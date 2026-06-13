@@ -31,27 +31,109 @@ omniagent-tui = "omniagent.tui.app:start_tui"
 # KamaClaude 借鉴: 工程质量管理
 # ════════════════════════════════════════════════════════════
 
-# ── Ruff: 快速 linter + import 排序 ──
+# ── Ruff: 快速 linter + import 排序 + 格式化 ──
 [tool.ruff]
 src = ["."]
 line-length = 100
 target-version = "py312"
+exclude = [".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__", "build", "dist"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]  # pycodestyle 错误、Pyflakes、isort、pyupgrade
-ignore = []
+select = [
+    # pycodestyle errors
+    "E",
+    # Pyflakes
+    "F",
+    # isort (import sorting)
+    "I",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear (common bugs)
+    "B",
+    # flake8-comprehensions
+    "C4",
+    # flake8-simplify
+    "SIM",
+    # Ruff-specific rules
+    "RUF",
+    # flake8-print
+    "T20",
+    # flake8-return
+    "RET",
+    # flake8-errmsg
+    "EM",
+    # flake8-no-pep420
+    "INP",
+    # Perflint
+    "PERF",
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "B904",   # raise from err
+    "RUF001", # ambiguous unicode characters (false positives in Chinese text)
+    "RUF002", # ambiguous unicode characters in docstrings
+    "RUF003", # ambiguous unicode characters in comments
+]
+fixable = ["ALL"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["E501"]  # 测试文件允许长行
+"tests/**/*.py" = ["S101", "S311", "T20"]
+"omniagent/__init__.py" = ["F401"]
+"__init__.py" = ["F401"]
+"omniagent/tools/**/*.py" = ["RUF012"]  # BaseTool input_schema 设计上就是类级别字典
+"omniagent/engine/checkpoint.py" = ["UP017"]  # timezone.utc 兼容 3.10
+
+[tool.ruff.lint.isort]
+force-single-line = false
+combine-as-imports = true
+split-on-trailing-comma = false
+order-by-type = true
+relative-imports-order = "closest-to-furthest"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
 
 # ── Mypy: 静态类型检查 ──
 [tool.mypy]
 python_version = "3.10"
-strict = false  # 渐进式: 先关闭 strict, 逐步打开
+strict = true
 warn_return_any = true
 warn_unused_configs = true
-ignore_missing_imports = true  # 第三方库可能无 stubs
-exclude = ["tests/", "build/"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_no_return = true
+disallow_any_generics = false
+disallow_subclassing_any = false
+ignore_missing_imports = true
+check_untyped_defs = true
+no_implicit_optional = true
+exclude = ["tests/", "build/", ".venv/", ".claude/"]
+
+# 允许新模块 strict，老模块逐步迁移
+[[tool.mypy.overrides]]
+module = [
+    "omniagent.engine.checkpoint",
+    "omniagent.engine.circuit_breaker",
+    "omniagent.tools.test_runner",
+]
+strict = true
+
+[[tool.mypy.overrides]]
+module = [
+    "omniagent.nodes.tool_node",
+    "omniagent.repl.repl",
+    "omniagent.engine.plan_execute_engine",
+    "omniagent.engine.reflection_engine",
+    "omniagent.engine.combined_engines",
+    "omniagent.engine.novel_engine",
+    "omniagent.tui.app",
+    "omniagent.engine.subagent",
+]
+ignore_errors = true
 
 [tool.setuptools.packages.find]
 include = ["omniagent*"]

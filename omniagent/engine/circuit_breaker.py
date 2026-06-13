@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -125,7 +125,9 @@ class CircuitBreaker:
 
         if not self.allow(tool_name):
             state = self._states.get(tool_name)
-            remaining = int((state.cooldown_until - time.time())) if state else 0
+            if state is None:
+                return None
+            remaining = int(state.cooldown_until - time.time())
             return (
                 f"⚠️ 工具 '{tool_name}' 已连续失败 {state.consecutive_failures} 次，"
                 f"暂时不可用（冷却 {remaining}s）。最后的错误: {error[:200]}\n"

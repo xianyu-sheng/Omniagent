@@ -2074,3 +2074,59 @@ def _cmd_novel(
             "  status             — 查看当前小说状态\n"
             "  delete <名称>      — 删除小说"
         )
+
+
+# /cleanup ───────────────────────────────────────────────────
+
+register_command(
+    "/cleanup",
+    "清理过期会话、运行记录和 checkpoint 备份",
+    "/cleanup [stats|dry-run]",
+)
+
+
+@_handler("/cleanup")
+def _cmd_cleanup(*, args: str, **kwargs: Any) -> str:
+    from omniagent.engine.cleanup import SessionCleaner
+
+    cleaner = SessionCleaner()
+    parts = args.strip().split()
+    sub = parts[0].lower() if parts else "run"
+
+    if sub == "stats":
+        s = cleaner.stats()
+        return (
+            f"═══ .omniagent 存储统计 ═══\n\n"
+            f"  会话: {s['sessions']['count']} 个 ({s['sessions']['size']})\n"
+            f"  运行记录: {s['runs']['count']} 个 ({s['runs']['size']})\n"
+            f"  Checkpoint: {s['checkpoints']['count']} 个 ({s['checkpoints']['size']})\n"
+            f"  总计: {s['total_size']}\n\n"
+            f"  保留策略:\n"
+            f"    会话: {s['retention']['sessions_days']} 天\n"
+            f"    运行记录: {s['retention']['runs_days']} 天\n"
+            f"    Checkpoint: {s['retention']['checkpoints_days']} 天"
+        )
+
+    if sub == "dry-run":
+        stats = cleaner.cleanup(dry_run=True)
+        return (
+            f"═══ 清理预览 (dry-run) ═══\n\n"
+            f"  将删除:\n"
+            f"    会话: {stats.sessions_deleted} 个 → 释放 {SessionCleaner._format_bytes(stats.bytes_freed)}\n"
+            f"    运行记录: {stats.runs_deleted} 个\n"
+            f"    Checkpoint: {stats.checkpoints_deleted} 个\n"
+            f"  将保留:\n"
+            f"    会话: {stats.sessions_kept} 个"
+        )
+
+    # 执行清理
+    stats = cleaner.cleanup()
+    if stats.sessions_deleted or stats.runs_deleted or stats.checkpoints_deleted:
+        return (
+            f"✅ 清理完成\n\n"
+            f"  删除会话: {stats.sessions_deleted} 个\n"
+            f"  删除运行记录: {stats.runs_deleted} 个\n"
+            f"  删除 checkpoint: {stats.checkpoints_deleted} 个\n"
+            f"  释放空间: {SessionCleaner._format_bytes(stats.bytes_freed)}"
+        )
+    return "✅ 无需清理，所有数据都在保留期内。"

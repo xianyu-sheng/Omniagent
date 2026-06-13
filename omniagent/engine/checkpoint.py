@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import logging
 import shutil
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ _CHECKPOINT_DIR_NAME = ".omniagent/checkpoints"
 
 
 def _ts() -> str:
-    return datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
 class CheckpointManager:
@@ -144,17 +144,16 @@ class CheckpointManager:
         Returns:
             列表，每项: {file: 原始路径, backup: 备份路径, time: 时间戳}
         """
-        items = []
-        for backup_dir in sorted(self._base.iterdir(), reverse=True):
-            if not backup_dir.is_dir():
-                continue
-            for backup_file in backup_dir.iterdir():
-                items.append({
-                    "file": self._backup_name_to_path(backup_file.name),
-                    "backup": str(backup_file),
-                    "time": backup_dir.name,
-                })
-        return items
+        return [
+            {
+                "file": self._backup_name_to_path(backup_file.name),
+                "backup": str(backup_file),
+                "time": backup_dir.name,
+            }
+            for backup_dir in sorted(self._base.iterdir(), reverse=True)
+            if backup_dir.is_dir()
+            for backup_file in backup_dir.iterdir()
+        ]
 
     def rollback_all(self, dry_run: bool = False) -> list[str]:
         """还原本次会话中所有已 checkpoint 的文件。
@@ -169,11 +168,7 @@ class CheckpointManager:
         if dry_run:
             return files
 
-        restored = []
-        for file_path in files:
-            if self.restore(file_path):
-                restored.append(file_path)
-        return restored
+        return [fp for fp in files if self.restore(fp)]
 
     # ── 上下文管理器 ──────────────────────────────────────────
 
@@ -185,11 +180,12 @@ class CheckpointManager:
             self._path = Path(file_path)
             self._saved = False
 
-        def __enter__(self):
+        def __enter__(self) -> CheckpointManager.Guard:
             self._saved = self._manager.save(self._path)
             return self
 
-        def __exit__(self, exc_type, exc_val, exc_tb):
+        def __exit__(self, exc_type: type | None, exc_val: BaseException | None,
+                     exc_tb: object) -> Literal[False]:
             if exc_type is not None:
                 # 异常 → 还原
                 if self._saved:
@@ -218,8 +214,7 @@ class CheckpointManager:
         """将文件路径转为备份文件名。"""
         # app.py → app.py
         # src/app.py → src_app.py
-        name = str(path).replace("\\", "/").replace(":", "").replace("/", "_")
-        return name
+        return str(path).replace("\\", "/").replace(":", "").replace("/", "_")
 
     @staticmethod
     def _backup_name_to_path(name: str) -> str:

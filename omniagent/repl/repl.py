@@ -277,6 +277,9 @@ class REPL:
         # 加载自定义快捷指令和技能
         self._load_custom_commands()
 
+        # 自动清理过期会话数据
+        self._auto_cleanup()
+
     def _print_welcome(self) -> None:
         """打印 Claude Code 风格的欢迎界面。"""
         import random
@@ -1196,6 +1199,21 @@ class REPL:
                 console.print(f"[dim]已加载 {len(skm.list_all())} 个技能[/dim]")
         except Exception as e:
             logger.debug(f"加载技能失败: {e}")
+
+    def _auto_cleanup(self) -> None:
+        """启动时自动清理过期会话数据。"""
+        try:
+            from omniagent.engine.cleanup import SessionCleaner
+            cleaner = SessionCleaner()
+            stats = cleaner.cleanup()
+            if stats.sessions_deleted or stats.runs_deleted or stats.checkpoints_deleted:
+                logger.info(
+                    f"自动清理: {stats.sessions_deleted} 会话, "
+                    f"{stats.runs_deleted} 运行记录, "
+                    f"{stats.checkpoints_deleted} checkpoint"
+                )
+        except Exception as e:
+            logger.debug(f"自动清理跳过: {e}")
 
 
 def start_repl(
