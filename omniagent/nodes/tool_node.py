@@ -21,8 +21,9 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from omniagent.engine.context import AgentContext
 from omniagent.engine.permissions import PermissionResult, get_permission_manager
@@ -293,10 +294,10 @@ class ToolNode(BaseNode):
     # ── 安全验证 ──────────────────────────────────────────
 
     # 类级别的审批处理器（由 REPL 注入）
-    _approval_handler: "Callable | None" = None
+    _approval_handler: Callable | None = None
 
     @classmethod
-    def set_approval_handler(cls, handler: "Callable | None") -> None:
+    def set_approval_handler(cls, handler: Callable | None) -> None:
         """设置交互式审批处理器。handler(tool_name, params_preview) -> bool"""
         cls._approval_handler = handler
 
@@ -312,8 +313,7 @@ class ToolNode(BaseNode):
                 allowed = ToolNode._approval_handler(tool_name, params_preview)
                 if allowed:
                     return PermissionResult("allow", "用户批准")
-                else:
-                    raise SecurityError(f"工具 '{tool_name}' 被用户拒绝")
+                raise SecurityError(f"工具 '{tool_name}' 被用户拒绝")
             # 没有审批处理器 → 降级为 allow（非严格模式下）
             logger.debug(f"工具 '{tool_name}' 需要审批但无审批处理器，降级为 allow")
             return PermissionResult("allow", "no approval handler, downgraded")
@@ -368,14 +368,23 @@ class ToolNode(BaseNode):
         resolved = path.resolve()
         root = self._get_allowed_root()
 
-        # 检查路径是否在允许的根目录下
-        try:
-            resolved.relative_to(root)
-        except ValueError:
-            raise SecurityError(
-                f"路径越界: {resolved} 不在允许的目录 {root} 下。"
-                f"文件操作限制在项目目录内。"
-            )
+        if for_write:
+            # 写操作：严格限制在项目目录内
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                msg = (
+                    f"写入路径越界: {resolved} 不在项目目录 {root} 下。"
+                    f"分析外部项目请使用只读工具（list_files/read_file/search_files）。"
+                )
+                raise SecurityError(msg)
+        else:
+            # 读操作：允许任意本地路径，仅拦截系统敏感目录
+            resolved_lower = str(resolved).lower().replace("\\", "/")
+            for sensitive in _SENSITIVE_PATHS:
+                if sensitive in resolved_lower:
+                    msg = f"禁止读取系统敏感路径: {resolved}"
+                    raise SecurityError(msg)
 
         # 写入操作额外检查敏感路径
         if for_write:
@@ -582,7 +591,7 @@ class ToolNode(BaseNode):
         try:
             file_size = path.stat().st_size
         except OSError:
-            return f"写入验证失败: 无法获取文件大小"
+            return "写入验证失败: 无法获取文件大小"
 
         if file_size > MAX_VERIFY_SIZE:
             logger.debug(f"文件 {path} 大小 {file_size} 字节，跳过内容回读验证")
@@ -599,7 +608,7 @@ class ToolNode(BaseNode):
 
         if is_append:
             if not actual.endswith(expected_content) and expected_content not in actual:
-                return f"追加验证失败: 写入的内容未在文件中找到"
+                return "追加验证失败: 写入的内容未在文件中找到"
         else:
             if actual != expected_content:
                 return (
@@ -648,7 +657,7 @@ class ToolNode(BaseNode):
                     "file": str(path),
                     "replacements": 0,
                     "success": False,
-                    "error": f"编辑验证失败: 文件内容与预期不一致",
+                    "error": "编辑验证失败: 文件内容与预期不一致",
                 }
         except Exception as e:
             return {
@@ -1139,7 +1148,7 @@ class ToolNode(BaseNode):
             self._write_output(context, display)
             return {"action_type": "refactor", "refactor_action": "rename", **result}
 
-        elif action == "clean_imports":
+        if action == "clean_imports":
             if not file_path:
                 return {
                     "action_type": "refactor",
@@ -1155,7 +1164,7 @@ class ToolNode(BaseNode):
             self._write_output(context, display)
             return {"action_type": "refactor", "refactor_action": "clean_imports", **result}
 
-        elif action == "analyze":
+        if action == "analyze":
             if not file_path:
                 return {
                     "action_type": "refactor",
@@ -1171,12 +1180,11 @@ class ToolNode(BaseNode):
             self._write_output(context, display)
             return {"action_type": "refactor", "refactor_action": "analyze", **result}
 
-        else:
-            return {
-                "action_type": "refactor",
-                "success": False,
-                "error": f"未知 refactor_action: {action}。支持: rename | clean_imports | analyze",
-            }
+        return {
+            "action_type": "refactor",
+            "success": False,
+            "error": f"未知 refactor_action: {action}。支持: rename | clean_imports | analyze",
+        }
 
     def _diff_preview(self, context: AgentContext) -> dict[str, Any]:
         """生成 diff 预览（不实际修改文件）。"""
@@ -1247,7 +1255,6 @@ class ToolNode(BaseNode):
 
     def _mcp_call(self, context: AgentContext) -> dict[str, Any]:
         """调用 MCP 服务器工具。"""
-        from omniagent.mcp.registry import MCPRegistry
 
         tool_name = self._resolve_template(self.tool_name, context)
         if not tool_name:
@@ -1419,7 +1426,6 @@ class ToolNode(BaseNode):
 
     def _walk_with_depth(self, base: Path, pattern: str, max_depth: int):
         """递归遍历，受深度限制。支持 **/*.ext 递归 glob 模式。"""
-        import os
 
         # 处理 **/*.ext 模式：拆分为前缀目录模式和文件名模式
         recursive_mode = "**" in pattern
@@ -1626,7 +1632,7 @@ class ToolNode(BaseNode):
         logger.debug(f"[{self.id}] 查询天气: {city}")
 
         try:
-            from omniagent.utils.weather import get_weather, format_weather_report
+            from omniagent.utils.weather import format_weather_report, get_weather
             info = get_weather(city, lang)
             report = format_weather_report(info)
 
@@ -1757,7 +1763,7 @@ class ToolNode(BaseNode):
                     "content": result_text, "success": True,
                 }
 
-            elif action == "fetch_file":
+            if action == "fetch_file":
                 if not github_path:
                     return {
                         "action_type": "github_fetch", "repo": repo,
@@ -1785,7 +1791,7 @@ class ToolNode(BaseNode):
                     "content": text, "content_length": len(text), "success": True,
                 }
 
-            elif action == "fetch_readme":
+            if action == "fetch_readme":
                 for readme_name in ["README.md", "readme.md", "README.rst", "README"]:
                     raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{readme_name}"
                     with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
@@ -1807,12 +1813,11 @@ class ToolNode(BaseNode):
                     "error": "未找到 README 文件",
                 }
 
-            else:
-                return {
-                    "action_type": "github_fetch", "repo": repo,
-                    "action": action, "content": "", "success": False,
-                    "error": f"不支持的 github_action: {action}（可选: list_files, fetch_file, fetch_readme）",
-                }
+            return {
+                "action_type": "github_fetch", "repo": repo,
+                "action": action, "content": "", "success": False,
+                "error": f"不支持的 github_action: {action}（可选: list_files, fetch_file, fetch_readme）",
+            }
 
         except httpx.HTTPStatusError as e:
             return {
@@ -1906,7 +1911,6 @@ class ToolNode(BaseNode):
         command_template = self._resolve_template(getattr(self, "command_template", ""), context)
         if command_template:
             def cmd_handler(ctx):
-                import shlex
                 cmd = command_template
                 # 替换模板变量
                 for key in (params_raw.get("properties") or {}):
