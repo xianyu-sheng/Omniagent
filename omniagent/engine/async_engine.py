@@ -22,6 +22,7 @@ import uuid
 from typing import Any
 
 from omniagent.engine.callbacks import EngineCallback
+from omniagent.engine.circuit_breaker import CircuitBreaker
 from omniagent.engine.compactor import Compactor
 from omniagent.engine.context import AgentContext
 from omniagent.engine.tool_tracker import ToolExecutionTracker
@@ -71,6 +72,7 @@ class AsyncReActEngine:
         self.tools = tools or BUILTIN_TOOLS
         self.system_prompt = system_prompt or self._build_system_prompt()
         self.callback = callback or EngineCallback()
+        self.breaker = CircuitBreaker()  # 工具断路器
 
         # 集成组件
         self._event_bus = event_bus
@@ -360,7 +362,10 @@ class AsyncReActEngine:
         tool_use_id: str = "",
         run_id: str = "",
     ) -> str:
-        """异步执行工具。优先使用 ToolRegistry，回退到 ToolNode。"""
+        """异步执行工具。优先使用 ToolRegistry，回退到 ToolNode。
+
+        包含断路器 + 1 次失败重试。
+        """
         # 权限检查
         if self._permissions and tool_use_id:
             allowed, reason = await self._permissions.check_and_wait(
@@ -375,87 +380,127 @@ class AsyncReActEngine:
                     tracker.record(action, action_input, False, error_msg, error=error_msg)
                 return error_msg
 
-        # ── 优先使用 ToolRegistry（异步）──
-        if self._tool_registry and action in self._tool_registry:
-            try:
-                result = await self._tool_registry.invoke(action, action_input)
-                if result.success:
-                    output = result.content or result.data.get("output", str(result.data))
+        # ── 断路器检查 ──
+        if not self.breaker.allow(action):
+            state = self.breaker.status(action)
+            cooldown_msg = (
+                f"⚠️ 工具 '{action}' 暂时不可用 — "
+                f"之前连续失败 {state.get('consecutive_failures', 0)} 次, "
+                f"冷却剩余 {state.get('cooldown_remaining', 0)} 秒。\n"
+                f"请尝试使用其他工具完成任务。"
+            )
+            if tracker:
+                tracker.record(action, action_input, False, cooldown_msg, error="circuit_breaker_cooldown")
+            return cooldown_msg
+
+        # ── 执行（含 1 次重试）──
+        max_attempts = 2
+        last_error_msg = ""
+
+        for attempt in range(max_attempts):
+            # ── 优先使用 ToolRegistry（异步）──
+            if self._tool_registry and action in self._tool_registry:
+                try:
+                    result = await self._tool_registry.invoke(action, action_input)
+                    if not result.is_error:
+                        output = result.content
+                        self.breaker.on_success(action)
+                        if tracker:
+                            tracker.record(action, action_input, True, str(output)[:200])
+                        if self._trace:
+                            self._trace.emit_ipc(
+                                "CORE→TOOL",
+                                {"tool": action, "params": action_input, "success": True},
+                                run_id=run_id, kind="tool_exec",
+                            )
+                        return str(output)[:3000]
+                    else:
+                        last_error_msg = f"工具执行失败: {result.content}"
+                        self.breaker.on_failure(action, str(result.content))
+                        if attempt < max_attempts - 1:
+                            logger.warning(f"工具 {action} 失败，重试 (1/1): {str(result.content)[:100]}")
+                            continue
+                        if tracker:
+                            tracker.record(action, action_input, False, last_error_msg, error=str(result.content))
+                        if self._trace:
+                            self._trace.emit_ipc(
+                                "CORE→TOOL",
+                                {"tool": action, "params": action_input, "success": False,
+                                 "error": str(result.content)},
+                                run_id=run_id, kind="tool_exec",
+                            )
+                        # 检查断路器
+                        tripped = self.breaker.on_failure_cooldown(action, last_error_msg)
+                        return tripped or last_error_msg
+                except Exception as e:
+                    last_error_msg = f"工具执行异常: {e}"
+                    logger.error(f"ToolRegistry 执行异常: {action} -> {e}")
+                    self.breaker.on_failure(action, str(e))
+                    if attempt < max_attempts - 1:
+                        logger.warning(f"工具 {action} 异常，重试 (1/1): {e}")
+                        continue
                     if tracker:
-                        tracker.record(action, action_input, True, str(output)[:200])
-                    ## Trace: tool execution
-                    if self._trace:
-                        self._trace.emit_ipc(
-                            "CORE→TOOL",
-                            {"tool": action, "params": action_input, "success": True},
-                            run_id=run_id, kind="tool_exec",
-                        )
-                    return str(output)[:3000]
-                else:
-                    error_detail = f"工具执行失败: {result.error or result.content}"
-                    if tracker:
-                        tracker.record(action, action_input, False, error_detail,
-                                       error=str(result.error))
-                    if self._trace:
-                        self._trace.emit_ipc(
-                            "CORE→TOOL",
-                            {"tool": action, "params": action_input, "success": False,
-                             "error": str(result.error)},
-                            run_id=run_id, kind="tool_exec",
-                        )
-                    return error_detail
-            except Exception as e:
-                error_msg = f"工具执行异常: {e}"
-                logger.error(f"ToolRegistry 执行异常: {action} -> {e}")
+                        tracker.record(action, action_input, False, last_error_msg, error=str(e))
+                    tripped = self.breaker.on_failure_cooldown(action, last_error_msg)
+                    return tripped or last_error_msg
+
+            # ── 回退到传统 ToolNode（同步）──
+            tool_info = self.tools.get(action)
+            if not tool_info and action in _DYNAMIC_TOOLS:
+                tool_info = _DYNAMIC_TOOLS[action]
+
+            if not tool_info:
+                error_msg = f"错误: 未知工具 '{action}'"
                 if tracker:
-                    tracker.record(action, action_input, False, error_msg, error=str(e))
+                    tracker.record(action, action_input, False, error_msg, error=error_msg)
                 return error_msg
 
-        # ── 回退到传统 ToolNode（同步）──
-        tool_info = self.tools.get(action)
-        if not tool_info and action in _DYNAMIC_TOOLS:
-            tool_info = _DYNAMIC_TOOLS[action]
+            try:
+                action_input = ToolNode.normalize_params(action_input)
+                node = ToolNode(f"async_react_{action}", action_type=action, **action_input)
+                result = node.execute(context)
 
-        if not tool_info:
-            error_msg = f"错误: 未知工具 '{action}'"
-            if tracker:
-                tracker.record(action, action_input, False, error_msg, error=error_msg)
-            return error_msg
+                success = result.get("success", False)
+                error = result.get("error")
 
-        try:
-            action_input = ToolNode.normalize_params(action_input)
-            node = ToolNode(f"async_react_{action}", action_type=action, **action_input)
-            result = node.execute(context)
-
-            success = result.get("success", False)
-            error = result.get("error")
-
-            if success:
-                summary = ""
-                for key in ("content", "stdout", "output", "files"):
-                    if key in result and result[key]:
-                        val = result[key]
-                        if isinstance(val, list):
-                            summary = "\n".join(str(v) for v in val[:50])
-                        else:
-                            summary = str(val)[:3000]
-                        break
-                if not summary:
-                    summary = str(result)[:3000]
+                if success:
+                    summary = ""
+                    for key in ("content", "stdout", "output", "files"):
+                        if key in result and result[key]:
+                            val = result[key]
+                            if isinstance(val, list):
+                                summary = "\n".join(str(v) for v in val[:50])
+                            else:
+                                summary = str(val)[:3000]
+                            break
+                    if not summary:
+                        summary = str(result)[:3000]
+                    self.breaker.on_success(action)
+                    if tracker:
+                        tracker.record(action, action_input, True, summary[:200])
+                    return summary
+                else:
+                    last_error_msg = f"工具执行失败: {error or result}"
+                    error_str = str(error) if error else str(result)
+                    self.breaker.on_failure(action, error_str)
+                    if attempt < max_attempts - 1:
+                        logger.warning(f"工具 {action} 失败，重试 (1/1): {error_str[:100]}")
+                        continue
+                    if tracker:
+                        tracker.record(action, action_input, False, last_error_msg, error=str(error))
+                    tripped = self.breaker.on_failure_cooldown(action, last_error_msg)
+                    return tripped or last_error_msg
+            except Exception as e:
+                last_error_msg = f"工具执行异常: {e}"
+                logger.error(f"工具执行异常: {action}({action_input}) -> {e}")
+                self.breaker.on_failure(action, str(e))
+                if attempt < max_attempts - 1:
+                    logger.warning(f"工具 {action} 异常，重试 (1/1): {e}")
+                    continue
                 if tracker:
-                    tracker.record(action, action_input, True, summary[:200])
-                return summary
-            else:
-                error_detail = f"工具执行失败: {error or result}"
-                if tracker:
-                    tracker.record(action, action_input, False, error_detail, error=str(error))
-                return error_detail
-        except Exception as e:
-            error_msg = f"工具执行异常: {e}"
-            logger.error(f"工具执行异常: {action}({action_input}) -> {e}")
-            if tracker:
-                tracker.record(action, action_input, False, error_msg, error=str(e))
-            return error_msg
+                    tracker.record(action, action_input, False, last_error_msg, error=str(e))
+                tripped = self.breaker.on_failure_cooldown(action, last_error_msg)
+                return tripped or last_error_msg
 
     # ── 事件发布 ──────────────────────────────────────────────
 

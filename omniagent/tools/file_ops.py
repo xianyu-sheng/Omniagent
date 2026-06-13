@@ -131,15 +131,26 @@ class WriteFileTool(BaseTool):
         if content_bytes > MAX_WRITE_SIZE:
             return ToolResult.error(f"内容过大: {content_bytes} 字节，上限 {MAX_WRITE_SIZE} 字节")
 
+        # ── Checkpoint: 写前备份 ──
+        from omniagent.engine.checkpoint import get_checkpoint
+        ckpt = get_checkpoint()
+        ckpt.save(path)
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        try:
+            path.write_text(content, encoding="utf-8")
+        except Exception as e:
+            ckpt.restore(path)
+            return ToolResult.error(f"写入失败: {e}")
 
         # 写入后验证
         if path.stat().st_size <= MAX_VERIFY_SIZE:
             actual = path.read_text(encoding="utf-8")
             if actual != content:
+                ckpt.restore(path)
                 return ToolResult.error("内容验证失败: 写入内容与预期不一致")
 
+        ckpt.keep(path)
         logger.info(f"写入文件: {path} ({content_bytes} 字节)")
         return ToolResult.ok(str(path), bytes_written=content_bytes, file_path=str(path))
 
@@ -180,14 +191,25 @@ class EditFileTool(BaseTool):
         if count > 1:
             return ToolResult.error(f"找到 {count} 处匹配，请提供更多上下文")
 
+        # ── Checkpoint: 编辑前备份 ──
+        from omniagent.engine.checkpoint import get_checkpoint
+        ckpt = get_checkpoint()
+        ckpt.save(path)
+
         new_content = content.replace(old_text, new_text, 1)
-        path.write_text(new_content, encoding="utf-8")
+        try:
+            path.write_text(new_content, encoding="utf-8")
+        except Exception as e:
+            ckpt.restore(path)
+            return ToolResult.error(f"编辑写入失败: {e}")
 
         # 验证
         actual = path.read_text(encoding="utf-8")
         if actual != new_content:
+            ckpt.restore(path)
             return ToolResult.error("编辑验证失败: 文件内容与预期不一致")
 
+        ckpt.keep(path)
         logger.info(f"编辑文件: {path} (1 处替换)")
         return ToolResult.ok(str(path), replacements=1, file_path=str(path))
 
@@ -300,13 +322,25 @@ class FileMoveTool(BaseTool):
         except Exception as e:
             return ToolResult.error(f"目标路径无效: {e}", error_type="runtime_error")
 
+        # ── Checkpoint: 移动前备份源和目标（如果目标已存在）──
+        from omniagent.engine.checkpoint import get_checkpoint
+        ckpt = get_checkpoint()
+        ckpt.save(src_path)
+        if dst_path.exists():
+            ckpt.save(dst_path)
+
         try:
             import shutil
             shutil.move(str(src_path), str(dst_path))
 
             if not dst_path.exists():
+                ckpt.restore(src_path)
+                ckpt.restore(dst_path)
                 return ToolResult.error(f"移动后验证失败: 目标路径不存在", error_type="runtime_error")
 
+            ckpt.keep(src_path)
+            if str(src_path) != str(dst_path):
+                ckpt.keep(dst_path)
             logger.debug(f"移动文件: {src_path} → {dst_path}")
             return ToolResult.ok(
                 f"已移动: {src_path} → {dst_path}",
@@ -314,6 +348,8 @@ class FileMoveTool(BaseTool):
                 destination=str(dst_path),
             )
         except Exception as e:
+            ckpt.restore(src_path)
+            ckpt.restore(dst_path)
             return ToolResult.error(f"移动失败: {e}", error_type="runtime_error")
 
 
