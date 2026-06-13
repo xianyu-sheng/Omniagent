@@ -322,7 +322,9 @@ class REPL:
 
         # ── 构建欢迎面板 ──
         logo_art = "\n".join(logo)
-        content = f"""{logo_art}
+        content = f"""[bold bright_green]欢迎来到闲余生的个人CLI编程工具[/bold bright_green]
+
+{logo_art}
 
   [dim]{version}[/dim]  ·  [bold white]Multi-Model AI Coding Assistant[/bold white]
 
@@ -334,7 +336,6 @@ class REPL:
   [dim]Ctrl+C 退出  ·  Shift+Enter 换行  ·  Enter 发送[/dim]"""
 
         console.print()
-        console.print("[bold green]你好，欢迎来到闲余生的个人AI编程工具[/bold green]")
         console.print(Panel(content, border_style="cyan", padding=(0, 2)))
         console.print()
 
