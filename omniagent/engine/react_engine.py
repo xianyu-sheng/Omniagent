@@ -331,7 +331,7 @@ _MIN_STRUCTURED_SECTIONS = 2    # 至少包含 2 个分析维度
 def _check_hollow_answer(
     final_answer: str,
     user_input: str = "",
-    tracker: "ToolExecutionTracker | None" = None,
+    tracker: ToolExecutionTracker | None = None,
 ) -> dict:
     """检测 final_answer 是否空洞/无实质内容。
 
@@ -653,14 +653,13 @@ class ReActEngine:
                         self.callback.on_warning(f"final_answer 空洞: {hollow_check['reason']}")
                         logger.warning(f"ReAct: final_answer 空洞，要求重新合成 (剩余 {remaining} 轮)")
                         continue
-                    else:
-                        logger.warning("ReAct: final_answer 空洞但无剩余轮次，附带警告返回")
-                        warning = (
-                            "\n\n⚠️ **注意**: 最终回答可能不够完整。"
-                            "建议重新运行并给出更具体的分析指令。"
-                        )
-                        self.callback.on_finish(final_answer + warning)
-                        return final_answer + warning
+                    logger.warning("ReAct: final_answer 空洞但无剩余轮次，附带警告返回")
+                    warning = (
+                        "\n\n⚠️ **注意**: 最终回答可能不够完整。"
+                        "建议重新运行并给出更具体的分析指令。"
+                    )
+                    self.callback.on_finish(final_answer + warning)
+                    return final_answer + warning
 
                 logger.debug(f"ReAct 完成，共 {i + 1} 次迭代，工具调用 {len(tracker.calls)} 次")
                 answer = final_answer
@@ -713,7 +712,7 @@ class ReActEngine:
                     self.callback.on_warning("LLM 仅输出 thought 无 action/final_answer，要求明确表态")
                     logger.warning(f"ReAct: thought-only 输出，注入选择提示 (剩余 {remaining} 轮)")
                     continue
-                elif remaining >= 1:
+                if remaining >= 1:
                     # 还没用过工具 → 要求开始行动
                     correction = (
                         "❌ 你的上一条回复只有 thought 字段，没有 action 也没有 final_answer。\n\n"
@@ -725,15 +724,14 @@ class ReActEngine:
                     self.callback.on_warning("LLM 仅输出 thought 无 action/final_answer (无工具执行)，要求行动")
                     logger.warning("ReAct: thought-only 输出 (无工具执行)，注入行动提示")
                     continue
+                # 无剩余轮次，尝试从最后观察中提取
+                last_obs = _extract_last_observation(messages)
+                if last_obs and len(last_obs) > 50:
+                    result = f"达到最大迭代次数，以下是最后执行结果：\n\n{last_obs[:2000]}"
                 else:
-                    # 无剩余轮次，尝试从最后观察中提取
-                    last_obs = _extract_last_observation(messages)
-                    if last_obs and len(last_obs) > 50:
-                        result = f"达到最大迭代次数，以下是最后执行结果：\n\n{last_obs[:2000]}"
-                    else:
-                        result = thought or response.strip() or "任务已执行，但未生成明确的回复内容。"
-                    self.callback.on_finish(result)
-                    return result
+                    result = thought or response.strip() or "任务已执行，但未生成明确的回复内容。"
+                self.callback.on_finish(result)
+                return result
 
         # 达到最大迭代次数，尝试从最后的观察结果中提取有用信息
         last_obs = _extract_last_observation(messages)
