@@ -52,6 +52,11 @@ desktop.ini
 *.exe
 *.msi
 
+# Test temporary directories
+omni_p1_int_*/
+omni_real_*/
+omni_multi_*/
+
 # Misc
 *.bak
 *.tmp
