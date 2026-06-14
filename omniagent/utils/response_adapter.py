@@ -542,6 +542,37 @@ _TOOL_PARAM_HINTS: dict[str, set[str]] = {
 }
 
 
+def register_known_tool(name: str, params: set[str] | None = None) -> None:
+    """注册一个工具名及其参数提示，使 fallback 意图检测能识别它。
+
+    引擎初始化或动态注册工具时调用此函数。
+    """
+    _KNOWN_TOOL_NAMES.add(name)
+    if params:
+        if name in _TOOL_PARAM_HINTS:
+            _TOOL_PARAM_HINTS[name] |= params
+        else:
+            _TOOL_PARAM_HINTS[name] = params
+
+
+def register_tools_from_dict(tools: dict[str, dict]) -> None:
+    """从工具描述字典批量注册工具名和参数提示。
+
+    tools 格式: {name: {name: str, params: dict[str, str]}}
+    """
+    for name, info in tools.items():
+        _KNOWN_TOOL_NAMES.add(name)
+        if isinstance(info, dict) and "params" in info:
+            param_desc = info["params"]
+            if isinstance(param_desc, dict):
+                _TOOL_PARAM_HINTS.setdefault(name, set()).update(param_desc.keys())
+
+
+def get_known_tool_names() -> set[str]:
+    """返回当前已知的所有工具名（只读）。"""
+    return frozenset(_KNOWN_TOOL_NAMES)
+
+
 def parse_review(raw: str) -> dict[str, Any]:
     """解析 LLM 输出为标准审查结构。
 

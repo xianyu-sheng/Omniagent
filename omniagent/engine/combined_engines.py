@@ -51,10 +51,16 @@ class PlanReactEngine:
 
         ctx = context or AgentContext()
 
-        # Phase 1: 全局规划
+        # Phase 0: Scout — 先侦察目录结构
+        scout_info = self.planner._scout(user_input, ctx, None)
+        plan_input = user_input
+        if scout_info:
+            plan_input = f"{user_input}\n\n## 🔴 项目的真实文件列表（来自 list_files）\n```\n{scout_info}\n```\n请使用上述真实文件路径来规划 read_file 步骤。"
+
+        # Phase 1: 全局规划（现在有真实文件列表）
         console.print("[dim]📋 Phase 1: 生成执行计划...[/dim]")
         try:
-            plan = self.planner._plan(user_input, ctx)
+            plan = self.planner._plan(plan_input, ctx)
         except Exception as e:
             console.print(f"[red]  ✗ 规划阶段异常: {e}[/red]")
             return f"规划阶段失败: {e}"

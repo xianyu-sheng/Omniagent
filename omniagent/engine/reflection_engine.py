@@ -127,11 +127,13 @@ class ReflectionEngine:
     def _execute(self, user_input: str, feedback: str = "", context: AgentContext | None = None) -> str:
         """执行阶段: LLM 生成输出。"""
         messages = [{"role": "system", "content": self.executor_prompt}]
-        # 注入对话历史（最近 6 条，排除 system 消息）
+        # 注入对话历史（最近 6 条，包括最近的 system 消息以保留 system_hint）
         if context:
             history = context.get_conversation_messages()
             if history:
-                recent = [m for m in history if m.get("role") != "system"][-6:]
+                non_system = [m for m in history if m.get("role") != "system"][-6:]
+                system_msgs = [m for m in history if m.get("role") == "system"][-2:]
+                recent = system_msgs + non_system
                 messages.extend(recent)
 
         if feedback:

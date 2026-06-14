@@ -27,19 +27,39 @@ from omniagent.engine.compactor import Compactor
 from omniagent.engine.context import AgentContext
 from omniagent.engine.tool_tracker import ToolExecutionTracker
 from omniagent.nodes.tool_node import _DYNAMIC_TOOLS, ToolNode
-from omniagent.utils.llm_client import chat_completion_async, chat_completion_stream_async
+from omniagent.utils.llm_client import chat_completion_async
 from omniagent.utils.response_adapter import parse_plan, parse_react, parse_review
 
 logger = logging.getLogger(__name__)
 
 # ── Re-import builtin tools from react_engine ─────────────────
-from omniagent.engine.react_engine import BUILTIN_TOOLS, REACT_SYSTEM_PROMPT
+# ── Re-import prompts + validator from plan_execute_engine ─────
+from omniagent.engine.plan_execute_engine import (
+    EXECUTE_PROMPT,
+    PLAN_SYSTEM_PROMPT,
+    _validate_tool_params,
+)
+from omniagent.engine.react_engine import (
+    _DEFAULT_COMPACT_INTERVAL,
+    _DEFAULT_EXPLORATION_START,
+    _DEFAULT_EXPLORATION_SYNTHESIZE,
+    _DEFAULT_FORCE_SYNTHESIS,
+    _DEFAULT_HURRY_WARNING,
+    _DEFAULT_MAX_NO_TOOL_STREAK,
+    _DEFAULT_MIDPOINT_CALLS,
+    _DEFAULT_MIN_FINAL_ANSWER_LENGTH,
+    _DEFAULT_MIN_STRUCTURED_SECTIONS,
+    _DEFAULT_TOOL_RETRY_ATTEMPTS,
+    BUILTIN_TOOLS,
+    REACT_SYSTEM_PROMPT,
+    _build_observation_summary,
+    _check_hollow_answer,
+    _compile_exhaustion_report,
+    _extract_last_observation,
+)
 
 # ── Re-import prompts from reflection_engine ──────────────────
 from omniagent.engine.reflection_engine import EXECUTOR_PROMPT, REVIEWER_PROMPT
-
-# ── Re-import prompts from plan_execute_engine ────────────────
-from omniagent.engine.plan_execute_engine import EXECUTE_PROMPT, PLAN_SYSTEM_PROMPT
 
 
 class AsyncReActEngine:
@@ -66,11 +86,21 @@ class AsyncReActEngine:
         tool_registry: Any = None,   # ToolRegistry | None
         permission_manager: Any = None,  # PermissionManagerV2 | None
         session_id: str = "",
+        # ── 可配置阈值（与 ReactEngine 对齐）──
+        min_final_answer_length: int = _DEFAULT_MIN_FINAL_ANSWER_LENGTH,
+        min_structured_sections: int = _DEFAULT_MIN_STRUCTURED_SECTIONS,
+        max_no_tool_streak: int = _DEFAULT_MAX_NO_TOOL_STREAK,
+        compact_interval: int = _DEFAULT_COMPACT_INTERVAL,
+        tool_retry_attempts: int = _DEFAULT_TOOL_RETRY_ATTEMPTS,
+        exploration_budget_start: int = _DEFAULT_EXPLORATION_START,
+        exploration_budget_synthesize: int = _DEFAULT_EXPLORATION_SYNTHESIZE,
+        hurry_warning_threshold: int = _DEFAULT_HURRY_WARNING,
+        force_synthesis_threshold: int = _DEFAULT_FORCE_SYNTHESIS,
+        midpoint_check_calls: int = _DEFAULT_MIDPOINT_CALLS,
     ) -> None:
         self.model_priority = model_priority
         self.max_iterations = max_iterations
         self.tools = tools or BUILTIN_TOOLS
-        self.system_prompt = system_prompt or self._build_system_prompt()
         self.callback = callback or EngineCallback()
         self.breaker = CircuitBreaker()  # 工具断路器
 
@@ -81,6 +111,20 @@ class AsyncReActEngine:
         self._permissions = permission_manager
         self.session_id = session_id
 
+        # ── 可配置阈值（必须在 _build_system_prompt 之前设置）──
+        self.min_final_answer_length = min_final_answer_length
+        self.min_structured_sections = min_structured_sections
+        self.max_no_tool_streak = max_no_tool_streak
+        self.compact_interval = compact_interval
+        self.tool_retry_attempts = tool_retry_attempts
+        self.exploration_budget_start = exploration_budget_start
+        self.exploration_budget_synthesize = exploration_budget_synthesize
+        self.hurry_warning_threshold = hurry_warning_threshold
+        self.force_synthesis_threshold = force_synthesis_threshold
+        self.midpoint_check_calls = midpoint_check_calls
+
+        self.system_prompt = system_prompt or self._build_system_prompt()
+
     def _build_system_prompt(self) -> str:
         """构建包含运行环境信息的系统提示词。"""
         import sys
@@ -88,6 +132,15 @@ class AsyncReActEngine:
         tools_desc = "\n".join(
             f"- {t['name']}: {t['description']} (参数: {t['params']})"
             for t in self.tools.values()
+        )
+
+        # 动态生成探索预算文本
+        exploration_budget = (
+            f"分析项目时，你有严格的探索预算：\n"
+            f"- **前 {self.exploration_budget_start} 步**：用 list_files 了解项目根目录 + 一级子目录结构\n"
+            f"- **第 {self.exploration_budget_start + 1}-{self.exploration_budget_synthesize - 1} 步**：用 read_file 读取最核心的源文件（入口文件、主要模块、配置文件）\n"
+            f"- **第 {self.exploration_budget_synthesize} 步起**：必须开始合成 final_answer，不要再探索新文件\n"
+            f"- 如果你在第 {self.exploration_budget_synthesize} 步还在读 README/build脚本/配置文件，说明探索策略失败"
         )
 
         if sys.platform == "win32":
@@ -119,7 +172,10 @@ class AsyncReActEngine:
 - 根据操作系统使用正确的命令。Windows 下不要使用 ls, cat, mkdir -p, uname, which, grep 等 Linux 命令。
 - 当用户询问日期、时间、星期几时，直接回答上面提供的当前日期时间，不要编造或猜测。
 """
-        return REACT_SYSTEM_PROMPT.format(tools_desc=tools_desc) + env_info
+        return REACT_SYSTEM_PROMPT.format(
+            tools_desc=tools_desc,
+            exploration_budget=exploration_budget,
+        ) + env_info
 
     # ── 主循环 ────────────────────────────────────────────────
 
@@ -138,12 +194,14 @@ class AsyncReActEngine:
         tracker = ToolExecutionTracker()
         messages: list[dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
 
-        # 注入对话历史
+        # 注入对话历史（包括最近的 system 消息以保留 system_hint）
         history = ctx.get_conversation_messages()
         if history:
-            recent = [m for m in history if m.get("role") != "system"][-10:]
+            non_system = [m for m in history if m.get("role") != "system"][-10:]
+            system_msgs = [m for m in history if m.get("role") == "system"][-2:]
+            recent = system_msgs + non_system
             messages.extend(recent)
-            logger.debug(f"AsyncReAct 注入 {len(recent)} 条对话历史")
+            logger.debug(f"AsyncReAct 注入 {len(recent)} 条对话历史 (含 {len(system_msgs)} 条 system)")
         messages.append({"role": "user", "content": user_input})
 
         # ── 初始化上下文压缩器 ──
@@ -168,8 +226,8 @@ class AsyncReActEngine:
 
         try:
             for i in range(self.max_iterations):
-                # ── 上下文压缩检查（每 3 轮）──
-                if i > 0 and i % 3 == 0:
+                # ── 上下文压缩检查（按可配置间隔 + 初始检查）──
+                if i == 0 or (i > 0 and i % self.compact_interval == 0):
                     estimated = Compactor._estimate_tokens(messages)
                     if compactor.needs_compact(estimated):
                         logger.info(f"AsyncReAct: 第 {i} 轮触发压缩 (≈{estimated} tokens)")
@@ -187,6 +245,39 @@ class AsyncReActEngine:
 
                 # ── 发布 StepStartedEvent ──
                 await self._publish_event("step.started", run_id=run_id, step=i + 1)
+
+                # ── 接近上限时注入合成提示（与 ReactEngine 对齐）──
+                remaining = self.max_iterations - i
+                if remaining <= self.hurry_warning_threshold and i > 0 and not tracker.has_executions():
+                    hurry_msg = (
+                        f"⚠️ 注意：仅剩 {remaining} 轮迭代机会。"
+                        f"请立即使用工具开始执行任务，不要再只做探索。"
+                        f"用 list_files 了解结构，用 read_file 读取关键文件。"
+                    )
+                    messages.append({"role": "user", "content": hurry_msg})
+                    logger.info(f"AsyncReAct: 注入加速提示 (剩余 {remaining} 轮，无工具执行)")
+                elif remaining <= self.force_synthesis_threshold and tracker.has_executions():
+                    obs_summary = _build_observation_summary(messages, tracker)
+                    hurry_msg = (
+                        f"🛑 仅剩 {remaining} 轮！这是你的最后机会。\n\n"
+                        f"## 你已收集的数据摘要\n{obs_summary}\n\n"
+                        f"## 你现在必须做的事\n"
+                        f"立即输出 final_answer，基于上述已收集的数据直接交付完整的分析报告。\n"
+                        f"❌ 不要再调用 read_file/list_files —— 你没有时间了\n"
+                        f"❌ 不要输出 \"我将...\" \"继续...\" —— 直接写报告内容\n"
+                        f"✅ 输出格式：{{\"thought\": \"基于已收集数据总结...\", \"final_answer\": \"## 分析报告\\n\\n### 1. 项目概述\\n...\"}}\n"
+                        f"final_answer 必须是可直接交付的完整报告。"
+                    )
+                    messages.append({"role": "user", "content": hurry_msg})
+                    logger.info(f"AsyncReAct: 注入强制合成提示 (剩余 {remaining} 轮，含观察摘要)")
+                elif remaining <= self.hurry_warning_threshold and tracker.has_executions() and len(tracker.calls) >= self.midpoint_check_calls:
+                    midpoint_msg = (
+                        f"⚠️ 探索预算提醒：你已执行 {len(tracker.calls)} 次工具调用，剩余 {remaining} 轮。\n"
+                        f"根据探索预算规则，你应该已经读了核心源文件，现在准备合成 final_answer。\n"
+                        f"如果还在读 build 脚本/配置文件/README，立即停止——直接基于已有数据输出 final_answer。"
+                    )
+                    messages.append({"role": "user", "content": midpoint_msg})
+                    logger.info(f"AsyncReAct: 中点预算提醒 (已 {len(tracker.calls)} 次调用，剩余 {remaining} 轮)")
 
                 # ── Trace: LLM call ──
                 if self._trace:
@@ -208,6 +299,25 @@ class AsyncReActEngine:
                 # 解析 LLM 输出
                 parsed = self._parse_response(response)
 
+                # ── 处理 JSON 解析失败 ──
+                if parsed.get("parse_error"):
+                    logger.warning(f"AsyncReAct: 第 {i + 1} 轮 JSON 解析失败，要求 LLM 重试")
+                    self.callback.on_warning(f"LLM 输出格式错误，要求重试（第 {i + 1} 轮）")
+                    fmt_correction = (
+                        "❌ 你的上一条回复无法被解析为有效的 JSON 格式。\n\n"
+                        "请严格遵守以下格式重新输出：\n\n"
+                        "调用工具时：\n"
+                        '```json\n{"thought": "分析当前状态", "action": "工具名", "action_input": {"参数": "值"}}\n```\n\n'
+                        "任务完成时：\n"
+                        '```json\n{"thought": "总结结果", "final_answer": "给用户的最终回答"}\n```\n\n'
+                        "⚠️ 注意：\n"
+                        "- 只输出一个 JSON 对象，不要加任何前言或后记\n"
+                        "- action 必须是可用工具列表中的工具名\n"
+                        "- 不要在 JSON 外添加 DSML 标记或其他文本"
+                    )
+                    messages.append({"role": "user", "content": fmt_correction})
+                    continue
+
                 thought = parsed.get("thought", "")
                 if thought:
                     self.callback.on_think(thought)
@@ -215,36 +325,70 @@ class AsyncReActEngine:
 
                 final_answer = parsed.get("final_answer", "")
                 if final_answer and final_answer.strip():
-                    # 验证: 如果需要工具但未执行
+                    # ── 验证: 如果需要工具但未执行 ──
                     if requires_tools and not tracker.has_executions():
                         no_tool_streak += 1
-                        if no_tool_streak <= 2:
+                        if no_tool_streak <= self.max_no_tool_streak:
                             force_msg = (
                                 "⚠️ 你还没有使用任何工具就声称完成了任务。"
                                 "请使用工具（如 write_file、command、create_directory 等）"
                                 "实际执行操作，而不是仅在文字中描述。"
+                                "如果你确实不需要工具，请在 final_answer 中明确说明原因。"
                             )
                             messages.append({"role": "user", "content": force_msg})
                             self.callback.on_warning("LLM 未执行工具就声称完成，要求重试")
                             await self._publish_event("run.warning", run_id=run_id,
                                                        warning="LLM 未执行工具就声称完成")
                             continue
-                        else:
-                            answer = final_answer
-                            warning = (
-                                "\n\n⚠️ **警告**: 本次回答未经工具执行验证。"
-                                "LLM 声称完成了任务但未实际调用任何工具。"
+                        answer = final_answer
+                        warning = (
+                            "\n\n⚠️ **警告**: 本次回答未经工具执行验证。"
+                            "LLM 声称完成了任务但未实际调用任何工具，"
+                            "文件操作可能未真正执行。"
+                        )
+                        self.callback.on_warning("LLM 连续拒绝工具调用，附带警告返回")
+                        self.callback.on_finish(answer + warning)
+                        await self._publish_event("agent.final_answer", run_id=run_id,
+                                                   result=answer + warning)
+                        await self._publish_event("run.finished", run_id=run_id,
+                                                   status="warning", result=answer)
+                        return answer + warning
+
+                    # ── hollow detection: final_answer 空洞检测 ──
+                    hollow_check = _check_hollow_answer(
+                        final_answer, user_input, tracker,
+                        min_length=self.min_final_answer_length,
+                        min_sections=self.min_structured_sections,
+                    )
+                    if hollow_check["is_hollow"]:
+                        remaining = self.max_iterations - i
+                        if remaining >= 1:
+                            correction = (
+                                f"❌ 你的 final_answer 不符合质量标准：{hollow_check['reason']}\n\n"
+                                f"请基于已收集的所有数据，直接交付一个完整的、结构化的最终报告。\n"
+                                f"不要在回答中说'我将...'、'继续...'、'基于收集到的信息...'这类元语言。\n"
+                                f"直接写出分析内容本身——就像你是一个分析师在提交报告。\n"
+                                f"还剩 {remaining} 轮，请立即重新输出包含完整分析内容的 final_answer。"
                             )
-                            self.callback.on_warning("LLM 连续拒绝工具调用，附带警告返回")
-                            self.callback.on_finish(answer + warning)
-                            await self._publish_event("agent.final_answer", run_id=run_id,
-                                                       result=answer + warning)
-                            await self._publish_event("run.finished", run_id=run_id,
-                                                       status="warning", result=answer)
-                            return answer + warning
+                            messages.append({"role": "user", "content": correction})
+                            self.callback.on_warning(f"final_answer 空洞: {hollow_check['reason']}")
+                            logger.warning(f"AsyncReAct: final_answer 空洞，要求重新合成 (剩余 {remaining} 轮)")
+                            continue
+                        logger.warning("AsyncReAct: final_answer 空洞但无剩余轮次，附带警告返回")
+                        warning = (
+                            "\n\n⚠️ **注意**: 最终回答可能不够完整。"
+                            "建议重新运行并给出更具体的分析指令。"
+                        )
+                        self.callback.on_finish(final_answer + warning)
+                        await self._publish_event("run.finished", run_id=run_id,
+                                                   status="warning", result=final_answer)
+                        return final_answer + warning
 
                     logger.debug(f"AsyncReAct 完成，共 {i + 1} 次迭代")
                     answer = final_answer
+                    if tracker.has_executions():
+                        summary = tracker.execution_summary()
+                        logger.debug(f"AsyncReAct 工具执行摘要: {summary}")
                     self.callback.on_finish(answer)
                     await self._publish_event("agent.final_answer", run_id=run_id, result=answer)
                     await self._publish_event("run.finished", run_id=run_id,
@@ -254,6 +398,16 @@ class AsyncReActEngine:
                 if "action" in parsed:
                     action = parsed["action"]
                     action_input = parsed.get("action_input", {})
+
+                    # ── 参数验证：文件路径不能是自然语言描述 ──
+                    validated = _validate_tool_params(action, action_input)
+                    if not validated["valid"]:
+                        error_msg = f"参数错误: {validated['reason']}"
+                        messages.append({"role": "user", "content": f"❌ {error_msg}\n请用正确的文件路径重试。"})
+                        if tracker:
+                            tracker.record(action, action_input, False, error_msg, error=error_msg)
+                        self.callback.on_warning(f"参数验证失败: {error_msg[:100]}")
+                        continue
 
                     logger.debug(f"AsyncReAct 行动: {action}({action_input})")
                     self.callback.on_act(action, action_input)
@@ -275,7 +429,16 @@ class AsyncReActEngine:
                                                output=observation[:500], elapsed_ms=elapsed,
                                                is_error=observation.startswith("错误"))
 
-                    obs_msg = f"Observation: {observation}"
+                    # ── 结构化观察注入（与 ReactEngine 对齐）──
+                    is_error = observation.startswith("错误") or observation.startswith("⚠️") or "失败" in observation[:100]
+                    obs_status = "❌ 执行失败" if is_error else "✅ 执行完成"
+                    obs_msg = (
+                        f"📋 工具 '{action}' 执行结果 ({obs_status}):\n"
+                        f"{observation}\n\n"
+                        f"请根据此结果决定下一步: "
+                        f"如果成功→继续下一个操作或输出 final_answer; "
+                        f"如果失败→分析原因并尝试替代方案。"
+                    )
                     messages.append({"role": "user", "content": obs_msg})
                     no_tool_streak = 0
 
@@ -284,33 +447,83 @@ class AsyncReActEngine:
                                                success=True,
                                                summary=f"{action}: {observation[:200]}")
                 else:
-                    # 没有有效输出
-                    last_obs = ""
-                    for m in reversed(messages):
-                        if m.get("role") == "user" and m.get("content", "").startswith("Observation:"):
-                            last_obs = m["content"][len("Observation:"):].strip()
-                            break
-                    if last_obs:
-                        result = last_obs[:1000]
+                    # ── thought-only 输出: 既没有 action 也没有 final_answer ──
+                    remaining = self.max_iterations - i
+                    if remaining >= 1 and tracker.has_executions():
+                        if remaining <= 1:
+                            obs_summary = _build_observation_summary(messages, tracker)
+                            correction = (
+                                "🛑 这是你的最后一次机会！你的上一条回复只有 thought 字段。\n\n"
+                                f"## 你已收集的数据\n{obs_summary}\n\n"
+                                "## 你必须立即做的\n"
+                                "直接输出 final_answer，格式如下：\n"
+                                '```json\n'
+                                '{"thought": "基于以上数据做最终总结", '
+                                '"final_answer": "## 分析报告\\n\\n'
+                                '### 1. 项目概述\\n...\\n\\n'
+                                '### 2. 技术栈\\n...\\n\\n'
+                                '### 3. 架构分析\\n...\\n\\n'
+                                '### 4. 代码质量\\n...\\n\\n'
+                                '### 5. 改进建议\\n1. ...\\n2. ..."}\n'
+                                '```\n'
+                                "❌ 不要只输出 thought！❌ 不要调用工具！直接输出上面的 JSON！"
+                            )
+                        else:
+                            correction = (
+                                "❌ 你的上一条回复只有 thought 字段，没有 action 也没有 final_answer。\n\n"
+                                "你必须做出选择：\n"
+                                "1. 如果需要继续执行操作 → 输出 action + action_input\n"
+                                "2. 如果任务已完成 → 输出 final_answer 直接交付最终报告\n\n"
+                                f"还剩 {remaining} 轮。如果你已经收集了足够的数据，请立即输出 final_answer。\n"
+                                "final_answer 必须包含完整的分析内容，不要描述'我将要做什么'。"
+                            )
+                        messages.append({"role": "user", "content": correction})
+                        self.callback.on_warning("LLM 仅输出 thought 无 action/final_answer，要求明确表态")
+                        logger.warning(f"AsyncReAct: thought-only 输出，注入选择提示 (剩余 {remaining} 轮)")
+                        continue
+                    if remaining >= 1:
+                        correction = (
+                            "❌ 你的上一条回复只有 thought 字段，没有 action 也没有 final_answer。\n\n"
+                            "请立即采取行动：用 action + action_input 调用工具开始执行任务，"
+                            "或者如果你的任务不需要工具，直接输出 final_answer。\n"
+                            "不要只输出 thought 而不采取任何行动。"
+                        )
+                        messages.append({"role": "user", "content": correction})
+                        self.callback.on_warning("LLM 仅输出 thought 无 action/final_answer (无工具执行)，要求行动")
+                        logger.warning("AsyncReAct: thought-only 输出 (无工具执行)，注入行动提示")
+                        continue
+                    # 无剩余轮次，尝试从最后观察中提取
+                    last_obs = _extract_last_observation(messages)
+                    if last_obs and len(last_obs) > 50:
+                        result = f"达到最大迭代次数，以下是最后执行结果：\n\n{last_obs[:2000]}"
                     else:
-                        result = parsed.get("thought", "").strip() or response.strip()
-                    if not result:
-                        result = "任务已执行，但未生成明确的回复内容。"
+                        result = thought or response.strip() or "任务已执行，但未生成明确的回复内容。"
                     self.callback.on_finish(result)
                     await self._publish_event("run.finished", run_id=run_id,
                                                status="completed", result=result)
                     return result
 
-            # 达到最大迭代次数
-            last_obs = ""
-            for m in reversed(messages):
-                if m.get("role") == "user" and m.get("content", "").startswith("Observation:"):
-                    last_obs = m["content"][len("Observation:"):].strip()
-                    break
-            if last_obs and len(last_obs) > 50:
+            # 达到最大迭代次数 — 强制编译观察摘要
+            if tracker.has_executions():
+                compiled = _compile_exhaustion_report(tracker, messages, self.max_iterations)
+                self.callback.on_warning(f"达到最大迭代次数，已自动编译 {len(tracker.calls)} 条观察记录")
+                self.callback.on_finish(compiled)
+                await self._publish_event("run.finished", run_id=run_id, status="max_iterations",
+                                           result=compiled)
+                return compiled
+
+            last_obs = _extract_last_observation(messages)
+            if last_obs and len(last_obs) > 100:
+                msg = (
+                    f"⚠️ 达到最大迭代次数 ({self.max_iterations})。\n\n"
+                    f"基于收集到的数据，以下自动生成摘要：\n\n"
+                    f"{last_obs[:3000]}\n\n"
+                    f"💡 提示：请重新运行任务以获取更完整的分析结果。"
+                )
+            elif last_obs and len(last_obs) > 50:
                 msg = f"达到最大迭代次数 ({self.max_iterations})，以下是最后的执行结果：\n\n{last_obs[:2000]}"
             else:
-                msg = f"达到最大迭代次数 ({self.max_iterations})，未能得出最终答案。"
+                msg = f"达到最大迭代次数 ({self.max_iterations})，未能得出最终答案。请尝试简化问题或使用更具体的指令。"
             self.callback.on_warning(msg)
             self.callback.on_finish(msg)
             await self._publish_event("run.finished", run_id=run_id, status="max_iterations",
@@ -393,8 +606,8 @@ class AsyncReActEngine:
                 tracker.record(action, action_input, False, cooldown_msg, error="circuit_breaker_cooldown")
             return cooldown_msg
 
-        # ── 执行（含 1 次重试）──
-        max_attempts = 2
+        # ── 执行（含重试）──
+        max_attempts = self.tool_retry_attempts
         last_error_msg = ""
 
         for attempt in range(max_attempts):
@@ -414,24 +627,23 @@ class AsyncReActEngine:
                                 run_id=run_id, kind="tool_exec",
                             )
                         return str(output)[:3000]
-                    else:
-                        last_error_msg = f"工具执行失败: {result.content}"
-                        self.breaker.on_failure(action, str(result.content))
-                        if attempt < max_attempts - 1:
-                            logger.warning(f"工具 {action} 失败，重试 (1/1): {str(result.content)[:100]}")
-                            continue
-                        if tracker:
-                            tracker.record(action, action_input, False, last_error_msg, error=str(result.content))
-                        if self._trace:
-                            self._trace.emit_ipc(
-                                "CORE→TOOL",
-                                {"tool": action, "params": action_input, "success": False,
-                                 "error": str(result.content)},
-                                run_id=run_id, kind="tool_exec",
-                            )
-                        # 检查断路器
-                        tripped = self.breaker.on_failure_cooldown(action, last_error_msg)
-                        return tripped or last_error_msg
+                    last_error_msg = f"工具执行失败: {result.content}"
+                    self.breaker.on_failure(action, str(result.content))
+                    if attempt < max_attempts - 1:
+                        logger.warning(f"工具 {action} 失败，重试 (1/1): {str(result.content)[:100]}")
+                        continue
+                    if tracker:
+                        tracker.record(action, action_input, False, last_error_msg, error=str(result.content))
+                    if self._trace:
+                        self._trace.emit_ipc(
+                            "CORE→TOOL",
+                            {"tool": action, "params": action_input, "success": False,
+                             "error": str(result.content)},
+                            run_id=run_id, kind="tool_exec",
+                        )
+                    # 检查断路器
+                    tripped = self.breaker.on_failure_cooldown(action, last_error_msg)
+                    return tripped or last_error_msg
                 except Exception as e:
                     last_error_msg = f"工具执行异常: {e}"
                     logger.error(f"ToolRegistry 执行异常: {action} -> {e}")
@@ -466,7 +678,7 @@ class AsyncReActEngine:
                 if success:
                     summary = ""
                     for key in ("content", "stdout", "output", "files"):
-                        if key in result and result[key]:
+                        if result.get(key):
                             val = result[key]
                             if isinstance(val, list):
                                 summary = "\n".join(str(v) for v in val[:50])
@@ -479,17 +691,16 @@ class AsyncReActEngine:
                     if tracker:
                         tracker.record(action, action_input, True, summary[:200])
                     return summary
-                else:
-                    last_error_msg = f"工具执行失败: {error or result}"
-                    error_str = str(error) if error else str(result)
-                    self.breaker.on_failure(action, error_str)
-                    if attempt < max_attempts - 1:
-                        logger.warning(f"工具 {action} 失败，重试 (1/1): {error_str[:100]}")
-                        continue
-                    if tracker:
-                        tracker.record(action, action_input, False, last_error_msg, error=str(error))
-                    tripped = self.breaker.on_failure_cooldown(action, last_error_msg)
-                    return tripped or last_error_msg
+                last_error_msg = f"工具执行失败: {error or result}"
+                error_str = str(error) if error else str(result)
+                self.breaker.on_failure(action, error_str)
+                if attempt < max_attempts - 1:
+                    logger.warning(f"工具 {action} 失败，重试 (1/1): {error_str[:100]}")
+                    continue
+                if tracker:
+                    tracker.record(action, action_input, False, last_error_msg, error=str(error))
+                tripped = self.breaker.on_failure_cooldown(action, last_error_msg)
+                return tripped or last_error_msg
             except Exception as e:
                 last_error_msg = f"工具执行异常: {e}"
                 logger.error(f"工具执行异常: {action}({action_input}) -> {e}")
@@ -696,7 +907,9 @@ class AsyncPlanExecuteEngine:
         if context:
             history = context.get_conversation_messages()
             if history:
-                recent = [m for m in history if m.get("role") != "system"][-6:]
+                non_system = [m for m in history if m.get("role") != "system"][-6:]
+                system_msgs = [m for m in history if m.get("role") == "system"][-2:]
+                recent = system_msgs + non_system
                 messages.extend(recent)
         messages.append({"role": "user", "content": user_input})
 
@@ -707,7 +920,15 @@ class AsyncPlanExecuteEngine:
         self, tool: str, params: dict, context: AgentContext,
         tracker: ToolExecutionTracker | None = None,
     ) -> str:
-        """异步执行带工具的步骤。"""
+        """异步执行带工具的步骤。包含参数验证。"""
+        # ── 参数验证：文件路径不能是自然语言描述 ──
+        validated = _validate_tool_params(tool, params)
+        if not validated["valid"]:
+            error_msg = f"参数错误: {validated['reason']}"
+            if tracker:
+                tracker.record(tool, params, False, error_msg, error=error_msg)
+            return error_msg
+
         try:
             params = ToolNode.normalize_params(params)
             self.callback.on_act(tool, params)
@@ -721,11 +942,10 @@ class AsyncPlanExecuteEngine:
                         tracker.record(tool, params, True, str(output)[:200])
                     self.callback.on_observe(str(output)[:500])
                     return str(output)[:2000]
-                else:
-                    error_detail = f"执行失败: {result.error}"
-                    if tracker:
-                        tracker.record(tool, params, False, error_detail, error=str(result.error))
-                    return error_detail
+                error_detail = f"执行失败: {result.error}"
+                if tracker:
+                    tracker.record(tool, params, False, error_detail, error=str(result.error))
+                return error_detail
 
             # 回退到 ToolNode
             node = ToolNode(f"plan_{tool}", action_type=tool, **params)
@@ -735,7 +955,7 @@ class AsyncPlanExecuteEngine:
             if success:
                 summary = ""
                 for key in ("content", "stdout", "output", "files"):
-                    if key in result and result[key]:
+                    if result.get(key):
                         val = result[key]
                         summary = "\n".join(str(v) for v in val[:30]) if isinstance(val, list) else str(val)[:2000]
                         break
@@ -745,12 +965,11 @@ class AsyncPlanExecuteEngine:
                     tracker.record(tool, params, True, summary[:200])
                 self.callback.on_observe(summary)
                 return summary
-            else:
-                error_detail = f"执行失败: {result.get('error', result)}"
-                if tracker:
-                    tracker.record(tool, params, False, error_detail, error=str(result.get("error")))
-                self.callback.on_observe(error_detail)
-                return error_detail
+            error_detail = f"执行失败: {result.get('error', result)}"
+            if tracker:
+                tracker.record(tool, params, False, error_detail, error=str(result.get("error")))
+            self.callback.on_observe(error_detail)
+            return error_detail
 
         except Exception as e:
             error_msg = f"执行异常: {e}"
@@ -815,8 +1034,11 @@ class AsyncPlanExecuteEngine:
             return
         try:
             from omniagent.events.models import (
-                RunErrorEvent, RunFinishedEvent, RunStartedEvent,
-                StepFinishedEvent, StepStartedEvent,
+                RunErrorEvent,
+                RunFinishedEvent,
+                RunStartedEvent,
+                StepFinishedEvent,
+                StepStartedEvent,
             )
             event_map: dict[str, Any] = {
                 "run.started": RunStartedEvent,
@@ -936,9 +1158,10 @@ class AsyncReflectionEngine:
         if context:
             history = context.get_conversation_messages()
             if history:
-                recent = [m for m in history if m.get("role") != "system"][-6:]
+                non_system = [m for m in history if m.get("role") != "system"][-6:]
+                system_msgs = [m for m in history if m.get("role") == "system"][-2:]
+                recent = system_msgs + non_system
                 messages.extend(recent)
-
         if feedback:
             messages.append({
                 "role": "user",
@@ -978,7 +1201,10 @@ class AsyncReflectionEngine:
             return
         try:
             from omniagent.events.models import (
-                ReviewFinishedEvent, RunErrorEvent, RunFinishedEvent, RunStartedEvent,
+                ReviewFinishedEvent,
+                RunErrorEvent,
+                RunFinishedEvent,
+                RunStartedEvent,
             )
             event_map: dict[str, Any] = {
                 "run.started": RunStartedEvent,

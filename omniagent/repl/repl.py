@@ -785,8 +785,11 @@ class REPL:
 
         console.print("[cyan]🔄 ReAct 模式: 思考 → 行动 → 观察 → 循环[/cyan]")
 
+        iterations = self._estimate_react_iterations(user_input)
+        console.print(f"[dim]  自适应迭代预算: {iterations} 轮[/dim]")
+
         callback = self._make_callback()
-        engine = ReActEngine(model_priority=model_ids, max_iterations=10, callback=callback)
+        engine = ReActEngine(model_priority=model_ids, max_iterations=iterations, callback=callback)
         try:
             result = engine.run(user_input, self.agent_context)
             self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
@@ -842,8 +845,11 @@ class REPL:
 
         console.print("[cyan]📋🔄 Plan+React 模式: 全局规划 → 每步 ReAct 执行[/cyan]")
 
+        iterations = self._estimate_react_iterations(user_input)
+        plan_steps = max(6, min(iterations, 15))
+
         callback = self._make_callback()
-        engine = PlanReactEngine(model_priority=model_ids, max_steps=10, react_iterations=8, callback=callback)
+        engine = PlanReactEngine(model_priority=model_ids, max_steps=plan_steps, react_iterations=iterations, callback=callback)
         try:
             result = engine.run(user_input, context=self.agent_context)
             self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
@@ -999,8 +1005,15 @@ class REPL:
         return detect_intent(text)
 
     # ── 工具需求检测 ──────────────────────────────────────────
-    # 只匹配明确的编程/文件/命令任务，不再枚举各种查询类型
     _TOOL_PATTERNS: list[re.Pattern[str]] = [
+        # 天气/时间/信息查询（需要工具获取实时数据）
+        re.compile(r"(?:天气|气温|温度|热不热|冷不冷|穿衣|几度|多少度)", re.I),
+        re.compile(r"(?:weather|temperature|forecast)", re.I),
+        re.compile(r"(?:黄金|金价|股价|汇率|行情|价格)", re.I),
+        re.compile(r"(?:今天|今日|现在|当前).{0,5}(?:天气|温度|时间|日期)", re.I),
+        re.compile(r"(?:查询|查|看).{0,10}(?:天气|时间|日期|新闻)", re.I),
+        re.compile(r"(?:现在几点|今天几号|今天星期几|今天日期)", re.I),
+        # 文件写入/创建/保存（以下为原有模式）
         # 文件写入/创建/保存
         re.compile(r"(?:写入|创建|保存|新建|生成|输出).{0,20}(?:文件|到|至|为)", re.I),
         re.compile(r"(?:write|create|save|generate|output).{0,20}(?:file|to)", re.I),
@@ -1026,8 +1039,8 @@ class REPL:
         re.compile(r"(?:run|execute|exec).{0,15}(?:command|script|cmd|test|pytest|npm|pip|python|node|it|this)", re.I),
         re.compile(r"(?:run|execute|exec)\s+it", re.I),
         # Git 操作
-        re.compile(r"\bgit\b.{0,20}(?:commit|push|pull|add|clone|checkout|branch|merge|stash)", re.I),
-        re.compile(r"(?:提交|推送|拉取|克隆|分支|合并)", re.I),
+        re.compile(r"\bgit\b.{0,20}(?:commit|push|pull|add|clone|checkout|branch|merge|stash|status|log|diff|show|remote|fetch|init|rebase|reset|restore)", re.I),
+        re.compile(r"(?:提交|推送|拉取|克隆|分支|合并|git)\b", re.I),
         # 搜索
         re.compile(r"(?:搜索|查找|grep|find).{0,20}(?:文件|内容|代码|文本|字符)", re.I),
         re.compile(r"(?:search|find|grep).{0,30}", re.I),
@@ -1058,6 +1071,92 @@ class REPL:
             if pattern.search(text):
                 return True
         return False
+
+    @classmethod
+    def _estimate_react_iterations(cls, text: str) -> int:
+        """根据任务复杂度自适应估算 ReAct 迭代次数。
+
+        这不是硬编码的数字分配，而是基于任务特征的多维度评估：
+        - 操作类型（读/写/分析）
+        - 项目规模（单文件 vs 多文件 vs 完整项目）
+        - 任务广度（单一操作 vs 多步骤流程）
+
+        返回值范围：5（简单） ~ 20（复杂项目分析）
+        """
+        score = 0
+
+        # 维度 1：操作类型
+        # 分析任务需要更多探索（list_files + 多次 read_file + 合成 final_answer）
+        analysis_patterns = [
+            r"分析.{0,30}(?:项目|代码|仓库|工程|架构|质量|性能|不足|问题|改进)",
+            r"(?:评估|审查|检查|诊断).{0,20}(?:项目|代码|质量|安全)",
+            r"(?:分析|评估).{0,10}(?:代码|结构|设计|模式)",
+        ]
+        for p in analysis_patterns:
+            if re.search(p, text, re.I):
+                score += 8  # 分析类任务基线就高
+                break
+
+        # 文件操作任务（需要创建/修改/删除）
+        file_op_patterns = [
+            r"(?:创建|新建|写入|修改|编辑|删除|移动|复制).{0,10}(?:文件|目录|项目)",
+            r"(?:write|create|edit|delete|move|copy).{0,10}(?:file|dir|project)",
+        ]
+        for p in file_op_patterns:
+            if re.search(p, text, re.I):
+                score += 4
+                break
+
+        # 维度 2：项目规模
+        # 提到具体项目路径或目录 → 多文件操作
+        if re.search(r"[A-Z]:\\", text) or re.search(r"(?:项目|仓库|工程|代码库|workspace|project|repo)", text, re.I):
+            score += 4
+        # 提到了 list_files / read_file 等工具
+        if re.search(r"(?:list_files|read_file|search_files|list|ls|dir)\b", text, re.I):
+            score += 3
+
+        # 维度 3：任务广度
+        # 多步骤指令
+        step_indicators = len(re.findall(r"(?:\d[\.\)、]|第\s*\d|首先|然后|接着|最后|其次|此外|另外)", text))
+        if step_indicators >= 3:
+            score += 4
+        elif step_indicators >= 1:
+            score += 2
+
+        # 维度 4：有实时数据需求 → 轻量（天气、时间等只需要 1-2 步）
+        realtime_patterns = [
+            r"(?:天气|气温|温度|热不热|冷不冷|几度|多少度)",
+            r"(?:weather|temperature|forecast)",
+            r"(?:现在几点|今天几号|今天星期几|日期|时间)",
+            r"(?:黄金|金价|股价|汇率|行情)",
+        ]
+        for p in realtime_patterns:
+            if re.search(p, text, re.I):
+                score -= 5  # 降低复杂度——这些通常 1-2 步就够
+                break
+
+        # 维度 5：简单对话（无工具需求）
+        chat_patterns = [
+            r"^(你好|hi|hello|嗨|嘿)\b",
+            r"^(介绍一下|什么是|解释|说明)\b",
+            r"^(帮我|请).{0,5}(?:写|实现|创建|生成).{0,20}(?:一个|个|函数|脚本|代码|类)",
+        ]
+        for p in chat_patterns:
+            if re.search(p, text, re.I):
+                score -= 2
+                break
+
+        # 映射到实际迭代数
+        if score <= 0:
+            return 5   # 极简任务（天气、时间查询）
+        elif score <= 3:
+            return 8   # 简单任务（单文件操作、简单代码生成）
+        elif score <= 6:
+            return 12  # 中等任务（多文件、一般分析）
+        elif score <= 10:
+            return 16  # 较复杂任务（项目代码分析）
+        else:
+            return 20  # 复杂项目分析、多步骤重构
 
     _FILE_CLAIM_KEYWORDS: list[str] = [
         "已创建", "已经创建", "已生成", "已经生成", "已写入", "已经写入",

@@ -12,15 +12,22 @@ Novel Engine — 小说创作专用引擎。
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-from pathlib import Path
 from typing import Any
 
 from omniagent.engine.callbacks import EngineCallback
 from omniagent.engine.context import AgentContext
-from omniagent.engine.novel_manager import NovelManager, NovelProject
+from omniagent.engine.novel_manager import NovelManager
+from omniagent.engine.plan_execute_engine import _validate_tool_params
+from omniagent.engine.react_engine import (
+    _DEFAULT_EXPLORATION_SYNTHESIZE,
+    _DEFAULT_FORCE_SYNTHESIS,
+    _DEFAULT_HURRY_WARNING,
+    _DEFAULT_MIN_FINAL_ANSWER_LENGTH,
+    _DEFAULT_TOOL_RETRY_ATTEMPTS,
+    _check_hollow_answer,
+    _compile_exhaustion_report,
+)
 from omniagent.engine.tool_tracker import ToolExecutionTracker
 from omniagent.nodes.tool_node import ToolNode
 from omniagent.utils.llm_client import chat_completion
@@ -220,12 +227,26 @@ class NovelEngine:
         system_prompt: str | None = None,
         callback: EngineCallback | None = None,
         novel_manager: NovelManager | None = None,
+        # ── 可配置阈值 ──
+        min_final_answer_length: int = _DEFAULT_MIN_FINAL_ANSWER_LENGTH,
+        tool_retry_attempts: int = _DEFAULT_TOOL_RETRY_ATTEMPTS,
+        hurry_warning_threshold: int = _DEFAULT_HURRY_WARNING,
+        force_synthesis_threshold: int = _DEFAULT_FORCE_SYNTHESIS,
+        exploration_budget_synthesize: int = _DEFAULT_EXPLORATION_SYNTHESIZE,
     ) -> None:
         self.model_priority = model_priority
         self.max_iterations = max_iterations
         self.tools = NOVEL_TOOLS
         self.callback = callback or EngineCallback()
         self.manager = novel_manager or NovelManager()
+
+        # ── 可配置阈值（必须在 _build_system_prompt 之前设置）──
+        self.min_final_answer_length = min_final_answer_length
+        self.tool_retry_attempts = tool_retry_attempts
+        self.hurry_warning_threshold = hurry_warning_threshold
+        self.force_synthesis_threshold = force_synthesis_threshold
+        self.exploration_budget_synthesize = exploration_budget_synthesize
+
         self.system_prompt = system_prompt or self._build_system_prompt()
 
     def _build_system_prompt(self) -> str:
@@ -267,15 +288,14 @@ class NovelEngine:
                     "  `/novel init 星际迷途 科幻`\n"
                     "  `/novel init 月下独行 武侠`"
                 )
-            else:
-                novel_list = "\n".join(
-                    f"  - **{n['title']}** ({n['genre'] or '未分类'}) — {n['chapters']} 章, {n['words']} 字"
-                    for n in novels
-                )
-                return (
-                    f"你有多本小说，请指定要操作哪一本：\n\n{novel_list}\n\n"
-                    "使用 `/novel switch <名称>` 切换，或在输入中提到小说标题。"
-                )
+            novel_list = "\n".join(
+                f"  - **{n['title']}** ({n['genre'] or '未分类'}) — {n['chapters']} 章, {n['words']} 字"
+                for n in novels
+            )
+            return (
+                f"你有多本小说，请指定要操作哪一本：\n\n{novel_list}\n\n"
+                "使用 `/novel switch <名称>` 切换，或在输入中提到小说标题。"
+            )
 
         slug = project.slug
         logger.debug(f"识别到小说: {project.title} ({slug})")
@@ -291,18 +311,36 @@ class NovelEngine:
                 "content": f"## 当前小说: {project.title}\n\n{project_ctx}",
             })
 
-        # 注入对话历史
+        # 注入对话历史（包括最近的 system 消息以保留 system_hint）
         history = ctx.get_conversation_messages()
         if history:
-            recent = [m for m in history if m.get("role") != "system"][-10:]
+            non_system = [m for m in history if m.get("role") != "system"][-10:]
+            system_msgs = [m for m in history if m.get("role") == "system"][-2:]
+            recent = system_msgs + non_system
             messages.extend(recent)
-            logger.debug(f"Novel 注入 {len(recent)} 条对话历史")
+            logger.debug(f"Novel 注入 {len(recent)} 条对话历史 (含 {len(system_msgs)} 条 system)")
 
         messages.append({"role": "user", "content": user_input})
 
         # ── 3. 执行创作循环 ──
         for i in range(self.max_iterations):
             logger.debug(f"Novel 迭代 {i + 1}/{self.max_iterations}")
+
+            # ── 接近上限时注入合成提示 ──
+            remaining = self.max_iterations - i
+            if remaining <= self.force_synthesis_threshold and tracker.has_executions():
+                hurry_msg = (
+                    f"🛑 仅剩 {remaining} 轮！请立即输出 final_answer 交付创作结果。\n"
+                    f"不要再调用工具——基于已收集的数据直接完成创作。"
+                )
+                messages.append({"role": "user", "content": hurry_msg})
+                logger.info(f"Novel: 注入强制合成提示 (剩余 {remaining} 轮)")
+            elif remaining <= self.hurry_warning_threshold and not tracker.has_executions():
+                hurry_msg = (
+                    f"⚠️ 仅剩 {remaining} 轮迭代机会。请立即使用工具开始创作。"
+                )
+                messages.append({"role": "user", "content": hurry_msg})
+                logger.info(f"Novel: 注入加速提示 (剩余 {remaining} 轮)")
 
             response = self._call_llm(messages)
             messages.append({"role": "assistant", "content": response})
@@ -315,6 +353,25 @@ class NovelEngine:
 
             if parsed.get("final_answer"):
                 answer = parsed["final_answer"]
+
+                # ── 空洞检测 ──
+                hollow_check = _check_hollow_answer(
+                    answer, user_input, tracker,
+                    min_length=self.min_final_answer_length,
+                )
+                if hollow_check["is_hollow"]:
+                    remaining = self.max_iterations - i
+                    if remaining >= 1:
+                        correction = (
+                            f"❌ 你的 final_answer 不符合质量标准：{hollow_check['reason']}\n\n"
+                            f"请直接交付完整的创作内容，不要描述'我将要做什么'。\n"
+                            f"还剩 {remaining} 轮，请立即重新输出。"
+                        )
+                        messages.append({"role": "user", "content": correction})
+                        self.callback.on_warning(f"final_answer 空洞: {hollow_check['reason']}")
+                        logger.warning(f"Novel: final_answer 空洞，要求重新合成 (剩余 {remaining} 轮)")
+                        continue
+
                 if tracker.has_executions():
                     summary = tracker.execution_summary()
                     logger.debug(f"Novel 工具执行摘要: {summary}")
@@ -329,6 +386,16 @@ class NovelEngine:
                 action = parsed["action"]
                 action_input = parsed.get("action_input", {})
 
+                # ── 参数验证 ──
+                validated = _validate_tool_params(action, action_input)
+                if not validated["valid"]:
+                    error_msg = f"参数错误: {validated['reason']}"
+                    messages.append({"role": "user", "content": f"❌ {error_msg}\n请用正确的文件路径重试。"})
+                    if tracker:
+                        tracker.record(action, action_input, False, error_msg, error=error_msg)
+                    self.callback.on_warning(f"参数验证失败: {error_msg[:100]}")
+                    continue
+
                 logger.debug(f"Novel 思考: {thought}")
                 logger.debug(f"Novel 行动: {action}({action_input})")
                 self.callback.on_act(action, action_input)
@@ -340,10 +407,27 @@ class NovelEngine:
                 messages.append({"role": "user", "content": obs_msg})
                 logger.debug(f"Novel 观察: {observation[:200]}")
             else:
+                # ── thought-only 输出修正 ──
+                remaining = self.max_iterations - i
+                if remaining >= 1 and tracker.has_executions():
+                    correction = (
+                        "❌ 你的上一条回复只有 thought 字段，没有 action 也没有 final_answer。\n\n"
+                        f"还剩 {remaining} 轮。如果你已经完成任务，请立即输出 final_answer。"
+                    )
+                    messages.append({"role": "user", "content": correction})
+                    self.callback.on_warning("LLM 仅输出 thought 无 action/final_answer，要求明确表态")
+                    continue
                 result = parsed.get("thought", response)
                 self._auto_update_context(slug, user_input, result, tracker)
                 self.callback.on_finish(result)
                 return result
+
+        # 达到最大迭代次数 — 强制编译观察摘要
+        if tracker.has_executions():
+            compiled = _compile_exhaustion_report(tracker, messages, self.max_iterations)
+            self.callback.on_warning(f"达到最大迭代次数，已自动编译 {len(tracker.calls)} 条观察记录")
+            self.callback.on_finish(compiled)
+            return compiled
 
         msg = f"达到最大迭代次数 ({self.max_iterations})，创作暂停。"
         self.callback.on_warning(msg)
@@ -432,44 +516,56 @@ class NovelEngine:
                 tracker.record(action, action_input, False, error_msg, error=error_msg)
             return error_msg
 
-        try:
-            action_input = ToolNode.normalize_params(action_input)
-            logger.debug(f"执行工具: {action}, 参数: {action_input}")
-            node = ToolNode(
-                f"novel_{action}",
-                action_type=action,
-                **action_input,
-            )
-            result = node.execute(context)
-            logger.debug(f"工具结果: {str(result)[:200]}")
+        max_attempts = self.tool_retry_attempts
+        last_error_msg = ""
 
-            success = result.get("success", False)
-            error = result.get("error")
+        for attempt in range(max_attempts):
+            try:
+                action_input = ToolNode.normalize_params(action_input)
+                logger.debug(f"执行工具: {action}, 参数: {action_input} (attempt {attempt + 1}/{max_attempts})")
+                node = ToolNode(
+                    f"novel_{action}",
+                    action_type=action,
+                    **action_input,
+                )
+                result = node.execute(context)
+                logger.debug(f"工具结果: {str(result)[:200]}")
 
-            if success:
-                summary = ""
-                for key in ("content", "stdout", "output", "files"):
-                    if key in result and result[key]:
-                        val = result[key]
-                        if isinstance(val, list):
-                            summary = "\n".join(str(v) for v in val[:50])
-                        else:
-                            summary = str(val)[:5000]
-                        break
-                if not summary:
-                    summary = str(result)[:5000]
+                success = result.get("success", False)
+                error = result.get("error")
+
+                if success:
+                    summary = ""
+                    for key in ("content", "stdout", "output", "files"):
+                        if result.get(key):
+                            val = result[key]
+                            if isinstance(val, list):
+                                summary = "\n".join(str(v) for v in val[:50])
+                            else:
+                                summary = str(val)[:5000]
+                            break
+                    if not summary:
+                        summary = str(result)[:5000]
+                    if tracker:
+                        tracker.record(action, action_input, True, summary[:200])
+                    return summary
+                last_error_msg = f"工具执行失败: {error or result}"
+                error_str = str(error) if error else str(result)
+                if attempt < max_attempts - 1:
+                    logger.warning(f"工具 {action} 失败，准备重试 ({attempt + 1}/{max_attempts}): {error_str[:100]}")
+                    continue
                 if tracker:
-                    tracker.record(action, action_input, True, summary[:200])
-                return summary
-            else:
-                error_detail = f"工具执行失败: {error or result}"
-                if tracker:
-                    tracker.record(action, action_input, False, error_detail, error=str(error))
-                return error_detail
+                    tracker.record(action, action_input, False, last_error_msg, error=str(error))
+                return last_error_msg
 
-        except Exception as e:
-            error_msg = f"工具执行异常: {e}"
-            logger.error(f"工具执行异常: {action}({action_input}) -> {e}")
-            if tracker:
-                tracker.record(action, action_input, False, error_msg, error=str(e))
-            return error_msg
+            except Exception as e:
+                last_error_msg = f"工具执行异常: {e}"
+                logger.error(f"工具执行异常: {action}({action_input}) -> {e}")
+                if attempt < max_attempts - 1:
+                    logger.warning(f"工具 {action} 异常，准备重试 ({attempt + 1}/{max_attempts}): {e}")
+                    continue
+                if tracker:
+                    tracker.record(action, action_input, False, last_error_msg, error=str(e))
+                return last_error_msg
+
+        return last_error_msg
