@@ -51,11 +51,21 @@ class PlanReactEngine:
 
         ctx = context or AgentContext()
 
-        # Phase 0: Scout — 先侦察目录结构
+        # Phase 0: Scout — 先侦察目录结构（含对话历史回退）
         scout_info = self.planner._scout(user_input, ctx, None)
+        if not scout_info:
+            scout_info = self.planner._scout_from_history(user_input, ctx, None)
         plan_input = user_input
         if scout_info:
             plan_input = f"{user_input}\n\n## 🔴 项目的真实文件列表（来自 list_files）\n```\n{scout_info}\n```\n请使用上述真实文件路径来规划 read_file 步骤。"
+        else:
+            plan_input = (
+                f"{user_input}\n\n"
+                "## 🔴 重要：当前消息中没有指定目录路径，且未获取到文件列表。\n"
+                "如果你的任务需要访问本地文件，第一步必须是 list_files。\n"
+                "**绝对禁止**猜测不存在的文件名或目录名。\n"
+                "如果你不需要访问文件（如纯对话/解释/展开已有分析），所有步骤的 tool 设为 null。"
+            )
 
         # Phase 1: 全局规划（现在有真实文件列表）
         console.print("[dim]📋 Phase 1: 生成执行计划...[/dim]")
