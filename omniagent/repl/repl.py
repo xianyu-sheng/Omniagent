@@ -631,10 +631,12 @@ class REPL:
         # ── 当前 runtime session notes 注入 ───────────────
         self._inject_session_notes()
 
+        # ── 意图检测（始终执行，用于路由决策）──
+        intent = self._detect_intent(user_input)
+
         # ── Prompt 优化（按需） ──────────────────────────
         if self.optimize_prompts:
             optimized, system_hint, was_optimized = optimize_prompt(user_input)
-            intent = self._detect_intent(user_input)
             console.print(f"[dim]🎯 意图: {get_intent_display(intent)}[/dim]")
 
             if was_optimized:
@@ -670,6 +672,10 @@ class REPL:
         # 注入对话历史到 AgentContext，供引擎使用
         self.agent_context.set_conversation_messages(self.ctx_mgr.get_messages())
 
+        # ── 注入 MCP 注册表（修复 MCPCallTool 空注册表 bug）──
+        if hasattr(self, '_mcp_registry') and self._mcp_registry is not None:
+            self.agent_context.set("_mcp_registry", self._mcp_registry)
+
         # 根据当前思考范式选择执行方式
         mode = self.registry.current_mode
         recorder = self._start_run(
@@ -693,7 +699,12 @@ class REPL:
         )
 
         try:
-            if mode == "react":
+            # ── 通用对话自动使用 direct 模式（忽略全局 mode 设置）──
+            # PlanExecute/ReAct 等重型引擎对纯对话无益，且会错误地
+            # 从对话历史中提取目录进行不必要的侦察分析。
+            if intent is None:
+                self._run_direct(optimized, model_ids)
+            elif mode == "react":
                 self._run_react_engine(optimized, model_ids)
             elif mode == "plan-execute":
                 self._run_plan_execute_engine(optimized, model_ids)
