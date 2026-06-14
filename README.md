@@ -4,6 +4,10 @@
 
 OmniAgent is a local-first coding agent CLI for developers who want a transparent, configurable agent runtime: multi-model routing, ReAct / Plan-Execute / Reflection workflows, MCP tools, memory, project context, and production-grade reliability features in one Python package.
 
+## 📺 Demo Video
+
+<video src="./项目使用视频.mp4" controls width="100%"></video>
+
 ![OmniAgent terminal demo](docs/assets/terminal-demo.svg)
 
 ## Why It Matters
