@@ -39,9 +39,18 @@ class MCPCallTool(BaseTool):
         if not tool_name:
             return ToolResult.schema_error("mcp_call 需要 tool_name 参数")
 
-        try:
+        # 使用注入的 registry（来自 REPL /mcp add），而非创建空实例
+        registry = params.get("_registry")
+        if registry is None:
+            # 尝试从全局获取（兼容直接调用）
             from omniagent.mcp.registry import MCPRegistry
             registry = MCPRegistry()
+            if not registry.servers:
+                return ToolResult.error(
+                    "MCP 未初始化或没有已连接的服务器。请先使用 /mcp add 命令添加 MCP 服务器。"
+                )
+
+        try:
             result = registry.call_tool(tool_name, tool_args)
 
             content_parts = []

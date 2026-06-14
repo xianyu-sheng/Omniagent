@@ -1,5 +1,10 @@
 """增强权限管理器 — 借鉴 KamaClaude 的 6 层评估 + 交互式审批。
 
+⚠️ DEPRECATED — 当前仅由测试文件 (test_kamaclaude_integration.py) 使用。
+   生产代码使用 permissions.py 中的简化版 ToolPolicy。
+   此模块依赖异步 EventBus (events/bus.py)，仅在 daemon/TUI 路径中可用。
+   待异步路径统一后，此模块将取代 permissions.py 成为唯一的权限系统。
+
 层级:
   Tier 1: deny_patterns（硬拒绝，不可被缓存绕过）
   Tier 2: OUTSIDE_CWD（强制 ask，不可被缓存绕过）

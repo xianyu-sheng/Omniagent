@@ -14,22 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from omniagent.tools.base import BaseTool, ToolResult
+from omniagent.tools.security import DANGEROUS_CMD_PATTERNS
 
 logger = logging.getLogger(__name__)
-
-# 危险命令黑名单
-_DANGEROUS_PATTERNS: list[str] = [
-    r"rm\s+(-[rfR]+\s+)?/", r"rm\s+(-[rfR]+\s+)?~",
-    r"rmdir\s+/", r"del\s+/[sfq]\s+[a-zA-Z]:\\",
-    r"del\s+/[sfq]\s+C:\\",
-    r"\bformat\s+[a-zA-Z]:", r"\bmkfs\b",
-    r"\bdd\s+if=",
-    r"\bshutdown\b", r"\breboot\b", r"\bhalt\b",
-    r"curl.*\|\s*(?:bash|sh|python|node)",
-    r"wget.*\|\s*(?:bash|sh|python|node)",
-    r"Remove-Item\s+-[rR].*C:\\", r"Format-Volume",
-    r"\bchmod\s+777\b", r"\bchown\b.*root",
-]
 
 MAX_OUTPUT_LENGTH = 100_000
 
@@ -39,7 +26,7 @@ def _validate_command(cmd: str) -> str | None:
     if not cmd or not cmd.strip():
         return None
     cmd_lower = cmd.lower().strip()
-    for pattern in _DANGEROUS_PATTERNS:
+    for pattern in DANGEROUS_CMD_PATTERNS:
         if re.search(pattern, cmd_lower):
             return f"危险命令被拦截: 匹配到禁止模式 '{pattern}'"
     return None

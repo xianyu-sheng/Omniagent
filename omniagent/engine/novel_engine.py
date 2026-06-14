@@ -18,7 +18,7 @@ from typing import Any
 from omniagent.engine.callbacks import EngineCallback
 from omniagent.engine.context import AgentContext
 from omniagent.engine.novel_manager import NovelManager
-from omniagent.engine.plan_execute_engine import _validate_tool_params
+from omniagent.engine.tool_executor import _validate_tool_params
 from omniagent.engine.react_engine import (
     _DEFAULT_EXPLORATION_SYNTHESIZE,
     _DEFAULT_FORCE_SYNTHESIS,

@@ -698,3 +698,242 @@ def _stream_anthropic(
                             yield text
                 except (json.JSONDecodeError, KeyError):
                     continue
+
+
+# ═══════════════════════════════════════════════════════════════
+# Native Tool Calling — 原生函数调用 API, 消除 JSON 解析根因
+# ═══════════════════════════════════════════════════════════════
+
+
+class NativeToolResponse:
+    """原生工具调用返回的结构化结果。"""
+
+    def __init__(
+        self,
+        *,
+        text: str = "",
+        tool_calls: list[dict] | None = None,
+        finish_reason: str = "stop",
+    ) -> None:
+        self.text = text
+        self.tool_calls = tool_calls or []
+        self.finish_reason = finish_reason
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return len(self.tool_calls) > 0
+
+    def first_tool_call(self) -> dict | None:
+        return self.tool_calls[0] if self.tool_calls else None
+
+
+def _tool_dict_to_openai_schema(tool: dict) -> dict:
+    """将内部工具描述转换为 OpenAI function calling 格式。"""
+    params_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    }
+    for param_name, param_desc in tool.get("params", {}).items():
+        if isinstance(param_desc, str):
+            params_schema["properties"][param_name] = {
+                "type": "string",
+                "description": param_desc,
+            }
+        elif isinstance(param_desc, dict):
+            params_schema["properties"][param_name] = param_desc
+        params_schema["required"].append(param_name)
+    return {
+        "type": "function",
+        "function": {
+            "name": tool["name"],
+            "description": tool.get("description", ""),
+            "parameters": params_schema,
+        },
+    }
+
+
+def build_tool_schemas(tools: dict[str, dict]) -> list[dict]:
+    """将内部工具字典转换为 OpenAI 兼容的工具 Schema 列表。"""
+    return [_tool_dict_to_openai_schema(t) for t in tools.values() if t.get("name")]
+
+
+def chat_completion_with_tools(
+    model_id: str,
+    messages: list[dict[str, str]],
+    tools: dict[str, dict],
+    *,
+    credentials: dict[str, Any] | None = None,
+    max_tokens: int = 131072,
+    temperature: float = 0.3,
+    timeout: float = 120.0,
+    max_retries: int = 3,
+) -> NativeToolResponse:
+    """
+    带原生工具调用的 chat completion — 消除 JSON 解析根源问题。
+    LLM 原生返回结构化 tool_calls, 无需字符串 JSON 解析。
+    """
+    import time
+
+    endpoint = build_endpoint(model_id, credentials)
+    tool_schemas = build_tool_schemas(tools)
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            if endpoint.provider == "anthropic":
+                return _native_call_anthropic(
+                    endpoint, messages, tool_schemas,
+                    max_tokens, temperature, timeout,
+                )
+            else:
+                return _native_call_openai_compat(
+                    endpoint, messages, tool_schemas,
+                    max_tokens, temperature, timeout,
+                )
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status == 429:
+                wait = 2 ** attempt
+                logger.warning(f"[{model_id}] 429 (native tools), 等待 {wait}s")
+                time.sleep(wait)
+                last_error = e
+            elif 500 <= status < 600:
+                wait = 2 ** attempt
+                logger.warning(f"[{model_id}] {status} (native tools), 等待 {wait}s")
+                time.sleep(wait)
+                last_error = e
+            else:
+                raise
+        except (
+            httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout,
+            httpx.RemoteProtocolError, httpx.WriteError, httpx.PoolTimeout,
+        ) as e:
+            wait = min(2 ** attempt, 8)
+            logger.warning(f"[{model_id}] 网络 ({type(e).__name__}), 等待 {wait}s")
+            time.sleep(wait)
+            last_error = e
+
+    raise last_error if last_error else RuntimeError("All retries failed (native tools)")
+
+
+def _native_call_openai_compat(
+    endpoint: ModelEndpoint,
+    messages: list[dict[str, str]],
+    tool_schemas: list[dict],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+) -> NativeToolResponse:
+    """OpenAI 兼容格式的原生工具调用 — 返回结构化 tool_calls。"""
+    url = _openai_compat_url(endpoint, "chat/completions")
+    headers = {
+        "Authorization": f"Bearer {endpoint.api_key}",
+        "Content-Type": "application/json",
+    }
+    payload: dict[str, Any] = {
+        "model": endpoint.model_name,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if tool_schemas:
+        payload["tools"] = tool_schemas
+        payload["tool_choice"] = "auto"
+
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+    choice = data["choices"][0]
+    finish = choice.get("finish_reason", "stop")
+    msg = choice.get("message", {})
+
+    text = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or msg.get("thinking") or ""
+    if not text and reasoning:
+        text = reasoning
+
+    # 原生 tool_calls — 无需 JSON 字符串解析
+    raw_tool_calls = msg.get("tool_calls") or []
+    tool_calls = []
+    for tc in raw_tool_calls:
+        func = tc.get("function", {})
+        name = func.get("name", "")
+        args_str = func.get("arguments", "{}")
+        try:
+            args = json.loads(args_str)
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        tool_calls.append({"id": tc.get("id", ""), "name": name, "arguments": args})
+
+    if finish == "length":
+        logger.warning("Native tools: 响应截断 (finish_reason=length)")
+
+    return NativeToolResponse(text=text, tool_calls=tool_calls, finish_reason=finish)
+
+
+def _native_call_anthropic(
+    endpoint: ModelEndpoint,
+    messages: list[dict[str, str]],
+    tool_schemas: list[dict],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+) -> NativeToolResponse:
+    """Anthropic 原生格式的工具调用 — 使用 tool_use content block。"""
+    url = f"{endpoint.base_url}/v1/messages"
+    headers = {
+        "x-api-key": endpoint.api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    system_text = ""
+    chat_messages = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_text = msg["content"]
+        else:
+            chat_messages.append(msg)
+
+    payload: dict[str, Any] = {
+        "model": endpoint.model_name,
+        "messages": chat_messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if system_text:
+        payload["system"] = system_text
+    if tool_schemas:
+        payload["tools"] = [
+            {
+                "name": ts["function"]["name"],
+                "description": ts["function"]["description"],
+                "input_schema": ts["function"]["parameters"],
+            }
+            for ts in tool_schemas
+        ]
+
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+    text_parts = []
+    tool_calls = []
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            text_parts.append(block.get("text", ""))
+        elif block.get("type") == "tool_use":
+            tool_calls.append({
+                "id": block.get("id", ""),
+                "name": block.get("name", ""),
+                "arguments": block.get("input", {}),
+            })
+
+    return NativeToolResponse(
+        text="\n".join(text_parts),
+        tool_calls=tool_calls,
+        finish_reason=data.get("stop_reason", "stop"),
+    )

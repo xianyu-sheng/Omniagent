@@ -47,13 +47,18 @@ class WebFetchTool(BaseTool):
         if not url:
             return ToolResult.schema_error("web_fetch 需要 url 参数")
 
-        # URL 安全检查
-        url_lower = url.lower().strip()
+        # URL 安全检查 & HTTP → HTTPS 自动升级
+        url = url.strip()
+        url_lower = url.lower()
         if url_lower.startswith("file://"):
             return ToolResult.permission_denied("禁止访问 file:// 协议")
+        # HTTP → HTTPS 自动升级（现代服务通常要求 HTTPS）
+        if url_lower.startswith("http://"):
+            url = "https://" + url[7:]
+            url_lower = url.lower()
         if any(url_lower.startswith(p) for p in [
-            "http://169.254", "http://10.", "http://172.1",
-            "http://192.168", "http://localhost", "http://127.",
+            "https://169.254", "https://10.", "https://172.1",
+            "https://192.168", "https://localhost", "https://127.",
         ]):
             return ToolResult.permission_denied("禁止访问内网地址")
 

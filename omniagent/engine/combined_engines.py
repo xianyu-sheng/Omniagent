@@ -51,13 +51,15 @@ class PlanReactEngine:
 
         ctx = context or AgentContext()
 
-        # Phase 0: Scout — 先侦察目录结构（含对话历史回退）
-        scout_info = self.planner._scout(user_input, ctx, None)
-        if not scout_info:
-            scout_info = self.planner._scout_from_history(user_input, ctx, None)
-        plan_input = user_input
-        if scout_info:
-            plan_input = f"{user_input}\n\n## 🔴 项目的真实文件列表（来自 list_files）\n```\n{scout_info}\n```\n请使用上述真实文件路径来规划 read_file 步骤。"
+        # Phase 0: Scout — 使用统一的 DirectoryScout 服务
+        from omniagent.engine.directory_scout import DirectoryScout
+        scout = DirectoryScout()
+        scout_result = scout.scout(user_input, ctx, None)
+        if not scout_result.has_data:
+            scout_result = scout.scout_from_history(user_input, ctx, None)
+
+        if scout_result and scout_result.has_data:
+            plan_input = scout_result.to_plan_input(user_input)
         else:
             plan_input = (
                 f"{user_input}\n\n"

@@ -8,23 +8,15 @@ import re
 from pathlib import Path
 from typing import Any
 
+from omniagent.tools.security import (
+    MAX_READ_SIZE,
+    MAX_VERIFY_SIZE,
+    MAX_WRITE_SIZE,
+    SENSITIVE_PATHS,
+    USER_SENSITIVE,
+)
+
 logger = logging.getLogger(__name__)
-
-# 路径安全常量
-MAX_READ_SIZE = 2 * 1024 * 1024
-MAX_WRITE_SIZE = 10 * 1024 * 1024
-MAX_VERIFY_SIZE = 1 * 1024 * 1024
-
-_SENSITIVE_PATHS = [
-    "c:\\windows", "c:\\program files", "c:\\programdata",
-    "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys",
-    "/var/log", "/root/.ssh", "/root/.gnupg",
-]
-
-_USER_SENSITIVE = [
-    ".ssh", ".gnupg", ".aws", ".azure", ".config/gh",
-    ".docker/config.json", "credentials", "id_rsa", "id_ed25519",
-]
 
 
 def validate_file_path(
@@ -63,12 +55,12 @@ def validate_file_path(
 
     if for_write:
         resolved_lower = str(resolved).lower().replace("\\", "/")
-        for sensitive in _SENSITIVE_PATHS:
+        for sensitive in SENSITIVE_PATHS:
             if sensitive in resolved_lower:
                 raise ValueError(f"禁止写入系统敏感路径: {resolved}")
 
         name_lower = resolved.name.lower()
-        for sensitive in _USER_SENSITIVE:
+        for sensitive in USER_SENSITIVE:
             if sensitive in name_lower or sensitive in resolved_lower:
                 raise ValueError(f"禁止写入敏感文件: {resolved}")
 

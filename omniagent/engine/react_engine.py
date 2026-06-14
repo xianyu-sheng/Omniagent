@@ -311,6 +311,22 @@ BUILTIN_TOOLS = {
             "timeout_seconds": "超时秒数，默认 120",
         },
     },
+    # ── 子 Agent 工具（从 subagent.py 注册到生产路径）──
+    "spawn_agent": {
+        "name": "spawn_agent",
+        "description": "派生子 Agent 在后台独立处理子任务。子 Agent 有独立上下文，结果通过 agent_result 工具查询。适合并行处理多个独立子任务。",
+        "params": {
+            "goal": "子任务目标描述",
+            "model": "指定模型（可选，默认继承父 Agent）",
+        },
+    },
+    "agent_result": {
+        "name": "agent_result",
+        "description": "查询子 Agent 任务的执行结果。需要先通过 spawn_agent 创建子任务。",
+        "params": {
+            "task_id": "子任务 ID（可选，不传则列出所有子任务）",
+        },
+    },
 }
 
 
@@ -607,6 +623,8 @@ class ReActEngine:
         system_prompt: str | None = None,
         tools: dict[str, dict] | None = None,
         callback: EngineCallback | None = None,
+        # ── Trace 记录（可选，用于调试/审计）──
+        trace_dir: str | None = None,
         # ── 可配置阈值（None 表示根据 max_iterations 动态缩放）──
         min_final_answer_length: int = _DEFAULT_MIN_FINAL_ANSWER_LENGTH,
         min_structured_sections: int = _DEFAULT_MIN_STRUCTURED_SECTIONS,
@@ -662,6 +680,12 @@ class ReActEngine:
         )
 
         self.system_prompt = system_prompt or self._build_system_prompt()
+
+        # ── 可选的 Trace 记录器（用于调试/审计）──
+        self._trace = None
+        if trace_dir:
+            from omniagent.engine.trace import TraceWriter
+            self._trace = TraceWriter(trace_dir)
 
     def _build_system_prompt(self) -> str:
         import sys
@@ -805,34 +829,27 @@ class ReActEngine:
                 messages.append({"role": "user", "content": midpoint_msg})
                 logger.info(f"ReAct: 中点预算提醒 (已 {len(tracker.calls)} 次调用，剩余 {remaining} 轮)")
 
-            # 调用 LLM
-            response = self._call_llm(messages)
-            messages.append({"role": "assistant", "content": response})
+            # ── 调用 LLM（优先原生工具调用，回退 JSON 解析）──
+            native_response = self._call_llm_native(messages)
+            response_text = native_response.get("raw_text", "")
+            messages.append({"role": "assistant", "content": response_text})
 
-            # 解析 LLM 输出
-            parsed = self._parse_response(response)
+            # 解析结果：优先使用原生 tool_calls，回退到 JSON 解析
+            parsed = native_response
 
-            # ── P0 修复: 处理 JSON 解析失败 ──
+            # ── 处理 JSON 解析失败（仅回退路径）──
             if parsed.get("parse_error"):
                 logger.warning(
-                    f"ReAct: 第 {i + 1} 轮 JSON 解析失败，"
+                    f"ReAct: 第 {i + 1} 轮 JSON 解析失败（原生工具调用也失败），"
                     f"要求 LLM 以正确格式重试"
                 )
                 self.callback.on_warning(
                     f"LLM 输出格式错误，要求重试（第 {i + 1} 轮）"
                 )
                 fmt_correction = (
-                    "❌ 你的上一条回复无法被解析为有效的 JSON 格式。\n\n"
-                    "请严格遵守以下格式重新输出：\n\n"
-                    "调用工具时：\n"
-                    '```json\n{"thought": "分析当前状态", "action": "工具名", "action_input": {"参数": "值"}}\n```\n\n'
-                    "任务完成时：\n"
-                    '```json\n{"thought": "总结结果", "final_answer": "给用户的最终回答"}\n```\n\n'
-                    "⚠️ 注意：\n"
-                    "- 只输出一个 JSON 对象，不要加任何前言或后记\n"
-                    "- action 必须是可用工具列表中的工具名\n"
-                    "- 如果你需要执行操作（如 git clone），请使用 command 工具\n"
-                    "- 不要在 JSON 外添加 DSML 标记或其他文本"
+                    "你的上一条回复无法被解析。请直接使用工具或输出最终答案。"
+                    "调用工具时输出: action=工具名, action_input=参数。"
+                    "任务完成时直接输出分析报告文本。"
                 )
                 messages.append({"role": "user", "content": fmt_correction})
                 continue
@@ -914,35 +931,16 @@ class ReActEngine:
                 logger.debug(f"ReAct 行动: {action}({action_input})")
                 self.callback.on_act(action, action_input)
 
-                observation = self._execute_tool(action, action_input, ctx, tracker)
-                self.callback.on_observe(observation)
+                # ── 使用统一 ToolExecutor（含断路器+重试+验证）──
+                from omniagent.engine.tool_executor import ToolExecutor
+                executor = ToolExecutor(retry_attempts=self.tool_retry_attempts)
+                exec_result = executor.execute(action, action_input, ctx, tracker)
+                self.callback.on_observe(exec_result.summary or exec_result.error or "")
 
-                # 将观察结果结构化地加入对话
-                is_error = observation.startswith("错误") or observation.startswith("⚠️") or "失败" in observation[:100] or observation.startswith("❌")
-                obs_status = "❌ 执行失败" if is_error else "✅ 执行完成"
-
-                # ── 上下文感知的下一步提示 ──
-                # 信息获取类工具（天气/时间/读取文件）→ 成功后应推动合成而非继续获取
-                info_tools = {"weather", "datetime", "read_file", "list_files", "search_files", "web_fetch", "github_fetch"}
-                if is_error:
-                    if "缺少" in observation and "参数" in observation:
-                        next_hint = "请补充缺失的参数后重试，或跳过此工具用已有信息输出 final_answer。"
-                    elif "不存在" in observation or "not found" in observation.lower():
-                        next_hint = "该资源不存在，请勿重试。用已有信息继续或输出 final_answer。"
-                    else:
-                        next_hint = "分析失败原因，尝试其他方法或工具。如果无法解决，基于已有数据输出 final_answer。"
-                elif action in info_tools:
-                    next_hint = "信息已获取。如果你已收集足够数据，请直接输出 final_answer 交付结果。如还需要其他信息，继续调用工具。"
-                else:
-                    next_hint = "操作完成。继续下一个操作或输出 final_answer。"
-
-                obs_msg = (
-                    f"📋 工具 '{action}' 执行结果 ({obs_status}):\n"
-                    f"{observation}\n\n"
-                    f"→ {next_hint}"
-                )
+                # 使用结构化结果格式化观察消息
+                obs_msg = exec_result.format_observation()
                 messages.append({"role": "user", "content": obs_msg})
-                logger.debug(f"ReAct 观察: {observation[:200]}")
+                logger.debug(f"ReAct 观察: {exec_result.summary[:200] if exec_result.summary else exec_result.error}")
                 no_tool_streak = 0
                 thought_only_streak = 0
             else:
@@ -1130,6 +1128,83 @@ class ReActEngine:
         msg = f"所有模型均调用失败: {last_error}"
         raise RuntimeError(msg)
 
+    def _call_llm_native(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        """调用 LLM — 优先使用原生工具调用，回退 JSON 解析。
+
+        这是 P0 根因修复的核心：通过 API 的 function calling 机制获取
+        结构化的 tool_calls，消除对 LLM 文本输出的 JSON 解析依赖。
+
+        Returns:
+            兼容 parse_react 返回格式的 dict，额外包含 "raw_text" 字段
+        """
+        from omniagent.utils.llm_client import chat_completion_with_tools, NativeToolResponse
+
+        last_text = ""
+        for model_id in self.model_priority:
+            try:
+                native: NativeToolResponse = chat_completion_with_tools(
+                    model_id, messages,
+                    tools=self.tools,
+                    max_tokens=_REACT_LOOP_MAX_TOKENS,
+                    temperature=0.3,
+                )
+
+                # ── Trace: LLM 调用 ──
+                if self._trace:
+                    self._trace.emit_llm("CORE→LLM", model=model_id,
+                        request_preview=str(messages[-1].get("content", ""))[:500],
+                        response_preview=native.text[:500] if native.text else "[tool_calls]")
+
+                # ── 优先: 原生 tool_calls（完全不需要 JSON 解析）──
+                if native.has_tool_calls:
+                    tc = native.first_tool_call()
+                    logger.debug(
+                        f"ReAct 原生工具调用: {tc['name']}({str(tc['arguments'])[:200]})"
+                    )
+                    if self._trace:
+                        self._trace.emit_event(kind="agent.tool_call",
+                            tool_name=tc["name"], tool_args=str(tc["arguments"])[:500])
+                    return {
+                        "thought": f"调用工具 {tc['name']}",
+                        "action": tc["name"],
+                        "action_input": tc["arguments"],
+                        "raw_text": native.text or f"tool_call: {tc['name']}",
+                    }
+
+                # ── 次优: 文本中包含 final_answer ──
+                if native.text and native.text.strip():
+                    last_text = native.text
+                    # 尝试解析文本中的 JSON（兼容不支持 function calling 的模型）
+                    parsed = parse_react(native.text)
+                    if not parsed.get("parse_error"):
+                        # 成功解析 → 返回
+                        parsed["raw_text"] = native.text
+                        return parsed
+                    # 解析失败但文本有意义 → 当作 final_answer
+                    if len(native.text.strip()) > 50:
+                        return {
+                            "thought": "任务完成",
+                            "final_answer": native.text,
+                            "raw_text": native.text,
+                        }
+
+                break  # 模型成功但不含有效响应，跳出尝试下一个
+
+            except Exception as e:
+                logger.warning(f"模型 {model_id} 原生工具调用失败: {e}，尝试下一个...")
+                continue
+
+        # ── 最终回退: 如果所有原生调用都失败，尝试传统 JSON 调用 ──
+        if not last_text:
+            try:
+                last_text = self._call_llm(messages)
+            except Exception:
+                pass
+
+        parsed = parse_react(last_text) if last_text else {"parse_error": True, "raw_text": ""}
+        parsed["raw_text"] = last_text
+        return parsed
+
     def _parse_response(self, response: str) -> dict[str, Any]:
         """解析 LLM 的 JSON 输出（委托给 response_adapter 中间件）。"""
         return parse_react(response)
@@ -1141,14 +1216,13 @@ class ReActEngine:
         context: AgentContext,
         tracker: ToolExecutionTracker | None = None,
     ) -> str:
-        """执行工具并返回结果。
+        """执行工具并返回观察结果文本。
 
-        包含:
-        - 断路器检查: 连续失败 3 次的工具暂时跳过
-        - 失败重试: 首次失败自动重试 1 次
+        委托给统一的 ToolExecutor，避免与其他引擎重复实现
+        断路器/重试/参数验证逻辑。
         """
+        # 验证工具存在
         tool_info = self.tools.get(action)
-        # 如果内置工具中没有，检查动态注册的工具
         if not tool_info and action in _DYNAMIC_TOOLS:
             tool_info = _DYNAMIC_TOOLS[action]
         if not tool_info:
@@ -1157,107 +1231,12 @@ class ReActEngine:
                 tracker.record(action, action_input, False, error_msg, error=error_msg)
             return error_msg
 
-        # ── 断路器检查 ──
-        if not self.breaker.allow(action):
-            state = self.breaker.status(action)
-            cooldown_msg = (
-                f"⚠️ 工具 '{action}' 暂时不可用 — "
-                f"之前连续失败 {state.get('consecutive_failures', 0)} 次, "
-                f"冷却剩余 {state.get('cooldown_remaining', 0)} 秒。\n"
-                f"请尝试使用其他工具完成任务。"
-            )
-            if tracker:
-                tracker.record(action, action_input, False, cooldown_msg, error="circuit_breaker_cooldown")
-            return cooldown_msg
+        # 委托给统一 ToolExecutor
+        from omniagent.engine.tool_executor import ToolExecutor
+        executor = ToolExecutor(retry_attempts=self.tool_retry_attempts)
+        result = executor.execute(action, action_input, context, tracker)
 
-        # ── 执行工具（含重试）──
-        max_attempts = self.tool_retry_attempts
-        last_error_msg = ""
-
-        for attempt in range(max_attempts):
-            try:
-                action_input = ToolNode.normalize_params(action_input)
-                logger.debug(f"执行工具: {action}, 参数: {action_input} (attempt {attempt + 1}/{max_attempts})")
-                node = ToolNode(
-                    f"react_{action}",
-                    action_type=action,
-                    **action_input,
-                )
-                result = node.execute(context)
-                logger.debug(f"工具结果: {str(result)[:200]}")
-
-                success = result.get("success", False)
-                error = result.get("error")
-
-                if success:
-                    # 提取主要内容
-                    summary = ""
-                    for key in ("content", "stdout", "output", "files"):
-                        if result.get(key):
-                            val = result[key]
-                            if isinstance(val, list):
-                                summary = "\n".join(str(v) for v in val[:50])
-                            else:
-                                summary = str(val)[:3000]
-                            break
-                    if not summary:
-                        summary = str(result)[:3000]
-
-                    # 成功 → 重置断路器
-                    self.breaker.on_success(action)
-                    if tracker:
-                        tracker.record(action, action_input, True, summary[:200])
-                    return summary
-                last_error_msg = f"工具执行失败: {error or result}"
-                error_str = str(error) if error else str(result)
-
-                # ── 终端错误检测：如果是"文件不存在"这类错误，重试无意义 ──
-                if CircuitBreaker.is_terminal_error(action, error_str):
-                    breaker_msg = (
-                        f"❌ {action} 失败（不可重试错误）: {error_str[:300]}\n"
-                        f"💡 请换一种方式：尝试其他文件路径、使用 list_files 确认实际文件名、或者跳过此文件继续其他操作。"
-                    )
-                    self.breaker.on_failure(action, error_str)
-                    if tracker:
-                        tracker.record(action, action_input, False, breaker_msg, error=error_str)
-                    logger.info(f"终端错误: {action} — {error_str[:100]}")
-                    return breaker_msg
-
-                # 记录失败（断路器内部会处理冷却逻辑）
-                self.breaker.on_failure(action, error_str)
-                if attempt < max_attempts - 1:
-                    logger.warning(f"工具 {action} 失败，准备重试 (1/1): {error_str[:100]}")
-                    continue  # 重试
-
-            except Exception as e:
-                last_error_msg = f"工具执行异常: {e}"
-                logger.error(f"工具执行异常: {action}({action_input}) -> {e}")
-
-                # ── 终端错误检测：异常也一样区分 ──
-                if CircuitBreaker.is_terminal_error(action, str(e)):
-                    breaker_msg = (
-                        f"❌ {action} 异常（不可重试错误）: {str(e)[:300]}\n"
-                        f"💡 请换一种方式：尝试其他文件路径或使用其他工具。"
-                    )
-                    self.breaker.on_failure(action, str(e))
-                    if tracker:
-                        tracker.record(action, action_input, False, breaker_msg, error=str(e))
-                    return breaker_msg
-
-                self.breaker.on_failure(action, str(e))
-                if attempt < max_attempts - 1:
-                    logger.warning(f"工具 {action} 异常，准备重试 (1/1): {e}")
-                    continue  # 重试
-
-        # 所有尝试都失败
-        # 检查断路器是否触发
-        tripped_msg = self.breaker.on_failure_cooldown(action, last_error_msg)
-        if tripped_msg:
-            last_error_msg = tripped_msg
-
-        if tracker:
-            tracker.record(action, action_input, False, last_error_msg, error=last_error_msg)
-        return last_error_msg
+        return result.summary if result.success else (result.error or result.summary)
 
     @staticmethod
     def _input_requires_tools(text: str) -> bool:
