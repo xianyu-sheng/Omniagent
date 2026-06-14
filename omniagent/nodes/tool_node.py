@@ -1634,7 +1634,11 @@ class ToolNode(BaseNode):
                 "action_type": "weather",
                 "success": False,
                 "content": "",
-                "error": "缺少城市参数。请提供 city 参数，如 '北京'、'重庆'、'Shanghai'。",
+                "error": (
+                    "缺少 city 参数。请在 action_input 中包含 city 字段，如 "
+                    "{\"city\": \"重庆\", \"lang\": \"zh\"}。"
+                    "如果你之前已经成功查询过天气，不要再重复查询——直接输出 final_answer。"
+                ),
             }
         lang = self._resolve_template(getattr(self, "lang", ""), context) or "zh"
 

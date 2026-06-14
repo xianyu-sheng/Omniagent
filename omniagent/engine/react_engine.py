@@ -918,14 +918,28 @@ class ReActEngine:
                 self.callback.on_observe(observation)
 
                 # 将观察结果结构化地加入对话
-                is_error = observation.startswith("错误") or observation.startswith("⚠️") or "失败" in observation[:100]
+                is_error = observation.startswith("错误") or observation.startswith("⚠️") or "失败" in observation[:100] or observation.startswith("❌")
                 obs_status = "❌ 执行失败" if is_error else "✅ 执行完成"
+
+                # ── 上下文感知的下一步提示 ──
+                # 信息获取类工具（天气/时间/读取文件）→ 成功后应推动合成而非继续获取
+                info_tools = {"weather", "datetime", "read_file", "list_files", "search_files", "web_fetch", "github_fetch"}
+                if is_error:
+                    if "缺少" in observation and "参数" in observation:
+                        next_hint = "请补充缺失的参数后重试，或跳过此工具用已有信息输出 final_answer。"
+                    elif "不存在" in observation or "not found" in observation.lower():
+                        next_hint = "该资源不存在，请勿重试。用已有信息继续或输出 final_answer。"
+                    else:
+                        next_hint = "分析失败原因，尝试其他方法或工具。如果无法解决，基于已有数据输出 final_answer。"
+                elif action in info_tools:
+                    next_hint = "信息已获取。如果你已收集足够数据，请直接输出 final_answer 交付结果。如还需要其他信息，继续调用工具。"
+                else:
+                    next_hint = "操作完成。继续下一个操作或输出 final_answer。"
+
                 obs_msg = (
                     f"📋 工具 '{action}' 执行结果 ({obs_status}):\n"
                     f"{observation}\n\n"
-                    f"请根据此结果决定下一步: "
-                    f"如果成功→继续下一个操作或输出 final_answer; "
-                    f"如果失败→分析原因并尝试替代方案。"
+                    f"→ {next_hint}"
                 )
                 messages.append({"role": "user", "content": obs_msg})
                 logger.debug(f"ReAct 观察: {observation[:200]}")
