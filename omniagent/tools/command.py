@@ -58,10 +58,26 @@ class CommandTool(BaseTool):
         "required": ["action"],
     }
 
+    @staticmethod
+    def _normalize_cmd(cmd: str) -> str:
+        """标准化命令文本：将字面换行符替换为平台对应的命令分隔符。"""
+        if not cmd:
+            return cmd
+        import re
+        if sys.platform == "win32":
+            cmd = re.sub(r'[\r\n]+', ' ; ', cmd)
+        else:
+            cmd = re.sub(r'[\r\n]+', ' ; ', cmd)
+        cmd = re.sub(r'\s*;\s*;+\s*', ' ; ', cmd)
+        return cmd.strip().rstrip(';').strip()
+
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         cmd = str(params.get("action", "") or params.get("command", ""))
         if not cmd:
             return ToolResult.schema_error("command 工具需要 'action' 参数")
+
+        # P0-2 修复: 标准化命令中的换行符
+        cmd = self._normalize_cmd(cmd)
 
         # 安全验证
         error = _validate_command(cmd)

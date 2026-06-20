@@ -143,15 +143,19 @@ class CircuitBreaker:
             )
 
     def on_failure_cooldown(self, tool_name: str, error: str) -> str | None:
-        """记录失败并返回冷却消息（如果触发）。
+        """检查断路器状态并返回冷却消息（如果触发）。
 
-        便捷方法: 结合了 on_failure + allow 检查。
+        注意：此方法不会再次增加失败计数 — 失败计数由 on_failure() 单独管理。
+        这样避免了双重计数导致断路器在 retry_attempts 耗尽前就提前熔断。
 
         Returns:
             None 表示未触发断路器
             字符串表示断路器消息（应直接返回给 Agent）
         """
-        self.on_failure(tool_name, error)
+        # 更新最后一次错误信息（不增加计数）
+        state = self._states.get(tool_name)
+        if state is not None:
+            state.last_error = error
 
         if not self.allow(tool_name):
             state = self._states.get(tool_name)

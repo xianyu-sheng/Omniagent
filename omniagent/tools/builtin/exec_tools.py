@@ -18,10 +18,34 @@ logger = logging.getLogger(__name__)
 class CommandTool(BaseTool):
     name = "command"
 
+    @staticmethod
+    def _normalize_cmd(cmd: str) -> str:
+        """标准化命令文本：将字面换行符替换为平台对应的命令分隔符。
+
+        LLM 有时在 JSON 字符串值中输出字面换行符而非 \\n 转义序列，
+        导致命令被分割成多行。此方法在平台层面修复此问题。
+        """
+        if not cmd:
+            return cmd
+        # 将各种换行符统一替换为平台分隔符
+        import re
+        if sys.platform == "win32":
+            # PowerShell 用 ; 分隔命令
+            cmd = re.sub(r'[\r\n]+', ' ; ', cmd)
+        else:
+            # bash 用 ; 或 && 分隔
+            cmd = re.sub(r'[\r\n]+', ' ; ', cmd)
+        # 清理多余空格和连续分号
+        cmd = re.sub(r'\s*;\s*;+\s*', ' ; ', cmd)
+        return cmd.strip().rstrip(';').strip()
+
     def execute(self, context: AgentContext) -> dict[str, Any]:
         cmd = self.resolve(self._extra.get("action", ""), context)
         if not cmd:
             return {"action_type": "command", "success": False, "error": "需要 action 参数（命令文本）"}
+
+        # P0-2 修复: 标准化命令中的换行符
+        cmd = self._normalize_cmd(cmd)
 
         self._validate_command(cmd)
 

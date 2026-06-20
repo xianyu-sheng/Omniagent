@@ -102,10 +102,11 @@ class ToolExecutor:
         *,
         retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
         security_enabled: bool = True,
+        breaker: CircuitBreaker | None = None,
     ) -> None:
         self.retry_attempts = retry_attempts
         self.security_enabled = security_enabled
-        self._breaker = CircuitBreaker()
+        self._breaker = breaker or CircuitBreaker()
 
     def execute(
         self,

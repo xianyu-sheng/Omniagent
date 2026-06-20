@@ -109,7 +109,7 @@ class GithubFetchTool(BaseTool):
                 repo = m.group(1)
 
         action = str(params.get("github_action", "list_files"))
-        branch = str(params.get("branch", "main"))
+        branch = str(params.get("branch", "") or "main")  # P0-3: 空字符串不覆盖默认值
         github_path = str(params.get("github_path", ""))
 
         headers = {"User-Agent": "OmniAgent-CLI/0.3"}

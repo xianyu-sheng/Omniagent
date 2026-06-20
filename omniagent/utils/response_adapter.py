@@ -147,15 +147,19 @@ def _normalize_step(step: Any, index: int) -> dict:
 def _repair_json(text: str) -> str | None:
     """尝试修复被截断或格式不完整的 JSON。
 
-    策略：
-    1. 截断未完成的值（去掉尾部不完整的 key/value）
-    2. 关闭所有未闭合的 { 和 [
-    3. 去掉尾部多余的逗号
+    策略（按优先级）：
+    1. 尝试闭合未完成的字符串值（而非直接截断）
+    2. 截断未完成的值（去掉尾部不完整的 key/value）
+    3. 关闭所有未闭合的 { 和 [
+    4. 去掉尾部多余的逗号
     """
     if not text or not text.strip():
         return None
 
     text = text.strip()
+
+    # 0. 优先尝试闭合未完成的字符串（保留值内容，而非截断）
+    text = _try_close_unclosed_string(text)
 
     # 1. 分析引号状态，找到最后一个未闭合的字符串
     in_string = False
@@ -180,15 +184,12 @@ def _repair_json(text: str) -> str | None:
         text = prefix.rstrip().rstrip(',')
 
         # 检查是否留下了一个孤立的 key: （值被截断的情况）
-        # 如果去掉不完整字符串后，末尾是 ":"，说明截断了值，需要连 key 一起去掉
-        # 例如: ...,"search_pattern": → 应该去掉整个 "search_pattern":
         stripped = text.rstrip()
         if stripped.endswith(':'):
             # 去掉冒号和前面的 key
             text = stripped[:-1].rstrip().rstrip(',')
             # 如果 key 带引号，去掉引号
             if text.endswith('"'):
-                # 找到这个引号的匹配引号
                 key_end = len(text) - 1
                 key_start = text.rfind('"', 0, key_end)
                 if key_start != -1:
@@ -227,6 +228,48 @@ def _repair_json(text: str) -> str | None:
     close_map = {'{': '}', '[': ']'}
     for bracket in reversed(bracket_stack):
         text += close_map.get(bracket, '')
+
+    return text
+
+
+def _try_close_unclosed_string(text: str) -> str:
+    """尝试闭合 JSON 中被截断的字符串值。
+
+    当检测到字符串未闭合时，先尝试在末尾添加引号来修复，
+    而不是直接丢弃整个字符串值。这对 URL/路径类参数至关重要。
+    """
+    import re
+
+    # 找最后一个未闭合的字符串
+    in_string = False
+    escape_next = False
+    string_start = -1
+    for i, c in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if c == '\\':
+            escape_next = True
+            continue
+        if c == '"':
+            if not in_string:
+                string_start = i
+            in_string = not in_string
+
+    # 如果没有未闭合的字符串，直接返回
+    if not in_string or string_start < 0:
+        return text
+
+    # 如果未闭合字符串在 JSON 即将结束的位置（最后 5%），尝试闭合
+    unclosed_content = text[string_start + 1:]
+    total_len = len(text)
+
+    # 只在字符串看起来几乎完成时才尝试闭合
+    # 条件：字符串开始位置在文本的后 20%，或字符串内容较短（< 200 chars）
+    if string_start > total_len * 0.8 or len(unclosed_content) < 200:
+        # 验证未闭合字符串的内容是合理的参数值（非嵌套 JSON 等）
+        if unclosed_content and '{' not in unclosed_content:
+            return text + '"'
 
     return text
 
