@@ -6,15 +6,58 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from omniagent.engine.context import AgentContext
 from omniagent.tools.builtin.base import BaseTool
 
 logger = logging.getLogger(__name__)
+
+# ── GitHub 凭证加载 ──────────────────────────────────────────
+
+
+def _load_github_token() -> str | None:
+    """从 ~/.omniagent/credentials.yaml 或环境变量加载 GitHub token。
+
+    优先级: GITHUB_TOKEN 环境变量 > credentials.yaml 中的 github.api_key
+    """
+    env_token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    if env_token:
+        return env_token.strip()
+
+    creds_path = Path.home() / ".omniagent" / "credentials.yaml"
+    if creds_path.exists():
+        try:
+            with open(creds_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+                github_cfg = data.get("github", {})
+                if isinstance(github_cfg, dict):
+                    token = github_cfg.get("api_key") or github_cfg.get("token")
+                    if token and str(token).strip():
+                        return str(token).strip()
+                elif isinstance(github_cfg, str):
+                    return github_cfg.strip()
+        except Exception:
+            pass
+    return None
+
+
+def _build_github_headers() -> dict:
+    """构建 GitHub API 请求头，包含 token（如果可用）。"""
+    headers = {"User-Agent": "OmniAgent-CLI/0.3"}
+    token = _load_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        logger.debug("github_fetch/web_fetch: 使用 GitHub token 认证")
+    else:
+        logger.debug("github_fetch/web_fetch: 无 GitHub token，使用未认证请求（60次/小时限制）")
+    return headers
 
 
 class WebFetchTool(BaseTool):
@@ -42,8 +85,28 @@ class WebFetchTool(BaseTool):
 
         try:
             import httpx
+
+            # P0-8: 对 GitHub API 请求使用 token 认证
+            headers = _build_github_headers() if "api.github.com" in url_lower or "raw.githubusercontent.com" in url_lower else {"User-Agent": "OmniAgent-CLI/0.3"}
+
             with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
-                resp = client.get(url, headers={"User-Agent": "OmniAgent-CLI/0.3"})
+                resp = client.get(url, headers=headers)
+
+                # P0-8: 403 限流检测 — 给出清晰的错误信息
+                if resp.status_code == 403 and "rate limit" in (resp.text or "").lower():
+                    return {
+                        "action_type": "web_fetch", "url": url, "content": "",
+                        "success": False,
+                        "error": (
+                            "GitHub API 限流 (403 rate limit exceeded)。"
+                            "未认证请求限制 60次/小时。\n"
+                            "解决方案: 在 ~/.omniagent/credentials.yaml 中添加:\n"
+                            "  github:\n"
+                            "    api_key: ghp_xxxxxxxxxxxx\n"
+                            "或设置环境变量 GITHUB_TOKEN。"
+                        ),
+                    }
+
                 resp.raise_for_status()
 
                 content_type = resp.headers.get("content-type", "")
@@ -198,7 +261,8 @@ class GitHubFetchTool(BaseTool):
         except ImportError:
             return {"action_type": "github_fetch", "success": False, "error": "需要 httpx 库"}
 
-        headers = {"User-Agent": "OmniAgent-CLI/0.3"}
+        # P0-8: 使用 GitHub token 认证（如果可用）
+        headers = _build_github_headers()
 
         try:
             with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
@@ -239,6 +303,20 @@ class GitHubFetchTool(BaseTool):
                 return {"action_type": "github_fetch", "success": False, "error": f"不支持的操作: {action}"}
 
         except Exception as e:
+            error_str = str(e)
+            # P0-8: 403 限流检测
+            if "403" in error_str and ("rate limit" in error_str.lower() or "rate limit" in error_str):
+                return {
+                    "action_type": "github_fetch", "repo": repo, "success": False,
+                    "error": (
+                        "GitHub API 限流 (403 rate limit exceeded)。\n"
+                        "建议:\n"
+                        "1. 在 ~/.omniagent/credentials.yaml 中配置 github.api_key\n"
+                        "2. 设置环境变量 GITHUB_TOKEN\n"
+                        "3. 使用 git clone 将仓库克隆到本地后用 list_files + read_file 分析\n"
+                        "4. 使用 web_fetch 访问 raw.githubusercontent.com 获取文件（无速率限制）"
+                    ),
+                }
             return {"action_type": "github_fetch", "repo": repo, "success": False, "error": str(e)}
 
 

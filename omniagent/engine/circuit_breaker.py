@@ -165,7 +165,7 @@ class CircuitBreaker:
             return (
                 f"⚠️ 工具 '{tool_name}' 已连续失败 {state.consecutive_failures} 次，"
                 f"暂时不可用（冷却 {remaining}s）。最后的错误: {error[:200]}\n"
-                f"请尝试其他方法完成任务。"
+                f"🛑 不要再调用 '{tool_name}' — 换用其他工具，或基于已有数据直接输出 final_answer。"
             )
         return None
 

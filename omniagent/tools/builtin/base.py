@@ -46,7 +46,7 @@ class BaseTool:
         security_enabled: bool = True,
         cwd: str | None = None,
         encoding: str = "utf-8",
-        timeout: int = 60,
+        timeout: int = 120,  # P0-9: 从 60s 提升到 120s，支持 git clone 等长时间操作
         output_slot: str | None = None,
         **kwargs,
     ) -> None:

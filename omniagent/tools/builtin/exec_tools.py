@@ -47,6 +47,12 @@ class CommandTool(BaseTool):
         # P0-2 修复: 标准化命令中的换行符
         cmd = self._normalize_cmd(cmd)
 
+        # P0-9: git clone 等长时间操作自动延长超时
+        effective_timeout = self.timeout
+        if "git clone" in cmd.lower() or "git clone" in cmd:
+            effective_timeout = max(self.timeout, 300)
+            logger.info(f"command: 检测到 git clone，超时自动延长至 {effective_timeout}s")
+
         self._validate_command(cmd)
 
         if sys.platform == "win32":
@@ -58,7 +64,7 @@ class CommandTool(BaseTool):
             proc = subprocess.run(
                 shell_exec, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
-                timeout=self.timeout, cwd=self.cwd,
+                timeout=effective_timeout, cwd=self.cwd,
             )
             result = {
                 "action_type": "command", "command": cmd,
@@ -104,10 +110,16 @@ class GitTool(BaseTool):
         else:
             cmd = ["git"] + git_cmd.split() + (extra_args.split() if extra_args else [])
 
+        # P0-12: git clone 操作自动延长超时
+        effective_timeout = self.timeout
+        if "clone" in git_cmd.lower() or "clone" in (extra_args or "").lower():
+            effective_timeout = max(self.timeout, 300)
+            logger.info(f"git: 检测到 clone，超时延长至 {effective_timeout}s")
+
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=self.timeout, cwd=self.cwd or ".",
+                timeout=effective_timeout, cwd=self.cwd or ".",
             )
             output = proc.stdout.strip() or proc.stderr.strip()
             result = {

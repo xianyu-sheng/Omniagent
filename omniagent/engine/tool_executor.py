@@ -64,12 +64,17 @@ class ToolExecuteResult:
     def next_hint(self) -> str:
         """根据执行结果生成下一步提示文本。"""
         if self.circuit_breaker_tripped:
-            return "该工具暂时不可用（连续失败触发断路保护），请尝试其他工具或直接输出 final_answer。"
+            return (
+                f"🛑 工具 '{self.tool_name}' 已触发断路保护，暂时不可用。"
+                f"不要再调用此工具 — 换用其他工具完成任务，或基于已有数据直接输出 final_answer。"
+            )
         if self.is_terminal_error:
             return "该资源/路径不存在，请勿重试。用已有信息继续或输出 final_answer。"
         if not self.success:
             if "缺少" in str(self.error or "") and "参数" in str(self.error or ""):
                 return "请补充缺失的参数后重试，或跳过此工具用已有信息输出 final_answer。"
+            if "rate limit" in str(self.error or "").lower():
+                return "GitHub API 限流。改用 git clone 克隆到本地后分析，或用 web_fetch 访问 raw.githubusercontent.com（不限流）。"
             return "分析失败原因，尝试其他方法或工具。如果无法解决，基于已有数据输出 final_answer。"
         if self.is_info_tool:
             return "信息已获取。如果你已收集足够数据，请直接输出 final_answer 交付结果。如还需要其他信息，继续调用工具。"

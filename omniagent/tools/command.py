@@ -85,6 +85,9 @@ class CommandTool(BaseTool):
             return ToolResult.permission_denied(error)
 
         timeout = int(params.get("timeout", 60) or 60)
+        # P0-9: git clone 等长时间操作自动延长超时
+        if "git clone" in cmd.lower():
+            timeout = max(timeout, 300)
         cwd = str(params.get("cwd", "")) or None
 
         if sys.platform == "win32":
