@@ -958,11 +958,13 @@ class ReActEngine:
                 logger.debug(f"ReAct 行动: {action}({action_input})")
                 self.callback.on_act(action, action_input)
 
-                # ── 使用统一 ToolExecutor（共享引擎级断路器，含重试+验证）──
+                # ── 使用统一 ToolExecutor（共享引擎级断路器，含权限检查+重试+验证）──
                 from omniagent.engine.tool_executor import ToolExecutor
                 executor = ToolExecutor(retry_attempts=self.tool_retry_attempts, breaker=self.breaker)
                 exec_result = executor.execute(action, action_input, ctx, tracker)
-                self.callback.on_observe(exec_result.summary or exec_result.error or "")
+                # 通知回调：成功时用通知格式，失败时用错误摘要
+                notify_text = exec_result.format_notification() if exec_result.success else (exec_result.error or exec_result.summary or "")
+                self.callback.on_observe(notify_text)
 
                 # 使用结构化结果格式化观察消息
                 obs_msg = exec_result.format_observation()

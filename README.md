@@ -180,14 +180,46 @@ python evals/runner.py --mode mock --output evals/reports/mock_report.md
 - 每次交互运行写入追加式事件日志（`.omniagent/sessions/<id>/runs/<id>/events.jsonl`）
 - 每个 REPL 会话有独立的 `thread.jsonl` 和 `notes.md`，笔记在后续对话中自动注入
 - 可通过 `.omniagent/policy.yaml` 自定义工具权限策略
+- **交互式权限审批**：写入文件、执行命令、Git 操作等敏感工具执行前弹出审批提示（类似 Claude Code），支持 `批准一次(y)` / `始终批准(a)` / `拒绝(n)`
+- **执行后通知**：工具执行完成后显示操作结果摘要（文件路径、命令输出、字节数等）
+- **会话级权限缓存**：选择「始终批准」后同一操作在同一会话中不再重复询问
 - **会话自动清理**：启动时移除过期会话（7 天）、运行记录（30 天）、检查点（14 天）
 - **MCP 自动重启**：崩溃的 MCP 子进程自动重启（最多 3 次，延迟退避）
+
+### 权限策略自定义
+
+在项目根目录创建 `.omniagent/policy.yaml` 即可覆盖默认策略：
+
+```yaml
+tools:
+  write_file:
+    default: allow          # 跳过审批，直接允许
+  command:
+    default: ask            # 每次都询问（默认）
+    deny_patterns:           # 额外的拒绝模式
+      - "docker rm"
+  git:
+    default: allow          # 允许 Git 操作无需审批
+    deny_patterns:
+      - "push --force"      # 但强制推送仍然拒绝
+      - "reset --hard"
+```
+
+默认策略：
+| 工具 | 默认决策 | 说明 |
+|------|---------|------|
+| `read_file`, `list_files`, `search_files` 等读取工具 | `allow` | 读取操作自动放行 |
+| `write_file`, `edit_file`, `batch_write`, `batch_edit` | `ask` | 写入文件前询问 |
+| `command` | `ask` | 执行命令前询问（危险命令 `deny`） |
+| `git` | `ask` | Git 操作前询问（危险操作 `deny`） |
+| `create_directory`, `mcp_call` | `ask` | 创建目录/MCP 调用前询问 |
 
 计划中：
 
 - 细粒度工作区沙箱策略
 - 基于运行事件日志的追踪回放和 UI 视图
 - 插件系统扩展
+- 工具执行 diff 预览（编辑前展示变更对比）
 
 ## 项目规则
 

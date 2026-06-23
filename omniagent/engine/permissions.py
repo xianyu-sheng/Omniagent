@@ -57,7 +57,7 @@ class ToolPolicy:
 
 DEFAULT_TOOL_POLICIES: dict[str, ToolPolicy] = {
     "command": ToolPolicy(
-        default="allow",
+        default="ask",
         deny_patterns=[
             r"rm\s+(-[rfR]+\s+)?/",
             r"rm\s+(-[rfR]+\s+)?~",
@@ -81,7 +81,7 @@ DEFAULT_TOOL_POLICIES: dict[str, ToolPolicy] = {
         sensitive=True,
     ),
     "git": ToolPolicy(
-        default="allow",
+        default="ask",
         deny_patterns=[
             r"push\s+--force",
             r"push\s+-f",
@@ -94,12 +94,12 @@ DEFAULT_TOOL_POLICIES: dict[str, ToolPolicy] = {
         ],
         sensitive=True,
     ),
-    "write_file": ToolPolicy(default="allow", sensitive=True),
-    "edit_file": ToolPolicy(default="allow", sensitive=True),
-    "batch_write": ToolPolicy(default="allow", sensitive=True),
-    "batch_edit": ToolPolicy(default="allow", sensitive=True),
-    "create_directory": ToolPolicy(default="allow", sensitive=True),
-    "mcp_call": ToolPolicy(default="allow", sensitive=True),
+    "write_file": ToolPolicy(default="ask", sensitive=True),
+    "edit_file": ToolPolicy(default="ask", sensitive=True),
+    "batch_write": ToolPolicy(default="ask", sensitive=True),
+    "batch_edit": ToolPolicy(default="ask", sensitive=True),
+    "create_directory": ToolPolicy(default="ask", sensitive=True),
+    "mcp_call": ToolPolicy(default="ask", sensitive=True),
 }
 
 

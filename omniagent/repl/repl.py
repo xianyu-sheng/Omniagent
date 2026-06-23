@@ -1295,32 +1295,79 @@ class REPL:
 
     # ── 交互式权限审批 ──────────────────────────────────────
 
+    # 工具图标映射
+    _TOOL_ICONS: dict[str, str] = {
+        "read_file": "📖", "write_file": "📄", "edit_file": "✏️",
+        "list_files": "📋", "search_files": "🔍", "create_directory": "📁",
+        "move_file": "📦", "copy_file": "📋", "delete_file": "🗑️",
+        "command": "⚡", "git": "🔀", "web_fetch": "🌐",
+        "github_fetch": "🐙", "batch_write": "📝", "batch_edit": "📝",
+        "mcp_call": "🔌", "spawn_agent": "🤖", "agent_result": "📬",
+        "weather": "🌤️", "datetime": "🕐", "code_index": "📊",
+        "ast_analyze": "🔬", "refactor": "🔧", "diff_preview": "📊",
+    }
+
     def _approval_handler(self, tool_name: str, params_preview: str) -> bool:
-        """交互式审批处理器 — 当工具需要 ask 权限时调用。"""
+        """交互式审批处理器 — 当工具需要 ask 权限时调用。
+
+        类似 Claude Code 的权限提示：在工具执行前展示操作内容并询问用户。
+        支持三种选择:
+        - (y) 批准一次 — 仅本次放行
+        - (a) 本次会话始终批准 — 缓存到会话结束
+        - (n) 拒绝 — 阻止本次执行
+        """
         # 检查缓存
         cache_key = f"{tool_name}:{params_preview}"
         if cache_key in self._approval_cache:
             return self._approval_cache[cache_key]
 
-        # 显示审批提示
+        icon = self._TOOL_ICONS.get(tool_name, "🔧")
+
+        # 根据工具类型选择提示文案
+        if tool_name in ("write_file", "edit_file", "batch_write", "batch_edit"):
+            action_desc = "OmniAgent 需要写入文件"
+        elif tool_name in ("command",):
+            action_desc = "OmniAgent 需要执行命令"
+        elif tool_name in ("git",):
+            action_desc = "OmniAgent 需要执行 Git 操作"
+        elif tool_name in ("create_directory", "move_file", "copy_file", "delete_file"):
+            action_desc = "OmniAgent 需要操作文件系统"
+        else:
+            action_desc = f"OmniAgent 需要调用工具 {icon} {tool_name}"
+
+        # 显示审批提示 — 极氪风格
         console.print()
         console.print(Panel(
-            f"[bold yellow]⚠ 工具调用需要审批[/bold yellow]\n\n"
-            f"[cyan]工具:[/cyan] {tool_name}\n"
-            f"[cyan]参数:[/cyan] {params_preview[:200]}\n\n"
-            f"[dim]选择: (y)批准一次 / (a)本次会话始终批准 / (n)拒绝[/dim]",
-            border_style="yellow",
-            title="权限审批",
+            f"[bold bright_cyan]{icon} {action_desc}[/bold bright_cyan]\n\n"
+            f"[dim]{params_preview[:300]}[/dim]\n\n"
+            f"[dim]▸ 选择: [/dim]"
+            f"[green]批准(y)[/green]  "
+            f"[cyan]始终批准(a)[/cyan]  "
+            f"[red]拒绝(n)[/red]",
+            border_style="bright_cyan",
+            title="[bold bright_cyan]◆ 权限审批[/bold bright_cyan]",
+            padding=(1, 2),
         ))
 
-        choice = Prompt.ask("批准?", choices=["y", "a", "n"], default="n")
+        try:
+            choice = Prompt.ask(
+                f"[bold bright_cyan]▸[/bold bright_cyan] 是否允许?",
+                choices=["y", "a", "n"],
+                default="n",
+            )
+        except (KeyboardInterrupt, EOFError):
+            console.print("[red]⛔ 已取消[/red]")
+            return False
+
         if choice == "a":
             self._approval_cache[cache_key] = True
+            console.print("[green]✓ 已批准（本次会话始终有效）[/green]")
             return True
         elif choice == "y":
+            console.print("[green]✓ 已批准（仅本次）[/green]")
             return True
         else:
-            console.print("[red]✗ 已拒绝[/red]")
+            console.print("[red]⛔ 已拒绝[/red]")
             return False
 
     def _inject_project_context(self) -> None:

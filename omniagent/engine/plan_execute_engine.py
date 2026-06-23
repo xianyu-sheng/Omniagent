@@ -290,7 +290,8 @@ class PlanExecuteEngine:
         result = executor.execute(tool, params, context, tracker)
 
         if result.success:
-            self.callback.on_observe(result.summary)
+            notify_text = result.format_notification()
+            self.callback.on_observe(notify_text)
             return result.summary
 
         self.callback.on_observe(result.error or result.summary)

@@ -214,9 +214,21 @@ class ConsoleCallback(EngineCallback):
     """
     控制台回调，REPL 使用。
 
-    - 默认模式：收集思考步骤到 ThinkingPanel，不实时打印
-    - verbose 模式：实时打印 + 收集（用于调试）
+    - 默认模式：收集思考步骤到 ThinkingPanel，工具调用实时显示简要通知
+    - verbose 模式：实时打印 + 收集详细信息（用于调试）
+
+    工具调用显示策略（类似 Claude Code 的权限通知）:
+    - 写入/命令/Git 操作 → 醒目显示（绿色/黄色边框）
+    - 读取/搜索 → 低调显示（dim 灰色）
+    - 失败 → 红色醒目显示
     """
+
+    # 写入/危险类工具（始终显示）
+    _NOTIFY_TOOLS = {
+        "write_file", "edit_file", "batch_write", "batch_edit",
+        "create_directory", "move_file", "copy_file", "delete_file",
+        "command", "git", "mcp_call", "spawn_agent",
+    }
 
     def __init__(self, *, verbose: bool = False) -> None:
         self.verbose = verbose
@@ -229,25 +241,65 @@ class ConsoleCallback(EngineCallback):
 
     def on_act(self, action: str, action_input: dict) -> None:
         self._panel.add_action(action, action_input)
-        if self.verbose:
-            params_str = ", ".join(f"{k}={repr(v)[:80]}" for k, v in action_input.items())
-            print(f"  🔧 {action}({params_str})")
+        # 简要参数预览
+        params_brief = self._brief_params(action, action_input)
+        if action in self._NOTIFY_TOOLS:
+            # 写入/命令类工具 → 醒目显示
+            icon = "📄" if action in ("write_file", "batch_write") else \
+                  "✏️" if action in ("edit_file", "batch_edit") else \
+                  "📁" if action == "create_directory" else \
+                  "⚡" if action == "command" else \
+                  "🔀" if action == "git" else "🔧"
+            print(f"\n  {icon} {action} {params_brief}")
+        elif self.verbose:
+            print(f"  🔧 {action}({params_brief})")
 
     def on_observe(self, observation: str) -> None:
         self._panel.add_observation(observation)
-        if self.verbose:
-            obs_preview = observation[:300].replace("\n", " ")
+        obs_preview = observation[:150].replace("\n", " ")
+        if observation.startswith("✅") or "执行完成" in observation[:50]:
+            # 成功 → 绿色简要
+            print(f"  ✅ {obs_preview}")
+        elif observation.startswith("❌") or "失败" in observation[:50] or "错误" in observation[:50]:
+            # 失败 → 红色
+            print(f"  ❌ {obs_preview}")
+        elif self.verbose:
             print(f"  👀 {obs_preview}")
 
+    @staticmethod
+    def _brief_params(action: str, params: dict) -> str:
+        """生成简要参数预览（一行，控制长度）。"""
+        if action == "command":
+            cmd = str(params.get("command", ""))
+            return cmd[:100] if cmd else ""
+        elif action == "git":
+            git_cmd = str(params.get("git_command") or params.get("command", ""))
+            return git_cmd[:80] if git_cmd else ""
+        elif action in ("write_file", "edit_file", "read_file"):
+            path = str(params.get("file_path", ""))
+            return path[:80] if path else ""
+        elif action in ("list_files", "create_directory"):
+            path = str(params.get("file_path") or params.get("path", ""))
+            return path[:60] if path else ""
+        elif action == "search_files":
+            pattern = str(params.get("search_pattern") or params.get("pattern", ""))
+            return pattern[:60] if pattern else ""
+        elif action in ("web_fetch", "github_fetch"):
+            url = str(params.get("url", ""))
+            return url[:80] if url else ""
+        # 通用：显示第一个关键参数
+        for key in ("file_path", "path", "url", "query", "search_pattern"):
+            if key in params:
+                return str(params[key])[:60]
+        return ""
+
     def on_step(self, step_id: int, total: int, task: str) -> None:
-        if self.verbose:
-            print(f"  📋 步骤 {step_id}/{total}: {task}")
+        print(f"  📋 步骤 {step_id}/{total}: {task[:100]}")
 
     def on_step_done(self, step_id: int, success: bool, summary: str) -> None:
-        if self.verbose:
-            icon = "✓" if success else "✗"
-            preview = summary[:100].replace("\n", " ")
-            print(f"  {icon} 步骤 {step_id}: {preview}")
+        icon = "✅" if success else "❌"
+        preview = summary[:100].replace("\n", " ")
+        print(f"  {icon} 步骤 {step_id}: {preview}")
 
     def on_review(self, score: int, passed: bool, feedback: str) -> None:
         if self.verbose:
@@ -256,8 +308,7 @@ class ConsoleCallback(EngineCallback):
 
     def on_error(self, error: str) -> None:
         self._panel.add_error(error)
-        if self.verbose:
-            print(f"  ❌ {error}")
+        print(f"  ❌ {error[:200]}")
 
     def on_warning(self, warning: str) -> None:
         self._panel.add_warning(warning)
