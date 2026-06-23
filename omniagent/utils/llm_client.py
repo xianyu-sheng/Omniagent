@@ -381,6 +381,8 @@ def _stream_openai_compat(
         "temperature": temperature,
         "stream": True,
     }
+    has_content = False
+    reasoning_parts: list[str] = []
     with httpx.Client(timeout=timeout) as client:
         with client.stream("POST", url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -394,10 +396,25 @@ def _stream_openai_compat(
                     chunk = json.loads(data_str)
                     delta = chunk["choices"][0].get("delta", {})
                     content = delta.get("content")
+                    reasoning = delta.get("reasoning_content") or delta.get("thinking") or ""
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
                     if content:
+                        has_content = True
                         yield content
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
+
+    # ── 推理模型回退：流式 delta 只含 reasoning_content 而 content 为空 ──
+    # 阻塞式调用已处理此情况（line 288-290），流式此前缺失此逻辑，
+    # 导致 LLM 消耗了 token 但用户看到空白输出。
+    if not has_content and reasoning_parts:
+        reasoning_text = "".join(reasoning_parts)
+        logger.warning(
+            f"流式响应: content 为空，回退到 reasoning_content "
+            f"({len(reasoning_text)} 字符)"
+        )
+        yield reasoning_text
 
 
 # ── 异步调用接口 ──────────────────────────────────────────
@@ -581,6 +598,8 @@ async def _stream_openai_compat_async(
         "temperature": temperature,
         "stream": True,
     }
+    has_content = False
+    reasoning_parts: list[str] = []
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -594,10 +613,23 @@ async def _stream_openai_compat_async(
                     chunk = json.loads(data_str)
                     delta = chunk["choices"][0].get("delta", {})
                     content = delta.get("content")
+                    reasoning = delta.get("reasoning_content") or delta.get("thinking") or ""
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
                     if content:
+                        has_content = True
                         yield content
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
+
+    # ── 推理模型回退：流式 delta 只含 reasoning_content 而 content 为空 ──
+    if not has_content and reasoning_parts:
+        reasoning_text = "".join(reasoning_parts)
+        logger.warning(
+            f"异步流式响应: content 为空，回退到 reasoning_content "
+            f"({len(reasoning_text)} 字符)"
+        )
+        yield reasoning_text
 
 
 async def _stream_anthropic_async(
