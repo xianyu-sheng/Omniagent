@@ -202,8 +202,8 @@ class REPL:
             "- 代码用 Markdown 代码块包裹，标注语言。\n"
             "- 先给核心答案，再展开细节——不啰嗦铺垫。\n"
             "- 遇到你知识范围内的问题，直接给出完整方案。\n"
-            "- 如果被问「你是什么模型」或类似身份问题：回答你是 OmniAgent-CLI 的 AI 助手，"
-            "由用户配置的模型驱动，不必猜测底层模型名称。\n"
+            "- 如果被问「你是什么模型」或类似身份问题：根据系统注入的模型信息如实回答，"
+            "例如「当前由 DeepSeek V4 Pro 驱动」。不要编造模型名——使用系统提供的信息。\n"
             "\n"
             "## 工具能力\n"
             "你具备文件读写、命令执行、网页搜索等工具能力。"
@@ -754,6 +754,14 @@ class REPL:
         # 添加用户消息
         self.ctx_mgr.add_user_message(optimized)
 
+        # ── 用户消息回显：极氪风格面板 ──
+        console.print(Panel(
+            optimized,
+            title="[bold bright_cyan]▸ You[/bold bright_cyan]",
+            border_style="bright_cyan",
+            padding=(0, 1),
+        ))
+
         # 获取模型列表
         model_ids = self.registry.get_role_priority("planner")
         if not model_ids:
@@ -843,10 +851,15 @@ class REPL:
         last_error = None
         for model_id in model_ids:
             try:
+                # ── 注入当前模型身份到 LLM 上下文 ──
+                # 这样 LLM 被问"你是什么模型"时能如实回答，而非猜测或拒绝
+                model_id_msg = {"role": "system", "content": f"[会话信息] 当前驱动模型: {model_id}"}
+                call_messages = list(messages) + [model_id_msg]
+
                 if self.streaming:
-                    response_text = self._stream_response(model_id, messages)
+                    response_text = self._stream_response(model_id, call_messages)
                 else:
-                    response_text = self._blocking_response(model_id, messages)
+                    response_text = self._blocking_response(model_id, call_messages)
                 self.status_bar.set_last_model(model_id)
 
                 if response_text:
@@ -1081,10 +1094,11 @@ class REPL:
             renderer = OutputRenderer(verbose=self.verbose)
             console.print(Panel(
                 renderer._render_markdown_enhanced(response_text),
-                title=f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]({model_id})[/dim]",
+                title=f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]· {model_id} · {len(response_text):,} chars[/dim]",
                 border_style="bright_green",
                 padding=(1, 2),
             ))
+            console.print("[dim]──[/dim]")  # 视觉分隔
 
         self.ctx_mgr.add_assistant_message(response_text, model_used=model_id)
         return response_text
@@ -1112,10 +1126,11 @@ class REPL:
         renderer = OutputRenderer(verbose=self.verbose)
         console.print(Panel(
             renderer._render_markdown_enhanced(response),
-            title=f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]({model_id})[/dim]",
+            title=f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]· {model_id} · {len(response):,} chars[/dim]",
             border_style="bright_green",
             padding=(1, 2),
         ))
+        console.print("[dim]──[/dim]")
         return response
 
     @staticmethod
