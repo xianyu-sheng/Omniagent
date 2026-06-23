@@ -113,7 +113,7 @@ class StatusBar:
         )
 
     def print_status(self) -> None:
-        """打印一行紧凑的状态信息（非 Live 模式）。"""
+        """打印极氪风格紧凑状态行。"""
         stats = self.ctx_mgr.stats()
         mode = self.registry.get_current_mode()
 
@@ -125,28 +125,33 @@ class StatusBar:
         if len(model_display) > 30:
             model_display = "..." + model_display[-27:]
 
-        stream = "⚡" if self._streaming else "⏸"
+        stream_icon = "⚡" if self._streaming else "⏸"
 
-        # 紧凑单行
         try:
             pct_val = float(ratio.strip('%'))
         except (ValueError, AttributeError):
             pct_val = 0.0
 
         if pct_val > 80:
-            token_color = "red"
+            token_style = "bold red"
         elif pct_val > 50:
-            token_color = "yellow"
+            token_style = "yellow"
         else:
-            token_color = "green"
+            token_style = "bright_cyan"
 
+        # 极氪风格：简洁分隔，突出关键信息
         line = (
-            f"[dim]┌─ {model_display} │ {mode.name} │ "
-            f"[{token_color}]Token {used:,}/{max_tok:,} ({ratio})[/{token_color}] │ "
-            f"消息 {stats['total_messages']} │ {stream}"
+            f"[dim]▎[/dim] "
+            f"[bold bright_cyan]{model_display}[/bold bright_cyan]"
+            f" [dim]·[/dim] "
+            f"{mode.name}"
+            f" [dim]·[/dim] "
+            f"[{token_style}]▐{'█' * min(int(pct_val / 100 * 8), 8)}{'░' * max(8 - int(pct_val / 100 * 8), 0)}▌ {used:,}/{max_tok:,}[/{token_style}]"
+            f" [dim]·[/dim] "
+            f"✉ {stats['total_messages']}"
+            f"  {stream_icon}"
         )
         if stats["needs_compact"]:
-            line += " │ [bold red]⚠ 建议 /compact[/bold red]"
-        line += "[/dim]"
+            line += " [bold red]⚠ 需 /compact[/bold red]"
 
         self.console.print(line)

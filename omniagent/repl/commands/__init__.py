@@ -104,20 +104,39 @@ def _cmd_help(*, args: str, **kwargs: Any) -> str:
 
 # /set_model ───────────────────────────────────────────────
 
+# /model — 统一的模型管理：浏览添加 + 切换 + 快速注册（合并原 /set_model）────
+
 register_command(
-    "/set_model",
-    "交互式选择或配置模型",
-    "/set_model [alias] [provider/model_name] [api_key=xxx] [base_url=xxx]",
+    "/model",
+    "管理模型：浏览添加、切换、快速注册（一步完成）",
+    "/model — 交互式管理\n/model <alias> <provider/model_name> — 快速添加并切换",
 )
 
+register_command(
+    "/set_model",
+    "模型管理（/model 别名，保留向后兼容）",
+    "/set_model [alias] [provider/model_name]",
+)
+
+
+@_handler("/model")
 @_handler("/set_model")
-def _cmd_set_model(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
+def _cmd_model(*, args: str, registry: ModelRegistry, session_state: dict, **kwargs: Any) -> str:
+    """统一模型管理：注册 + 切换一步完成。
+
+    - /model 无参数 + 无已注册模型 → 自动打开厂商模型浏览器，选择后注册并切换
+    - /model 无参数 + 有已注册模型 → 显示模型列表，可切换或添加新模型
+    - /model <alias> <provider/model> → 快速注册并自动切换
+    """
     from rich.table import Table as _Table
     from rich.prompt import IntPrompt as _IntPrompt
+    from rich.console import Console as _Console
+    console = kwargs.get("console") or _Console()
 
     parts = args.split() if args.strip() else []
+    registered = registry.list_models()
 
-    # 有参数 → 旧逻辑
+    # ── 有参数：快速注册 + 自动切换 ──
     if len(parts) >= 2:
         alias = parts[0]
         model_id = parts[1]
@@ -128,11 +147,44 @@ def _cmd_set_model(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
                 extra[k] = v
         try:
             config = registry.add_model(model_id, alias, **extra)
-            return f"✅ 模型已注册: {alias} -> {config.model_id}"
+            # 自动切换
+            registry.role_priority["planner"] = [alias]
+            return f"✅ 已注册并切换: {alias} → {config.model_id}"
         except Exception as e:
             return f"❌ 注册失败: {e}"
 
-    # 无参数 → 交互式选择
+    # ── 无参数 + 有已注册模型 → 显示列表可切换 ──
+    if registered:
+        current_aliases = registry.role_priority.get("planner", [])
+        table = _Table(show_header=True, header_style="bold")
+        table.add_column("#", style="cyan", width=4)
+        table.add_column("别名", style="bold")
+        table.add_column("模型 ID")
+        table.add_column("状态")
+        for i, m in enumerate(registered, 1):
+            status = "[green]✦ 当前[/green]" if m.alias in current_aliases else ""
+            table.add_row(str(i), m.alias, m.model_id, status)
+        # 添加"注册新模型"选项
+        table.add_row(str(len(registered) + 1), "[bold cyan]+ 添加新模型[/bold cyan]", "", "")
+        console.print(table)
+        console.print()
+
+        try:
+            choice = _IntPrompt.ask(
+                "选择操作",
+                choices=[str(i) for i in range(1, len(registered) + 2)],
+                default="1",
+            )
+        except (KeyboardInterrupt, EOFError, OSError):
+            return "已取消"
+
+        if choice <= len(registered):
+            selected = registered[choice - 1]
+            registry.role_priority["planner"] = [selected.alias]
+            return f"✅ 已切换到: {selected.alias} ({selected.model_id})"
+        # else: choice == len(registered)+1 → 添加新模型，走下面的厂商浏览器
+
+    # ── 无参数 + 无已注册模型（或用户选择"添加新模型"）→ 厂商浏览器 ──
     from omniagent.repl.provider_registry import get_configured_providers
     configured = get_configured_providers()
     if not configured:
@@ -157,8 +209,6 @@ def _cmd_set_model(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
             all_models.append((model_id, m, p.key, p.base_url))
             idx += 1
 
-    from rich.console import Console as _Console
-    console = kwargs.get("console") or _Console()
     console.print(table)
     console.print()
 
@@ -167,7 +217,7 @@ def _cmd_set_model(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
 
     try:
         choice = _IntPrompt.ask(
-            "输入模型编号",
+            "输入模型编号（注册并立即切换）",
             choices=[str(i) for i in range(1, len(all_models) + 1)],
             default="1",
         )
@@ -179,7 +229,8 @@ def _cmd_set_model(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
 
     try:
         config = registry.add_model(model_id, alias, base_url=base_url)
-        return f"✅ 模型已设置: {alias} -> {config.model_id}"
+        registry.role_priority["planner"] = [alias]
+        return f"✅ 已注册并切换: {alias} → {config.model_id}"
     except Exception as e:
         return f"❌ 设置失败: {e}"
 
@@ -221,7 +272,7 @@ register_command("/models", "列出所有已注册的模型及其角色分配", 
 def _cmd_models(*, registry: ModelRegistry, **kwargs: Any) -> str:
     models = registry.list_models()
     if not models:
-        return "暂无已注册模型。使用 /set_model 添加模型。"
+        return "暂无已注册模型。使用 /model 浏览并添加模型。"
 
     lines = ["已注册模型:\n"]
     for m in models:
@@ -1181,50 +1232,6 @@ def _cmd_setup(*, session_state: dict, **kwargs: Any) -> str:
         interactive_setup(repl.registry)
         return ""
     return "❌ 无法获取 REPL 状态"
-
-
-# /model ───────────────────────────────────────────────────
-
-register_command("/model", "交互式切换模型", "/model")
-
-@_handler("/model")
-def _cmd_model(*, session_state: dict, registry: ModelRegistry, **kwargs: Any) -> str:
-    from rich.table import Table as _Table
-    from rich.prompt import IntPrompt as _IntPrompt
-    from rich.console import Console as _Console
-
-    models = registry.list_models()
-    if not models:
-        return "暂无已注册模型。请先执行 /set_model 注册模型。"
-
-    console = kwargs.get("console") or _Console()
-    current_aliases = registry.role_priority.get("planner", [])
-
-    table = _Table(show_header=True, header_style="bold")
-    table.add_column("#", style="cyan", width=4)
-    table.add_column("别名", style="bold")
-    table.add_column("模型 ID")
-    table.add_column("状态")
-
-    for i, m in enumerate(models, 1):
-        status = "[green]当前[/green]" if m.alias in current_aliases else ""
-        table.add_row(str(i), m.alias, m.model_id, status)
-
-    console.print(table)
-    console.print()
-
-    try:
-        choice = _IntPrompt.ask(
-            "输入编号切换模型",
-            choices=[str(i) for i in range(1, len(models) + 1)],
-            default="1",
-        )
-    except (KeyboardInterrupt, EOFError, OSError):
-        return "已取消"
-
-    selected = models[choice - 1]
-    registry.role_priority["planner"] = [selected.alias]
-    return f"✅ 已切换到: {selected.alias} ({selected.model_id})"
 
 
 # /provider ────────────────────────────────────────────────

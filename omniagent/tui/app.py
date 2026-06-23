@@ -32,7 +32,6 @@ from textual.widgets import (
     Label,
     RichLog,
     Static,
-    TextArea,
 )
 from textual.widget import Widget
 from textual.binding import Binding
@@ -52,8 +51,10 @@ class ThinkingPanel(Widget):
     ThinkingPanel {
         height: auto;
         min-height: 3;
-        border: solid dim;
+        border: solid $primary 30%;
         padding: 1;
+        margin: 0 0 1 0;
+        background: #0d1117;
     }
     ThinkingPanel > Static {
         width: 100%;
@@ -110,8 +111,9 @@ class StatusPanel(Widget):
     StatusPanel {
         height: auto;
         min-height: 3;
-        border: solid dim;
+        border: solid $secondary 30%;
         padding: 1;
+        background: #0a0e14;
     }
     """
 
@@ -165,22 +167,36 @@ class ConversationLog(RichLog):
     """
 
     def add_user_message(self, text: str) -> None:
-        """添加用户消息。"""
-        self.write(Panel(text, title="You", border_style="cyan"))
+        """极氪风格：用户消息 — 青色标识。"""
+        self.write(Text())  # 空行分隔
+        self.write(Panel(
+            text,
+            title="▸ You",
+            title_align="left",
+            border_style="bright_cyan",
+            padding=(0, 1),
+        ))
 
     def add_assistant_message(self, text: str, model: str = "") -> None:
-        """添加助手消息（Markdown 渲染）。"""
-        title = f"Assistant" + (f" ({model})" if model else "")
-        md = Markdown(text)
-        self.write(Panel(md, title=title, border_style="green"))
+        """极氪风格：助手消息 — 绿色标识 + Markdown 渲染。"""
+        title = "◆ Assistant" + (f"  [{model}]" if model else "")
+        md = Markdown(text, code_theme="monokai")
+        self.write(Panel(
+            md,
+            title=title,
+            title_align="left",
+            border_style="bright_green",
+            padding=(1, 2),
+        ))
+        self.write(Text())  # 空行分隔
 
     def add_system_message(self, text: str) -> None:
-        """添加系统消息。"""
-        self.write(Text(text, style="dim yellow"))
+        """极氪风格：系统消息 — 细线前缀。"""
+        self.write(Text(f"▎ {text}", style="dim bright_cyan"))
 
     def add_error(self, text: str) -> None:
-        """添加错误消息。"""
-        self.write(Text(f"❌ {text}", style="bold red"))
+        """极氪风格：错误消息 — 红色强调。"""
+        self.write(Text(f"✖ {text}", style="bold red"))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -309,37 +325,47 @@ class OmniAgentTUI(App):
         !: 终端命令
     """
 
-    TITLE = "🚀 OmniAgent-CLI"
-    SUB_TITLE = "Multi-Model AI Coding Assistant"
+    TITLE = "OmniAgent CLI"
+    SUB_TITLE = "多模型 AI 编程助手 · Zeekr Edition"
 
     CSS = """
+    /* ═══════════════════════════════════════════════════════════
+       OmniAgent CLI — 极氪风格主题
+       深色基底 + 青色强调 + 微妙的边框层次
+       ═══════════════════════════════════════════════════════════ */
+
     Screen {
         layout: vertical;
+        background: #0a0e14;
     }
 
     #main-container {
         layout: horizontal;
         height: 1fr;
+        margin: 0 0 1 0;
     }
 
     #conversation-container {
         width: 2fr;
         height: 100%;
+        border-right: solid $primary 20%;
+        background: #0d1117;
     }
 
     #side-panel {
         width: 1fr;
         height: 100%;
-        border-left: solid $primary;
-        padding: 0 0 0 0;
+        background: #0a0e14;
+        padding: 0 1 0 0;
     }
 
     #input-container {
         height: auto;
         min-height: 3;
         max-height: 10;
-        border-top: solid $primary;
+        border-top: double $primary 60%;
         padding: 0 1;
+        margin: 0 1 0 1;
     }
 
     #input-area {
@@ -348,18 +374,54 @@ class OmniAgentTUI(App):
         max-height: 10;
     }
 
+    /* ── Conversation Log ── */
+    ConversationLog {
+        height: 1fr;
+        border: none;
+        padding: 1;
+        background: #0d1117;
+    }
+
+    ConversationLog > .user-message {
+        margin: 1 0;
+    }
+
+    ConversationLog > .assistant-message {
+        margin: 1 0;
+    }
+
+    /* ── Header / Footer ── */
+    Header {
+        background: #0a0e14;
+        color: $accent;
+        text-style: bold;
+        dock: top;
+    }
+
+    Footer {
+        background: #0a0e14;
+        color: $text-muted;
+        dock: bottom;
+    }
+
+    /* ── Labels & Status ── */
     .title {
         text-style: bold;
         color: $accent;
     }
 
     .subtitle {
-        text-style: bold;
         color: $secondary;
+        text-style: italic;
     }
 
     .reason {
         color: $warning;
+    }
+
+    .highlight {
+        color: $accent;
+        text-style: bold;
     }
     """
 
@@ -432,7 +494,7 @@ class OmniAgentTUI(App):
 
         with Container(id="input-container"):
             yield Input(
-                placeholder="输入消息... (Enter 发送, / 命令, ! 终端命令)",
+                placeholder="▸ 输入消息…  Enter 发送  │  / 命令  │  ! 终端",
                 id="input-area",
             )
 
@@ -445,11 +507,10 @@ class OmniAgentTUI(App):
         self._init_engine()
         self._update_status()
 
-        # 显示欢迎
+        # 极氪风格欢迎消息
         log = self.query_one("#conversation-log", ConversationLog)
-        log.add_system_message(f"OmniAgent TUI v0.1.0 — {self.current_mode} 模式")
-        log.add_system_message(f"模型: {self.current_model}")
-        log.add_system_message("输入消息开始对话，/help 查看帮助")
+        log.add_system_message(f"⚡ OmniAgent CLI v0.1.0  ·  {self.current_mode} 模式  ·  {self.current_model}")
+        log.add_system_message("输入消息开始对话  │  /help 帮助  │  Ctrl+Q 退出")
 
     def _init_engine(self) -> None:
         """初始化引擎组件。"""
@@ -561,8 +622,8 @@ class OmniAgentTUI(App):
 
     # ── Input Handling ───────────────────────────────────────
 
-    @on(TextArea.Changed, "#input-area")
-    def on_input_change(self, event: TextArea.Changed) -> None:
+    @on(Input.Changed, "#input-area")
+    def on_input_change(self, event: Input.Changed) -> None:
         """输入区域变化时检查是否需要自动调整大小。"""
         pass  # 可扩展: 自动调整输入区域高度
 
@@ -792,7 +853,7 @@ class OmniAgentTUI(App):
     def action_focus_input(self) -> None:
         """聚焦输入区域。"""
         try:
-            self.query_one("#input-area", TextArea).focus()
+            self.query_one("#input-area", Input).focus()
         except NoMatches:
             pass
 

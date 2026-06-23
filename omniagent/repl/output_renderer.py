@@ -205,7 +205,7 @@ class OutputRenderer:
 
     def _extract_code_blocks(self, content: str, store: dict[str, str]) -> str:
         """提取 markdown 代码块，替换为占位符用于后续恢复。"""
-        pattern = re.compile(r'```(\w*)\n(.*?)```', re.DOTALL)
+        pattern = re.compile(r'```(\w*)\s*\n(.*?)```', re.DOTALL)
         counter = 0
 
         def _replace(m: re.Match) -> str:

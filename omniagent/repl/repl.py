@@ -358,38 +358,39 @@ class REPL:
         self._auto_cleanup()
 
     def _print_welcome(self) -> None:
-        """打印 Claude Code 风格的欢迎界面。"""
+        """极氪风格欢迎界面 — 现代、简洁、高辨识度。"""
         import random
+        from rich.text import Text
 
         mode = self.registry.get_current_mode()
         models = self.registry.list_models()
 
-        # ── ASCII Art Logo（清晰大字版）──
-        logo = [
-            "[bold cyan]   ___  __  __  __  __  _  _    __   __  __  ______[/bold cyan]",
-            "[bold cyan]  / _ \\|  \\/  |/ _||  \\| |  / _\\ |  \\/  ||  ____|[/bold cyan]",
-            "[bold cyan] | |_| || |\\/| | |_ | |  | | / |_ | |\\/| || |___[/bold cyan]",
-            "[bold cyan] |  _  || |  | |  _|| |/\\| ||  _ || |  | ||  ___|[/bold cyan]",
-            "[bold cyan] |_| |_||_|  |_||_|  |_| \\__||_|_\\|_|  |_||______|[/bold cyan]",
-        ]
+        # ── 渐变标题 ──
+        title = Text()
+        title.append("▲ ", style="bold bright_cyan")
+        title.append("O M N I A G E N T", style="bold cyan")
+        title.append(" C L I", style="bold bright_cyan")
 
-        # ── 版本信息 ──
+        # ── 版本标签 ──
         version = "v0.1.0"
 
-        # ── 模型状态 ──
+        # ── 模型状态指示灯 ──
         if models:
-            model_names = ", ".join(m.alias for m in models[:3])
+            model_chips = []
+            for m in models[:3]:
+                chip = f"[on cyan] {m.alias} [/on cyan]"
+                model_chips.append(chip)
             if len(models) > 3:
-                model_names += f" +{len(models) - 3}"
-            model_line = f"[bold green]{model_names}[/bold green]"
+                model_chips.append(f"[dim]+{len(models)-3}[/dim]")
+            model_line = "  ".join(model_chips)
         else:
-            model_line = "[dim]未配置 — 输入 [bold cyan]/setup[/bold cyan] 开始配置[/dim]"
+            model_line = "[dim]未配置 — 输入 [bold cyan]/model[/bold cyan] 浏览添加模型[/dim]"
 
         # ── 随机提示 ──
         tips = [
             "输入 [bold cyan]/help[/bold cyan] 查看所有可用命令",
-            "输入 [bold cyan]/model[/bold cyan] 切换 AI 模型",
-            "输入 [bold cyan]/mode[/bold cyan] 切换思考范式（direct/react/plan-execute）",
+            "输入 [bold cyan]/model[/bold cyan] 管理 AI 模型（注册+切换一步完成）",
+            "输入 [bold cyan]/mode[/bold cyan] 切换思考范式",
             "输入 [bold cyan]/setup[/bold cyan] 运行首次配置向导",
             "按 [bold cyan]Shift+Enter[/bold cyan] 可以输入多行内容",
             "输入 [bold cyan]!pytest tests -q[/bold cyan] 可直接运行终端命令",
@@ -401,22 +402,25 @@ class REPL:
         tip = random.choice(tips)
 
         # ── 构建欢迎面板 ──
-        logo_art = "\n".join(logo)
-        content = f"""[bold bright_green]欢迎来到闲余生的个人CLI编程工具[/bold bright_green]
+        content = f"""{title}
 
-{logo_art}
+  [dim]{version}[/dim]  [bold white]Multi-Model AI Coding Assistant[/bold white]
 
-  [dim]{version}[/dim]  ·  [bold white]Multi-Model AI Coding Assistant[/bold white]
+  [bold cyan]◆[/bold cyan] [bold]范式[/bold]  {mode.name}  [dim]— {mode.description}[/dim]
+  [bold cyan]◆[/bold cyan] [bold]模型[/bold]  {model_line}
 
-  [bold]范式[/bold]    {mode.name} — {mode.description}
-  [bold]模型[/bold]    {model_line}
+  [bold bright_cyan]▶[/bold bright_cyan]  [dim]{tip}[/dim]
 
-  [bold yellow]提示[/bold yellow]    {tip}
-
-  [dim]Ctrl+C 退出  ·  Shift+Enter 换行  ·  Enter 发送[/dim]"""
+  [dim]Ctrl+C 退出 · Shift+Enter 换行 · Enter 发送[/dim]"""
 
         console.print()
-        console.print(Panel(content, border_style="cyan", padding=(0, 2)))
+        console.print(Panel(
+            content,
+            border_style="bright_cyan",
+            padding=(1, 2),
+            subtitle="[dim]Powered by Rich[/dim]",
+            subtitle_align="right",
+        ))
         console.print()
 
     @staticmethod
@@ -1058,9 +1062,7 @@ class REPL:
                 if self._current_run_recorder is not None:
                     self._current_run_recorder.emit("llm.token", model=model_id, token=chunk)
                 token_count = len("".join(full_response))
-                live.update(
-                    Spinner("dots", text=f"[cyan] 生成中... {token_count} tokens[/cyan]")
-                )
+                live.update(f"[cyan] 生成中... {token_count} tokens[/cyan]")
 
         response_text = "".join(full_response)
         if self._current_run_recorder is not None:
@@ -1071,13 +1073,14 @@ class REPL:
                 output_tokens=self.ctx_mgr.estimate_tokens(response_text),
             )
 
-        # 流式完成后，用增强 Markdown Panel 渲染最终结果
+        # 极氪风格：流式完成后渲染增强 Markdown
         if response_text.strip():
             renderer = OutputRenderer(verbose=self.verbose)
             console.print(Panel(
                 renderer._render_markdown_enhanced(response_text),
-                title=f"[assistant]Assistant[/assistant] [dim]({model_id})[/dim]",
-                border_style="green",
+                title=f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]({model_id})[/dim]",
+                border_style="bright_green",
+                padding=(1, 2),
             ))
 
         self.ctx_mgr.add_assistant_message(response_text, model_used=model_id)
@@ -1106,8 +1109,9 @@ class REPL:
         renderer = OutputRenderer(verbose=self.verbose)
         console.print(Panel(
             renderer._render_markdown_enhanced(response),
-            title=f"[assistant]Assistant[/assistant] [dim]({model_id})[/dim]",
-            border_style="green",
+            title=f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]({model_id})[/dim]",
+            border_style="bright_green",
+            padding=(1, 2),
         ))
         return response
 
