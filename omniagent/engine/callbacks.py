@@ -147,10 +147,8 @@ class ThinkingPanel:
         return len(self.steps) == 0 and len(self.errors) == 0 and len(self.warnings) == 0
 
     def __rich_console__(self, console, options):
-        """Rich 协议：渲染思考面板 — 摘要行 + 折叠详情（卡片式）。"""
+        """Rich 协议：渲染思考面板 — 摘要行 + 折叠详情。"""
         from rich.text import Text
-        from rich.panel import Panel
-        from rich.console import Group
 
         if self.is_empty:
             return
@@ -168,20 +166,18 @@ class ThinkingPanel:
 
         yield Text.from_markup(summary)
 
-        # ── 折叠详情（使用卡片组件）──
-        detail_items = []
-        from omniagent.repl.cards import ThinkingCard, ToolCallCard
+        # ── 折叠详情（dim 文本行，无边框）──
+        from omniagent.repl.cards import TOOL_ICONS
 
         for i, step in enumerate(self.steps, 1):
-            step_group: list = []
+            parts: list[str] = []
             if step.thought:
                 thought_short = step.thought[:120].replace("\n", " ")
                 if len(step.thought) > 120:
                     thought_short += "..."
-                step_group.append(
-                    Text.from_markup(f"[dim]#{i} 🤔 {thought_short}[/dim]")
-                )
+                parts.append(f"[dim]#{i} 🤔 {thought_short}[/dim]")
             if step.action:
+                icon = TOOL_ICONS.get(step.action, "🔧")
                 params_parts = []
                 for k, v in step.action_input.items():
                     v_str = repr(v)
@@ -189,34 +185,20 @@ class ThinkingPanel:
                         v_str = v_str[:47] + "..."
                     params_parts.append(f"{k}={v_str}")
                 params_str = ", ".join(params_parts)
-                from omniagent.repl.cards import TOOL_ICONS
-                icon = TOOL_ICONS.get(step.action, "🔧")
-                step_group.append(
-                    Text.from_markup(f"[dim]{icon} {step.action}({params_str})[/dim]")
-                )
+                parts.append(f"[dim]{icon} {step.action}({params_str})[/dim]")
             if step.observation:
                 obs_short = step.observation[:100].replace("\n", " ")
                 if len(step.observation) > 100:
                     obs_short += "..."
-                step_group.append(
-                    Text.from_markup(f"[dim]👀 {obs_short}[/dim]")
-                )
+                parts.append(f"[dim]👀 {obs_short}[/dim]")
 
-            if step_group:
-                detail_items.append(Text("  ").join(step_group))
+            if parts:
+                yield Text.from_markup("  " + "  ".join(parts))
 
         for err in self.errors:
-            detail_items.append(Text.from_markup(f"  [red]❌ {err}[/red]"))
+            yield Text.from_markup(f"  [red]❌ {err}[/red]")
         for warn in self.warnings:
-            detail_items.append(Text.from_markup(f"  [yellow]⚠️  {warn}[/yellow]"))
-
-        if detail_items:
-            yield Panel(
-                Group(*detail_items),
-                title="[dim]推理详情[/dim]",
-                border_style="dim",
-                padding=(0, 1),
-            )
+            yield Text.from_markup(f"  [yellow]⚠️  {warn}[/yellow]")
 
 
 class ConsoleCallback(EngineCallback):

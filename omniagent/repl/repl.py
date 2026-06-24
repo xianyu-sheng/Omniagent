@@ -191,9 +191,10 @@ class REPL:
             logger.debug("failed to append runtime session thread: %s", e)
 
     def _render_engine_result(self, callback, result: str, title: str, border_style: str = "green") -> None:
-        """渲染引擎结果 — Claude Code 风格：答案优先 + 思考折叠。"""
+        """渲染引擎结果 — 分隔线 + 答案 + 思考折叠。"""
         renderer = OutputRenderer(verbose=self.verbose)
         panel = callback.get_thinking_panel() if hasattr(callback, 'get_thinking_panel') else None
+        console.print(Rule(f"[bold {border_style}]{title}[/bold {border_style}]", style=border_style, align="left"))
         renderer.render_answer(result, panel, title=title, border_style=border_style)
 
     @staticmethod
@@ -743,12 +744,8 @@ class REPL:
 
             if was_optimized:
                 # 展示优化后的 prompt，帮助用户学习
-                console.print(Panel(
-                    optimized,
-                    title="[dim]📝 优化后的 Prompt（供学习参考）[/dim]",
-                    border_style="dim",
-                    padding=(0, 1),
-                ))
+                console.print(Rule("[dim]📝 优化后的 Prompt[/dim]", style="dim", align="left"))
+                console.print(f"[dim italic]{optimized}[/dim italic]")
                 if system_hint:
                     self.ctx_mgr.add_system_message(f"[指令上下文] {system_hint}")
             elif intent is not None:
@@ -765,13 +762,9 @@ class REPL:
         # 添加用户消息
         self.ctx_mgr.add_user_message(optimized)
 
-        # ── 用户消息回显：极氪风格面板 ──
-        console.print(Panel(
-            optimized,
-            title="[bold bright_cyan]▸ You[/bold bright_cyan]",
-            border_style="bright_cyan",
-            padding=(0, 1),
-        ))
+        # ── 用户消息回显 ──
+        console.print(Rule("[bold bright_cyan]▸ You[/bold bright_cyan]", style="bright_cyan", align="left"))
+        console.print(optimized)
 
         # 获取模型列表
         model_ids = self.registry.get_role_priority("planner")
@@ -1129,16 +1122,14 @@ class REPL:
                 output_tokens=self.ctx_mgr.estimate_tokens(response_text),
             )
 
-        # 极氪风格：流式完成后渲染增强 Markdown
+        # 流式完成后渲染增强 Markdown
         if response_text.strip():
             renderer = OutputRenderer(verbose=self.verbose)
-            console.print(Panel(
-                renderer._render_markdown_enhanced(response_text),
-                title=f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]· {model_id} · {len(response_text):,} chars[/dim]",
-                border_style="bright_green",
-                padding=(1, 2),
+            console.print(Rule(
+                f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]· {model_id} · {len(response_text):,} chars[/dim]",
+                style="bright_green", align="left",
             ))
-            console.print("[dim]──[/dim]")  # 视觉分隔
+            console.print(renderer._render_markdown_enhanced(response_text))
 
         self.ctx_mgr.add_assistant_message(response_text, model_used=model_id)
         return response_text
@@ -1164,13 +1155,11 @@ class REPL:
 
         console.print()
         renderer = OutputRenderer(verbose=self.verbose)
-        console.print(Panel(
-            renderer._render_markdown_enhanced(response),
-            title=f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]· {model_id} · {len(response):,} chars[/dim]",
-            border_style="bright_green",
-            padding=(1, 2),
+        console.print(Rule(
+            f"[bold bright_green]◆ Assistant[/bold bright_green] [dim]· {model_id} · {len(response):,} chars[/dim]",
+            style="bright_green", align="left",
         ))
-        console.print("[dim]──[/dim]")
+        console.print(renderer._render_markdown_enhanced(response))
         return response
 
     @staticmethod

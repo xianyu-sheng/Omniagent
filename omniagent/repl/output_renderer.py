@@ -79,23 +79,11 @@ class OutputRenderer:
     ) -> None:
         """渲染引擎最终回答 — 答案优先 + 思考折叠。
 
-        Claude Code 风格布局:
-        ┌──────────────────────────────────────┐
-        │  🤖 Assistant                       │
-        │                                      │
-        │  (带语法高亮的 Markdown 内容)         │
-        │                                      │
-        └──────────────────────────────────────┘
-        🧠 深度思考 · 3次工具调用 [展开查看 /verbose]
+        极简布局：分隔线 + 内容 + 思考摘要。
         """
         # ── 1. 渲染最终答案 (主体) ──
         rendered = self._render_markdown_enhanced(result)
-        self._console.print(Panel(
-            rendered,
-            title=f"[bold green]{title}[/bold green]",
-            border_style=border_style,
-            padding=(1, 2),
-        ))
+        self._console.print(rendered)
 
         # ── 2. 渲染思考摘要 (折叠) ──
         if thinking_panel is not None and hasattr(thinking_panel, 'is_empty'):
@@ -161,48 +149,34 @@ class OutputRenderer:
             self._render_thinking_details(panel)
 
     def _render_thinking_details(self, panel: Any) -> None:
-        """展开思考详情 — 结构化展示每一步。"""
-        from rich.table import Table
-
-        table = Table(show_header=False, box=None, padding=(0, 1))
-        table.add_column("icon", width=2)
-        table.add_column("step", width=4, style="dim")
-        table.add_column("detail")
-
+        """展开思考详情 — dim 文本行，无边框。"""
         for i, step in enumerate(panel.steps, 1):
-            parts = []
+            parts: list[str] = []
             if hasattr(step, 'thought') and step.thought:
                 thought = step.thought[:120].replace("\n", " ")
                 if len(step.thought) > 120:
                     thought += "..."
-                parts.append(Text(f"🤔 {thought}", style="dim"))
+                parts.append(f"[dim]🤔 {thought}[/dim]")
 
             if hasattr(step, 'action') and step.action:
                 params_str = ", ".join(
                     f"{k}={repr(v)[:40]}"
                     for k, v in (step.action_input.items() if hasattr(step, 'action_input') else [])
                 )
-                parts.append(Text(f"🔧 {step.action}({params_str})", style="yellow"))
+                parts.append(f"[yellow]🔧 {step.action}({params_str})[/yellow]")
 
             if hasattr(step, 'observation') and step.observation:
                 obs = step.observation[:100].replace("\n", " ")
                 if len(step.observation) > 100:
                     obs += "..."
-                parts.append(Text(f"👀 {obs}", style="dim"))
+                parts.append(f"[dim]👀 {obs}[/dim]")
 
             if parts:
-                table.add_row("", str(i), Group(*parts))
+                self._console.print(Text.from_markup(f"  [{i}] " + "  ".join(parts)))
 
-        if panel.errors if hasattr(panel, 'errors') else []:
+        if hasattr(panel, 'errors'):
             for err in panel.errors:
-                table.add_row("", "❌", Text(err, style="red"))
-
-        self._console.print(Panel(
-            table,
-            title="[dim]推理详情[/dim]",
-            border_style="dim",
-            padding=(0, 1),
-        ))
+                self._console.print(Text.from_markup(f"  [red]❌ {err}[/red]"))
 
     # ═══════════════════════════════════════════════════════════
     # 增强 Markdown 渲染 (代码高亮 + 公式)
