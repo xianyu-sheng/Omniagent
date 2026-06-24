@@ -161,8 +161,8 @@ class RecordingCallback(EngineCallback):
             params=action_input,
         )
 
-    def on_observe(self, observation: str) -> None:
-        self.delegate.on_observe(observation)
+    def on_observe(self, observation: str, card_data: dict | None = None) -> None:
+        self.delegate.on_observe(observation, card_data=card_data)
         if self._current_tool_use_id:
             self._emit(
                 "tool.call_finished",

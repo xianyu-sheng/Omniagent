@@ -291,10 +291,10 @@ class PlanExecuteEngine:
 
         if result.success:
             notify_text = result.format_notification()
-            self.callback.on_observe(notify_text)
+            self.callback.on_observe(notify_text, card_data=result.to_card_data())
             return result.summary
 
-        self.callback.on_observe(result.error or result.summary)
+        self.callback.on_observe(result.error or result.summary, card_data=result.to_card_data())
         return result.error or result.summary
 
     def _execute_step_with_llm(

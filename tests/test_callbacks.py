@@ -23,7 +23,9 @@ class TestSilentCallback:
     def test_records_observe(self):
         cb = SilentCallback()
         cb.on_observe("文件已创建")
-        assert cb.events == [("observe", "文件已创建")]
+        assert cb.events[0][0] == "observe"
+        assert cb.events[0][1] == "文件已创建"
+        assert cb.events[0][2] is None  # card_data defaults to None
 
     def test_records_step(self):
         cb = SilentCallback()

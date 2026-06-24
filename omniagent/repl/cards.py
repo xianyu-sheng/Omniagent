@@ -55,21 +55,25 @@ TOOL_ICONS: dict[str, str] = {
 }
 
 # 写入/敏感工具（始终显示完整卡片）
-_NOTIFY_TOOLS: set[str] = {
+NOTIFY_TOOLS: set[str] = {
     "write_file", "edit_file", "batch_write", "batch_edit",
     "create_directory", "move_file", "copy_file", "delete_file",
     "command", "git", "mcp_call", "spawn_agent",
 }
 
 # 信息获取工具（紧凑显示）
-_INFO_TOOLS: set[str] = {
+INFO_TOOLS: set[str] = {
     "read_file", "list_files", "search_files",
     "web_fetch", "github_fetch", "weather", "datetime",
 }
 
+# 向后兼容别名
+_NOTIFY_TOOLS = NOTIFY_TOOLS
+_INFO_TOOLS = INFO_TOOLS
+
 
 def _is_notify_tool(tool_name: str) -> bool:
-    return tool_name in _NOTIFY_TOOLS
+    return tool_name in NOTIFY_TOOLS
 
 
 def _status_color(status: str) -> str:
@@ -464,6 +468,18 @@ class ModeHeader:
         elif self.mode == "Direct":
             parts.append("[bold bright_cyan]💬 Direct 模式[/bold bright_cyan]")
             parts.append("[dim]直接对话[/dim]")
+        elif self.mode == "Plan+React":
+            parts.append("[bold bright_cyan]📋🔄 Plan+React 模式[/bold bright_cyan]")
+            parts.append("[dim]全局规划 → 每步 ReAct 执行[/dim]")
+        elif self.mode == "Plan+Reflection":
+            parts.append("[bold bright_cyan]📋🔍 Plan+Reflection 模式[/bold bright_cyan]")
+            parts.append("[dim]规划执行 → 反思修正[/dim]")
+        elif self.mode == "React+Reflection":
+            parts.append("[bold bright_cyan]🔄🔍 React+Reflection 模式[/bold bright_cyan]")
+            parts.append("[dim]ReAct 探索 → 反思审查[/dim]")
+        elif self.mode == "Novel":
+            parts.append("[bold magenta]📖 Novel 模式[/bold magenta]")
+            parts.append("[dim]小说创作助手[/dim]")
         else:
             parts.append(f"[bold bright_cyan]📐 {self.mode} 模式[/bold bright_cyan]")
             if self.description:

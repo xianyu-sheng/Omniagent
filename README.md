@@ -131,7 +131,7 @@ Mock 评测（确定性，CI 使用）：
 python evals/runner.py --mode mock --output evals/reports/mock_report.md
 ```
 
-最新 mock 评测结果（2026-06-23）：**20/20 (100%)** — 3 次独立运行全部通过，36 次工具调用，0 次工具失败。
+最新 mock 评测结果（2026-06-24）：**20/20 (100%)** — 2 次独立运行全部通过，36 次工具调用，0 次工具失败。
 
 真实评测（使用已配置的模型，手动运行）：
 
@@ -140,7 +140,7 @@ python evals/runner.py --mode real --model deepseek/deepseek-v4-pro --output eva
 python evals/runner.py --mode real --model openai/gpt-4o --output evals/reports/real_report.md
 ```
 
-最新真实评测结果（deepseek-v4-pro，2026-06-23）：**20/20 (100%)**，平均 82.2 tokens，37 次工具调用，0 次工具失败。
+最新真实评测结果（deepseek-v4-pro，2026-06-24）：**20/20 (100%)**，平均 85.4 tokens，36 次工具调用，0 次工具失败。
 
 ## TUI 模式
 

@@ -964,7 +964,7 @@ class ReActEngine:
                 exec_result = executor.execute(action, action_input, ctx, tracker)
                 # 通知回调：成功时用通知格式，失败时用错误摘要
                 notify_text = exec_result.format_notification() if exec_result.success else (exec_result.error or exec_result.summary or "")
-                self.callback.on_observe(notify_text)
+                self.callback.on_observe(notify_text, card_data=exec_result.to_card_data())
 
                 # 使用结构化结果格式化观察消息
                 obs_msg = exec_result.format_observation()

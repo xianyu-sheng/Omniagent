@@ -85,8 +85,8 @@ class EventAwareCallback(EngineCallback):
         except Exception:
             pass
 
-    def on_observe(self, observation: str) -> None:
-        self._delegate.on_observe(observation)
+    def on_observe(self, observation: str, card_data: dict | None = None) -> None:
+        self._delegate.on_observe(observation, card_data=card_data)
         elapsed_ms = int((time.monotonic() - self._tool_start_time) * 1000) if self._tool_start_time else 0
         is_error = observation.startswith(("执行失败", "执行异常", "错误:", "Error:"))
         try:

@@ -1001,10 +1001,10 @@ class REPL:
         """Plan + React 组合引擎模式。"""
         from omniagent.engine.combined_engines import PlanReactEngine
 
-        console.print("[cyan]📋🔄 Plan+React 模式: 全局规划 → 每步 ReAct 执行[/cyan]")
-
         iterations = self._estimate_react_iterations(user_input)
         plan_steps = max(6, min(iterations, 15))
+        console.print(ModeHeader("Plan+React", description="全局规划 → 每步 ReAct 执行", iterations=iterations))
+        self.status_bar.set_engine_status("running")
 
         callback = self._make_callback()
         engine = PlanReactEngine(model_priority=model_ids, max_steps=plan_steps, react_iterations=iterations, callback=callback)
@@ -1016,14 +1016,18 @@ class REPL:
             self.status_bar.set_last_model(model_ids[0])
             self._finish_run(status="success", result=result)
         except Exception as e:
-            console.print(f"[error]❌ Plan+React 引擎执行失败: {e}[/error]")
+            console.print(ErrorCard(str(e), title="Plan+React 引擎执行失败"))
             self._finish_run(status="error", reason=str(e))
+        finally:
+            self.status_bar.set_engine_status("done")
+            console.print(render_shortcut_bar())
 
     def _run_plan_reflection_engine(self, user_input: str, model_ids: list[str]) -> None:
         """Plan + Reflection 组合引擎模式。"""
         from omniagent.engine.combined_engines import PlanReflectionEngine
 
-        console.print("[cyan]📋🔍 Plan+Reflection 模式: 规划执行 → 反思修正[/cyan]")
+        console.print(ModeHeader("Plan+Reflection", description="规划执行 → 反思修正"))
+        self.status_bar.set_engine_status("running")
 
         callback = self._make_callback()
         engine = PlanReflectionEngine(model_priority=model_ids, max_steps=10, review_rounds=2, callback=callback)
@@ -1035,14 +1039,18 @@ class REPL:
             self.status_bar.set_last_model(model_ids[0])
             self._finish_run(status="success", result=result)
         except Exception as e:
-            console.print(f"[error]❌ Plan+Reflection 引擎执行失败: {e}[/error]")
+            console.print(ErrorCard(str(e), title="Plan+Reflection 引擎执行失败"))
             self._finish_run(status="error", reason=str(e))
+        finally:
+            self.status_bar.set_engine_status("done")
+            console.print(render_shortcut_bar())
 
     def _run_react_reflection_engine(self, user_input: str, model_ids: list[str]) -> None:
         """ReAct + Reflection 组合引擎模式。"""
         from omniagent.engine.combined_engines import ReactReflectionEngine
 
-        console.print("[cyan]🔄🔍 React+Reflection 模式: ReAct 探索 → 反思审查[/cyan]")
+        console.print(ModeHeader("React+Reflection", description="ReAct 探索 → 反思审查"))
+        self.status_bar.set_engine_status("running")
 
         callback = self._make_callback()
         engine = ReactReflectionEngine(model_priority=model_ids, react_iterations=8, review_rounds=2, callback=callback)
@@ -1054,14 +1062,18 @@ class REPL:
             self.status_bar.set_last_model(model_ids[0])
             self._finish_run(status="success", result=result)
         except Exception as e:
-            console.print(f"[error]❌ React+Reflection 引擎执行失败: {e}[/error]")
+            console.print(ErrorCard(str(e), title="React+Reflection 引擎执行失败"))
             self._finish_run(status="error", reason=str(e))
+        finally:
+            self.status_bar.set_engine_status("done")
+            console.print(render_shortcut_bar())
 
     def _run_novel_engine(self, user_input: str, model_ids: list[str]) -> None:
         """小说创作引擎模式（支持多小说隔离）。"""
         from omniagent.engine.novel_engine import NovelEngine
 
-        console.print("[magenta]Novel 模式: 小说创作助手[/magenta]")
+        console.print(ModeHeader("Novel", description="小说创作助手"))
+        self.status_bar.set_engine_status("running")
 
         callback = self._make_callback()
         engine = NovelEngine(
@@ -1078,8 +1090,11 @@ class REPL:
             self.status_bar.set_last_model(model_ids[0])
             self._finish_run(status="success", result=result)
         except Exception as e:
-            console.print(f"[error]❌ 小说创作引擎执行失败: {e}[/error]")
+            console.print(ErrorCard(str(e), title="Novel 引擎执行失败"))
             self._finish_run(status="error", reason=str(e))
+        finally:
+            self.status_bar.set_engine_status("done")
+            console.print(render_shortcut_bar())
 
     def _stream_response(self, model_id: str, messages: list[dict[str, str]]) -> str:
         """流式输出模型回复，完成后 Markdown 渲染。返回完整响应文本。"""

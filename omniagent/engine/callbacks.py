@@ -20,8 +20,8 @@ class EngineCallback:
         """即将执行工具。"""
         pass
 
-    def on_observe(self, observation: str) -> None:
-        """工具执行结果。"""
+    def on_observe(self, observation: str, card_data: dict | None = None) -> None:
+        """工具执行结果。card_data 为可选的结构化数据（来自 ToolExecuteResult.to_card_data()）。"""
         pass
 
     def on_step(self, step_id: int, total: int, task: str) -> None:
@@ -61,8 +61,8 @@ class SilentCallback(EngineCallback):
     def on_act(self, action: str, action_input: dict) -> None:
         self.events.append(("act", (action, action_input)))
 
-    def on_observe(self, observation: str) -> None:
-        self.events.append(("observe", observation))
+    def on_observe(self, observation: str, card_data: dict | None = None) -> None:
+        self.events.append(("observe", observation, card_data))
 
     def on_step(self, step_id: int, total: int, task: str) -> None:
         self.events.append(("step", (step_id, total, task)))
@@ -233,18 +233,16 @@ class ConsoleCallback(EngineCallback):
     - 错误 → ErrorCard（红色醒目卡片）
     """
 
-    # 写入/危险类工具（完整卡片）
-    _NOTIFY_TOOLS = {
-        "write_file", "edit_file", "batch_write", "batch_edit",
-        "create_directory", "move_file", "copy_file", "delete_file",
-        "command", "git", "mcp_call", "spawn_agent",
-    }
+    # 写入/危险类工具（完整卡片）— 从 cards.py 统一来源导入
+    from omniagent.repl.cards import NOTIFY_TOOLS as _NOTIFY_TOOLS
 
     def __init__(self, *, verbose: bool = False) -> None:
         self.verbose = verbose
         self._panel = ThinkingPanel()
         # 懒加载 Rich Console（模块级重用）
         self._console = None
+        # 跟踪步骤总数（on_step 传入，on_step_done 复用）
+        self._current_step_total: int = 0
 
     @property
     def _rich_console(self):
@@ -270,12 +268,24 @@ class ConsoleCallback(EngineCallback):
         elif self.verbose:
             self._rich_console.print(card)
 
-    def on_observe(self, observation: str) -> None:
+    def on_observe(self, observation: str, card_data: dict | None = None) -> None:
         self._panel.add_observation(observation)
 
         from omniagent.repl.cards import ToolResultCard
 
-        # 检测通知类型
+        # ── 优先使用结构化 card_data（来自 ToolExecuteResult.to_card_data()）──
+        if card_data:
+            card = ToolResultCard(
+                tool_name=card_data.get("tool_name", ""),
+                success=card_data.get("success", False),
+                summary=observation,
+                permission_denied=card_data.get("permission_denied", False),
+                circuit_breaker_tripped=card_data.get("circuit_breaker_tripped", False),
+            )
+            self._rich_console.print(card)
+            return
+
+        # ── 回退：从纯文本 observation 解析（兼容未升级的引擎/异步引擎）──
         is_success = observation.startswith("✅") or "执行完成" in observation[:50]
         is_failure = (
             observation.startswith(("❌", "🛑", "⛔"))
@@ -301,41 +311,16 @@ class ConsoleCallback(EngineCallback):
             from rich.text import Text
             self._rich_console.print(Text.from_markup(f"  [dim]👀 {obs_preview}[/dim]"))
 
-    @staticmethod
-    def _brief_params(action: str, params: dict) -> str:
-        """生成简要参数预览（一行，控制长度）。"""
-        if action == "command":
-            cmd = str(params.get("command", ""))
-            return cmd[:100] if cmd else ""
-        elif action == "git":
-            git_cmd = str(params.get("git_command") or params.get("command", ""))
-            return git_cmd[:80] if git_cmd else ""
-        elif action in ("write_file", "edit_file", "read_file"):
-            path = str(params.get("file_path", ""))
-            return path[:80] if path else ""
-        elif action in ("list_files", "create_directory"):
-            path = str(params.get("file_path") or params.get("path", ""))
-            return path[:60] if path else ""
-        elif action == "search_files":
-            pattern = str(params.get("search_pattern") or params.get("pattern", ""))
-            return pattern[:60] if pattern else ""
-        elif action in ("web_fetch", "github_fetch"):
-            url = str(params.get("url", ""))
-            return url[:80] if url else ""
-        # 通用：显示第一个关键参数
-        for key in ("file_path", "path", "url", "query", "search_pattern"):
-            if key in params:
-                return str(params[key])[:60]
-        return ""
-
     def on_step(self, step_id: int, total: int, task: str) -> None:
+        self._current_step_total = total
         from omniagent.repl.cards import StepCard
         self._rich_console.print(StepCard(step_id, total, task, status="running"))
 
     def on_step_done(self, step_id: int, success: bool, summary: str) -> None:
         from omniagent.repl.cards import StepCard
         status = "done" if success else "failed"
-        self._rich_console.print(StepCard(step_id, 0, summary, status=status))
+        total = self._current_step_total  # 复用 on_step 传入的 total
+        self._rich_console.print(StepCard(step_id, total, summary, status=status))
 
     def on_review(self, score: int, passed: bool, feedback: str) -> None:
         if self.verbose:
