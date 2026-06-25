@@ -19,7 +19,9 @@ class SpawnAgentTool(BaseTool):
 
     def execute(self, context: AgentContext) -> dict[str, Any]:
         goal = str(self._extra.get("goal", ""))
-        model = self._extra.get("model", "")
+        model = str(self._extra.get("model", "") or "")
+        capability = str(self._extra.get("capability", "") or "general-purpose")
+        context_seed = self._extra.get("context_seed", None)
 
         if not goal:
             return {"action_type": "spawn_agent", "success": False, "error": "需要 goal 参数（子任务目标）"}
@@ -29,9 +31,14 @@ class SpawnAgentTool(BaseTool):
             import asyncio
 
             spawn = _Spawn()
-            params = {"goal": goal}
+            params: dict[str, Any] = {
+                "goal": goal,
+                "capability": capability,
+            }
             if model:
                 params["model"] = model
+            if context_seed is not None:
+                params["context_seed"] = context_seed
 
             result = asyncio.run(spawn.invoke(params))
             return {

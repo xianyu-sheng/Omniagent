@@ -345,17 +345,26 @@ BUILTIN_TOOLS = {
         },
     },
     # ── 子 Agent 工具（从 subagent.py 注册到生产路径）──
+    "discover_agents": {
+        "name": "discover_agents",
+        "description": "发现可用的子 Agent 类型及其能力。返回每个子 Agent 的名称、可用工具、是否只读等信息。主 Agent 应先调用此工具了解可用类型，再选择合适的类型 spawn。",
+        "params": {
+            "name": "指定 AgentCard 名称查看详情（可选，不传则列出全部）",
+        },
+    },
     "spawn_agent": {
         "name": "spawn_agent",
-        "description": "派生子 Agent 在后台独立处理子任务。子 Agent 有独立上下文，结果通过 agent_result 工具查询。适合并行处理多个独立子任务。",
+        "description": "派生子 Agent 在后台独立处理子任务。子 Agent 有独立上下文，结果通过 agent_result 工具查询。通过 capability 参数指定子 Agent 类型。适合并行处理多个独立子任务。",
         "params": {
             "goal": "子任务目标描述",
+            "capability": "子 Agent 能力类型（code-explorer/file-writer/test-runner/general-purpose），默认 general-purpose",
+            "context_seed": "父 Agent 传递的上下文（可选）：{parent_goal, discovered_files, constraints}",
             "model": "指定模型（可选，默认继承父 Agent）",
         },
     },
     "agent_result": {
         "name": "agent_result",
-        "description": "查询子 Agent 任务的执行结果。需要先通过 spawn_agent 创建子任务。",
+        "description": "查询子 Agent 任务的执行结果。需要先通过 spawn_agent 创建子任务。不传 task_id 则列出所有子任务。",
         "params": {
             "task_id": "子任务 ID（可选，不传则列出所有子任务）",
         },

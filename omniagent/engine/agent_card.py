@@ -112,7 +112,10 @@ class AgentCard:
 
     @property
     def tool_list(self) -> list[str]:
-        return list(self.capabilities.get("tools", []))
+        tools = self.capabilities.get("tools")
+        if tools is None:
+            return []
+        return list(tools)
 
     @property
     def max_iterations(self) -> int:
@@ -195,7 +198,7 @@ class AgentCardRegistry:
         for f in sorted(self.cards_dir.glob("*.yaml")):
             try:
                 data = yaml.safe_load(f.read_text(encoding="utf-8"))
-                if data and "name" in data:
+                if isinstance(data, dict) and "name" in data:
                     card = AgentCard(
                         name=data["name"],
                         display_name=data.get("display_name", data["name"]),
@@ -207,7 +210,7 @@ class AgentCardRegistry:
                     )
                     self.cards[card.name] = card
                     logger.debug("已加载 AgentCard: %s (v%s)", card.name, card.version)
-            except (yaml.YAMLError, KeyError) as e:
+            except (yaml.YAMLError, KeyError, TypeError, ValueError) as e:
                 logger.warning("AgentCard 解析失败 %s: %s", f.name, e)
 
         self._loaded = True
@@ -239,6 +242,7 @@ class AgentCardRegistry:
             card: 名片对象
             persist: 是否持久化到磁盘 YAML
         """
+        self._ensure_loaded()
         self.cards[card.name] = card
 
         if persist:
@@ -261,6 +265,7 @@ class AgentCardRegistry:
 
     def unregister(self, name: str) -> bool:
         """注销并删除一张名片。"""
+        self._ensure_loaded()
         if name not in self.cards:
             return False
         del self.cards[name]

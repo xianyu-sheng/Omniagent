@@ -150,7 +150,7 @@ class SubagentNotifier:
     def poll_completed(self, task_ids: list[str]) -> dict[str, SubagentTask]:
         """Poll: 非阻塞检查指定 task_id 是否完成。
 
-        返回 {task_id: SubagentTask} 仅已完成的任务。
+        返回 {task_id: SubagentTask} 仅已完成的任务。每个任务只返回一次。
         """
         results: dict[str, SubagentTask] = {}
         for tid in task_ids:
@@ -161,6 +161,7 @@ class SubagentNotifier:
             task = self.registry.get_task(tid)
             if task and task.status in ("success", "failed"):
                 results[tid] = task
+                self._completed[tid] = task  # 标记已消费，防止重复返回
         return results
 
     def poll_all(self, *, force: bool = False) -> list[SubagentTask]:
@@ -305,8 +306,8 @@ class SpawnAgentTool(BaseTool):
     # 默认模型优先级（可通过实例属性覆盖）
     model_priority: list[str] = ["deepseek/deepseek-v4-pro"]
 
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(self) -> None:
+        super().__init__()
         self._notifier: SubagentNotifier | None = None
 
     @property
