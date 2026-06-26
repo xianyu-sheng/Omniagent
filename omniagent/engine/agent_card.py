@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 _CARDS_DIR = Path.home() / ".omniagent" / "agents"
 
+# ── AgentCard 格式版本 — 递增此值会触发已有卡片的自动更新 ──
+_CARD_FORMAT_VERSION = "1.1"
+
 # ── 默认种子名片 ─────────────────────────────────────────────
 
 _SEED_CARDS: list[dict[str, Any]] = [
@@ -165,19 +168,46 @@ class AgentCardRegistry:
     # ── 加载 ──────────────────────────────────────────────
 
     def ensure_seeded(self) -> None:
-        """确保默认名片存在（首次运行时写入）。"""
+        """确保默认名片存在，并在格式版本升级时自动更新。
+
+        首次运行时写入默认名片；当 _CARD_FORMAT_VERSION 递增时，
+        已存在的旧版本 YAML 会被自动覆盖为最新版本。
+        """
         if not self.cards_dir.exists():
             self.cards_dir.mkdir(parents=True, exist_ok=True)
 
         for seed in _SEED_CARDS:
             card_path = self.cards_dir / f"{seed['name']}.yaml"
+            should_write = False
+
             if not card_path.exists():
+                should_write = True
+            else:
+                # ── 版本检查：若格式版本升级，覆盖旧卡片 ──
+                try:
+                    existing = yaml.safe_load(card_path.read_text(encoding="utf-8"))
+                    existing_version = str(existing.get("version", "0") if isinstance(existing, dict) else "0")
+                    if existing_version != _CARD_FORMAT_VERSION:
+                        logger.info(
+                            "AgentCard %s 版本过期 (%s → %s)，自动更新",
+                            seed["name"], existing_version, _CARD_FORMAT_VERSION,
+                        )
+                        should_write = True
+                except Exception:
+                    # 文件损坏，覆盖写入
+                    logger.warning("AgentCard %s 解析失败，重新写入", seed["name"])
+                    should_write = True
+
+            if should_write:
+                # ── 写入时注入当前格式版本 ──
+                card_data = dict(seed)
+                card_data["version"] = _CARD_FORMAT_VERSION
                 try:
                     card_path.write_text(
-                        yaml.dump(seed, allow_unicode=True, default_flow_style=False, sort_keys=False),
+                        yaml.dump(card_data, allow_unicode=True, default_flow_style=False, sort_keys=False),
                         encoding="utf-8",
                     )
-                    logger.info("已写入默认 AgentCard: %s", seed["name"])
+                    logger.info("已写入 AgentCard: %s (v%s)", seed["name"], _CARD_FORMAT_VERSION)
                 except Exception as e:
                     logger.warning("写入默认名片失败 %s: %s", seed["name"], e)
 

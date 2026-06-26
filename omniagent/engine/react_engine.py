@@ -20,6 +20,7 @@ from omniagent.engine.circuit_breaker import CircuitBreaker
 from omniagent.engine.compactor import Compactor
 from omniagent.engine.context import AgentContext
 from omniagent.engine.tool_tracker import ToolExecutionTracker
+from omniagent.engine.subagent import SubagentNotifier, get_background_registry
 from omniagent.nodes.tool_node import _DYNAMIC_TOOLS, ToolNode
 from omniagent.utils.llm_client import chat_completion
 from omniagent.utils.response_adapter import parse_react, register_tools_from_dict
@@ -710,6 +711,10 @@ class ReActEngine:
         self.breaker = CircuitBreaker()  # 工具断路器
         self._interrupt_event = interrupt_event  # 中断事件（Esc/Ctrl+C）
 
+        # ── 子 Agent 通知轮询 ──
+        self._active_subagent_ids: set[str] = set()  # 已 spawn 但未通知的 task_id
+        self._subagent_notifier: SubagentNotifier | None = None
+
         # ── 静态阈值 ──
         self.min_final_answer_length = min_final_answer_length
         self.min_structured_sections = min_structured_sections
@@ -804,6 +809,65 @@ class ReActEngine:
             exploration_budget=exploration_budget,
         ) + env_info
 
+    def _poll_subagents(self, iteration: int, messages: list[dict]) -> int:
+        """轮询已完成的子 Agent 并将结果注入消息列表。
+
+        混合通知策略：
+        - 每轮：非阻塞检查 _active_subagent_ids 中指定的任务
+        - 每 6 轮（≈60s）：全量扫描兜底
+
+        Returns:
+            本轮注入的消息数量
+        """
+        if self._subagent_notifier is None:
+            self._subagent_notifier = SubagentNotifier(get_background_registry())
+
+        notifier = self._subagent_notifier
+        injected = 0
+
+        # 1. 检查已知活跃子 Agent（最快路径）
+        if self._active_subagent_ids:
+            completed = notifier.poll_completed(list(self._active_subagent_ids))
+            for task_id, task in completed.items():
+                self._active_subagent_ids.discard(task_id)
+                status_icon = "✅" if task.status == "success" else "❌"
+                result_preview = task.result[:800] if task.result else "(无输出)"
+                msg = (
+                    f"[子 Agent 完成] {status_icon} {task_id}\n"
+                    f"目标: {task.goal}\n"
+                    f"结果:\n{result_preview}"
+                )
+                messages.append({"role": "user", "content": msg})
+                injected += 1
+                logger.info(
+                    "ReAct: 子 Agent %s 完成 (%s)，结果已注入上下文 (%d chars)",
+                    task_id, task.status, len(task.result),
+                )
+
+        # 2. 长周期全量扫描兜底（每 6 轮强制一次）
+        force_full = (iteration > 0 and iteration % 6 == 0)
+        all_completed = notifier.poll_all(force=force_full)
+        for task in all_completed:
+            if task.task_id in self._active_subagent_ids:
+                self._active_subagent_ids.discard(task.task_id)
+            status_icon = "✅" if task.status == "success" else "❌"
+            result_preview = task.result[:800] if task.result else "(无输出)"
+            msg = (
+                f"[子 Agent 完成·全量扫描] {status_icon} {task.task_id}\n"
+                f"目标: {task.goal}\n"
+                f"结果:\n{result_preview}"
+            )
+            messages.append({"role": "user", "content": msg})
+            injected += 1
+            logger.info(
+                "ReAct: 全量扫描发现已完成子 Agent %s (%s)，结果已注入",
+                task.task_id, task.status,
+            )
+
+        if injected > 0:
+            self.callback.on_observe(f"📬 {injected} 个子 Agent 结果已注入上下文")
+        return injected
+
     def run(self, user_input: str, context: AgentContext | None = None) -> str:
         """
         执行 ReAct 循环。
@@ -853,6 +917,9 @@ class ReActEngine:
                 self.callback.on_warning("用户中断")
                 self.callback.on_finish(interrupted_msg)
                 return interrupted_msg
+
+            # ── 子 Agent 通知轮询（混合通知：push + poll + 长周期兜底）──
+            subagent_result = self._poll_subagents(i, messages)
 
             # ── 上下文压缩检查（按可配置间隔 + 初始检查）──
             if i == 0 or (i > 0 and i % self.compact_interval == 0):
@@ -1022,6 +1089,15 @@ class ReActEngine:
                 obs_msg = exec_result.format_observation()
                 messages.append({"role": "user", "content": obs_msg})
                 logger.debug(f"ReAct 观察: {exec_result.summary[:200] if exec_result.summary else exec_result.error}")
+
+                # ── 追踪 spawn_agent 的 task_id 用于子 Agent 通知轮询 ──
+                if action == "spawn_agent" and exec_result.success:
+                    import re as _re_tid
+                    tid_match = _re_tid.search(r'task_id:\s*([a-zA-Z0-9_-]+)', exec_result.summary)
+                    if tid_match:
+                        self._active_subagent_ids.add(tid_match.group(1))
+                        logger.debug("ReAct: 追踪子 Agent task_id=%s", tid_match.group(1))
+
                 no_tool_streak = 0
                 thought_only_streak = 0
             else:

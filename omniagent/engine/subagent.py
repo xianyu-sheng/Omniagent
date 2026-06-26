@@ -17,7 +17,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -216,21 +216,40 @@ _RESULT_SCHEMA_HINT = """
 def _parse_structured_result(text: str) -> dict[str, Any]:
     """从子 Agent 输出中解析结构化 JSON 结果。
 
+    支持嵌套 JSON（如 errors 中嵌套对象），按优先级尝试：
+    1. ```json ... ``` 代码块中的完整 JSON
+    2. 裸 JSON 对象（brace-counting 提取，支持嵌套）
+    3. 回退：整段文本作为 summary
+
     回退策略：若无法解析 JSON，返回整个文本作为 summary。
     """
-    # 尝试匹配 JSON 块
-    json_match = re.search(r'\{[^{}]*"summary"[^{}]*\}', text, re.DOTALL)
-    if not json_match:
-        # 尝试匹配代码块中的 JSON
-        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-
-    if json_match:
+    # ── 策略 1: 代码块中的 JSON（```json ... ```）──
+    for m in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL):
         try:
-            return json.loads(json_match.group(1) if json_match.lastindex else json_match.group(0))
-        except (json.JSONDecodeError, IndexError):
-            pass
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
 
-    # 回退：整段文本作为 summary
+    # ── 策略 2: 裸 JSON 对象（brace-counting，支持嵌套）──
+    for m in re.finditer(r'\{', text):
+        depth = 0
+        start = m.start()
+        for i, c in enumerate(text[start:], start):
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        candidate = text[start:i + 1]
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict) and parsed:
+                            return parsed
+                    except json.JSONDecodeError:
+                        pass
+                    break  # 这个候选解析失败，尝试下一个 {
+
+    # ── 回退：整段文本作为 summary ──
     return {
         "summary": text[:500].strip(),
         "files_modified": [],

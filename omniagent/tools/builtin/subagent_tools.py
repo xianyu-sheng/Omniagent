@@ -22,9 +22,14 @@ class SpawnAgentTool(BaseTool):
         model = str(self._extra.get("model", "") or "")
         capability = str(self._extra.get("capability", "") or "general-purpose")
         context_seed = self._extra.get("context_seed", None)
+        run_id = str(self._extra.get("run_id", "") or "")
 
         if not goal:
             return {"action_type": "spawn_agent", "success": False, "error": "需要 goal 参数（子任务目标）"}
+
+        # ── 从 AgentContext 提取 run_id（若 LLM 未显式传递）──
+        if not run_id and context:
+            run_id = str(getattr(context, "run_id", "") or "")
 
         try:
             from omniagent.engine.subagent import SpawnAgentTool as _Spawn, get_background_registry
@@ -37,6 +42,8 @@ class SpawnAgentTool(BaseTool):
             }
             if model:
                 params["model"] = model
+            if run_id:
+                params["run_id"] = run_id
             if context_seed is not None:
                 params["context_seed"] = context_seed
 
