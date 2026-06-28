@@ -1546,12 +1546,26 @@ class ReActEngine(BaseEngine):
         委托给统一的 ToolExecutor，避免与其他引擎重复实现
         断路器/重试/参数验证逻辑。
         """
-        # 验证工具存在
+        # 验证工具存在（优先 BUILTIN_TOOLS，回退 ToolRegistry 动态工具）
         tool_info = self.tools.get(action)
+        if not tool_info:
+            try:
+                from omniagent.tools.registry import get_registry
+                registry = get_registry()
+                if action in registry._dynamic_tools:
+                    info = registry._dynamic_tools[action]
+                    tool_info = {"name": action, "description": info["description"], "params": info.get("params", {})}
+            except Exception:
+                pass
         if not tool_info and action in _DYNAMIC_TOOLS:
             tool_info = _DYNAMIC_TOOLS[action]
         if not tool_info:
-            error_msg = f"错误: 未知工具 '{action}'，可用工具: {list(self.tools.keys()) + list(_DYNAMIC_TOOLS.keys())}"
+            all_tools = list(self.tools.keys())
+            try:
+                all_tools += list(_DYNAMIC_TOOLS.keys())
+            except Exception:
+                pass
+            error_msg = f"错误: 未知工具 '{action}'，可用工具: {all_tools}"
             if tracker:
                 tracker.record(action, action_input, False, error_msg, error=error_msg)
             return error_msg

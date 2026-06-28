@@ -29,10 +29,11 @@ class ToolRegistry:
         result = registry.execute_sync("read_file", {"file_path": "app.py"}, context)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, session_id: str = "") -> None:
         self._tools: dict[str, BaseTool] = {}
         self._sync_tools: dict[str, type] = {}  # 内置同步工具类
         self._dynamic_tools: dict[str, dict] = {}  # {handler, description, params}
+        self.session_id = session_id
         self._init_builtins()
 
     def _init_builtins(self) -> None:
@@ -198,13 +199,18 @@ class ToolRegistry:
         return self.has(name)
 
 
-# 全局单例
-_registry: ToolRegistry | None = None
+# 全局实例（向后兼容，逐步迁移到会话作用域实例）
+_global_instance: ToolRegistry | None = None
 
 
 def get_registry() -> ToolRegistry:
-    global _registry
-    if _registry is None:
-        _registry = ToolRegistry()
-    return _registry
+    """获取全局 ToolRegistry 实例（向后兼容）。
+
+    新代码应通过构造函数注入 ToolRegistry 实例，
+    而非依赖此全局单例。
+    """
+    global _global_instance
+    if _global_instance is None:
+        _global_instance = ToolRegistry()
+    return _global_instance
 

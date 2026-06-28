@@ -20,24 +20,46 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 动态工具注册表
+# 动态工具注册表（委托到 ToolRegistry）
 # ═══════════════════════════════════════════════════════════════
 
+# _DYNAMIC_TOOLS 保留作为向后兼容的代理字典
+# 新代码应通过 ToolRegistry.register_dynamic() 注册
 _DYNAMIC_TOOLS: dict[str, dict] = {}
 
 
+def _get_registry():
+    """懒加载 ToolRegistry（避免循环导入）。"""
+    from omniagent.tools.registry import get_registry
+    return get_registry()
+
+
 def register_dynamic_tool(name: str, handler, description: str, params: dict) -> None:
-    """注册一个动态工具，之后可通过 ToolNode(action_type=name) 调用。"""
+    """注册一个动态工具，同时写入 ToolRegistry 和本地 _DYNAMIC_TOOLS（向后兼容）。"""
     _DYNAMIC_TOOLS[name] = {
         "handler": handler,
         "description": description,
         "params": params,
     }
+    # 同步到 ToolRegistry
+    try:
+        _get_registry().register_dynamic(name, handler, description, params)
+    except Exception:
+        pass  # ToolRegistry 可能尚未初始化
     logger.debug(f"[DynamicTool] 注册工具: {name}")
 
 
 def get_dynamic_tool_schema(name: str) -> dict | None:
     """获取动态工具的描述（用于注入到 LLM 工具列表）。"""
+    # 优先从 ToolRegistry 查询
+    try:
+        registry = _get_registry()
+        info = registry._dynamic_tools.get(name)
+        if info:
+            return {"name": name, "description": info["description"], "params": info["params"]}
+    except Exception:
+        pass
+    # 回退到本地
     info = _DYNAMIC_TOOLS.get(name)
     if not info:
         return None
@@ -181,7 +203,24 @@ class ToolNode(BaseNode):
         except (ImportError, ValueError) as e:
             logger.debug(f"ToolRegistry 调度失败: {e}")
 
-        # ── 路径 2: 动态工具（运行时注册的自定义工具）──
+        # ── 路径 2: 动态工具（优先 ToolRegistry，回退本地 _DYNAMIC_TOOLS）──
+        try:
+            dynamic = registry._dynamic_tools.get(self.action_type)
+            if dynamic:
+                try:
+                    result = dynamic["handler"](context)
+                    return result if isinstance(result, dict) else {
+                        "action_type": self.action_type, "success": True,
+                        "content": str(result),
+                    }
+                except Exception as e:
+                    return {
+                        "action_type": self.action_type, "success": False,
+                        "error": str(e),
+                    }
+        except Exception:
+            pass
+        # 回退到本地 _DYNAMIC_TOOLS
         dynamic = _DYNAMIC_TOOLS.get(self.action_type)
         if dynamic:
             try:

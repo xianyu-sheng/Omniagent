@@ -16,20 +16,40 @@ from omniagent.tools.builtin.base import BaseTool
 
 logger = logging.getLogger(__name__)
 
-# ── 动态工具注册表（从 ToolNode 迁移）──
+# ── 动态工具注册表（统一委托到 ToolRegistry）──
 _DYNAMIC_TOOLS: dict[str, dict] = {}
 
 
+def _get_registry():
+    """懒加载 ToolRegistry（避免循环导入）。"""
+    from omniagent.tools.registry import get_registry
+    return get_registry()
+
+
 def register_dynamic_tool(name: str, handler, description: str, params: dict) -> None:
+    """注册动态工具到 ToolRegistry（并保留本地副本向后兼容）。"""
     _DYNAMIC_TOOLS[name] = {"handler": handler, "description": description, "params": params}
+    try:
+        _get_registry().register_dynamic(name, handler, description, params)
+    except Exception:
+        pass
 
 
 def get_dynamic_tool_schema(name: str) -> dict | None:
+    """获取动态工具 schema（优先 ToolRegistry）。"""
+    try:
+        registry = _get_registry()
+        info = registry._dynamic_tools.get(name)
+        if info:
+            return {"name": name, "description": info["description"], "params": info["params"]}
+    except Exception:
+        pass
     info = _DYNAMIC_TOOLS.get(name)
     return {"name": name, "description": info["description"], "params": info["params"]} if info else None
 
 
 def list_dynamic_tools() -> list[str]:
+    """列出所有动态工具名。"""
     return list(_DYNAMIC_TOOLS.keys())
 
 

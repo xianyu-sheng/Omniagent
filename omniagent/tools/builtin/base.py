@@ -35,7 +35,11 @@ from omniagent.tools.security import (
 
 
 class BaseTool:
-    """所有工具的抽象基类。"""
+    """所有内置工具的基类（同步执行，带异步 invoke 包装器）。
+
+    每个工具子类实现 execute(context) -> dict，
+    基类提供 async invoke(params) -> ToolResult 用于统一接口。
+    """
 
     # 子类必须覆盖
     name: str = ""
@@ -62,6 +66,41 @@ class BaseTool:
     def execute(self, context: AgentContext) -> dict[str, Any]:
         """执行工具操作，返回 {"success": bool, ...} 标准字典。"""
         raise NotImplementedError(f"{self.__class__.__name__}.execute()")
+
+    # ── 统一接口包装器 ──
+
+    async def invoke(self, params: dict[str, object]) -> "ToolResult":
+        """将 legacy execute(context) 模式包装为统一 async invoke(params) 接口。
+
+        这是连接旧版同步工具和新版异步 ToolRegistry 的桥接层。
+
+        Args:
+            params: 工具参数字典（会设置到 self._extra 中）
+
+        Returns:
+            ToolResult 统一执行结果
+        """
+        from omniagent.tools.base import ToolResult
+
+        # 将 params 合并到 self._extra 供 execute() 使用
+        for k, v in params.items():
+            self._extra[k] = v
+
+        ctx = AgentContext()
+        try:
+            result = self.execute(ctx)
+            success = result.get("success", False)
+            content = result.get("content", result.get("error", str(result)))
+            if success:
+                return ToolResult.ok(str(content))
+            return ToolResult.error(
+                str(content),
+                error_type=result.get("error_type", "runtime_error"),
+            )
+        except PermissionError as e:
+            return ToolResult.permission_denied(str(e))
+        except Exception as e:
+            return ToolResult.error(str(e))
 
     # ── 工具方法 ──
 
