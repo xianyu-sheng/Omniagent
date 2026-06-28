@@ -5,10 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omniagent-cli"
 version = "0.1.0"
-description = "A decoupled, config-driven multi-model AI programming Agent scheduling engine"
+description = "Local multi-model AI Coding Agent CLI with ReAct, Plan-Execute, MCP tools, memory & TUI"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [
+    {name = "Xianyu Sheng", url = "https://github.com/xianyu-sheng"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "httpx>=0.27.0",
     "prompt_toolkit>=3.0.0",
@@ -22,16 +39,21 @@ dev = [
     "pytest>=8.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/xianyu-sheng/omniagent"
+Repository = "https://github.com/xianyu-sheng/omniagent"
+Issues = "https://github.com/xianyu-sheng/omniagent/issues"
+
 [project.scripts]
 omniagent = "omniagent.main:cli"
 omniagent-core = "omniagent.core.app:run"
 omniagent-tui = "omniagent.tui.app:start_tui"
 
 # ════════════════════════════════════════════════════════════
-# KamaClaude 借鉴: 工程质量管理
+# Engineering Quality Configuration
 # ════════════════════════════════════════════════════════════
 
-# ── Ruff: 快速 linter + import 排序 + 格式化 ──
+# ── Ruff: fast linter + import sorting + formatting ──
 [tool.ruff]
 src = ["."]
 line-length = 100
@@ -40,32 +62,19 @@ exclude = [".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__",
 
 [tool.ruff.lint]
 select = [
-    # pycodestyle errors
-    "E",
-    # Pyflakes
-    "F",
-    # isort (import sorting)
-    "I",
-    # pyupgrade
-    "UP",
-    # flake8-bugbear (common bugs)
-    "B",
-    # flake8-comprehensions
-    "C4",
-    # flake8-simplify
-    "SIM",
-    # Ruff-specific rules
-    "RUF",
-    # flake8-print
-    "T20",
-    # flake8-return
-    "RET",
-    # flake8-errmsg
-    "EM",
-    # flake8-no-pep420
-    "INP",
-    # Perflint
-    "PERF",
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear (common bugs)
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RUF", # Ruff-specific rules
+    "T20", # flake8-print
+    "RET", # flake8-return
+    "EM",  # flake8-errmsg
+    "INP", # flake8-no-pep420
+    "PERF",# Perflint
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
@@ -81,8 +90,8 @@ fixable = ["ALL"]
 "tests/**/*.py" = ["S101", "S311", "T20"]
 "omniagent/__init__.py" = ["F401"]
 "__init__.py" = ["F401"]
-"omniagent/tools/**/*.py" = ["RUF012"]  # BaseTool input_schema 设计上就是类级别字典
-"omniagent/engine/checkpoint.py" = ["UP017"]  # timezone.utc 兼容 3.10
+"omniagent/tools/**/*.py" = ["RUF012"]
+"omniagent/engine/checkpoint.py" = ["UP017"]
 
 [tool.ruff.lint.isort]
 force-single-line = false
@@ -97,7 +106,7 @@ indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
 
-# ── Mypy: 静态类型检查 ──
+# ── Mypy: static type checking ──
 [tool.mypy]
 python_version = "3.10"
 strict = true
@@ -113,7 +122,6 @@ check_untyped_defs = true
 no_implicit_optional = true
 exclude = ["tests/", "build/", ".venv/", ".claude/"]
 
-# 允许新模块 strict，老模块逐步迁移
 [[tool.mypy.overrides]]
 module = [
     "omniagent.engine.checkpoint",
@@ -138,10 +146,6 @@ ignore_errors = true
 [tool.setuptools.packages.find]
 include = ["omniagent*"]
 
-# ── pytest: Python 3.14 兼容性配置 ──
-# pytest 9.x 的 capture 插件在 Python 3.14 上存在 tempfile 清理
-# 时序问题，导致 pytest 退出时崩溃 (ValueError: I/O operation on closed file)。
-# 禁用 capture 插件作为临时修复，待 pytest 上游修复后移除。
 [tool.pytest.ini_options]
 addopts = "-p no:capture"
 asyncio_mode = "auto"
