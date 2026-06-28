@@ -1009,12 +1009,24 @@ class REPL:
         self._sigint_count = 0
 
         callback = self._make_callback()
-        engine = ReActEngine(
-            model_priority=model_ids,
-            max_iterations=iterations,
-            callback=callback,
-            interrupt_event=self._interrupt_event,
-        )
+        # Headless 模式：提高强制合成阈值，防止分析类任务陷入无限探索
+        headless_cap = getattr(self, '_headless_max_iterations', None)
+        if headless_cap is not None:
+            engine = ReActEngine(
+                model_priority=model_ids,
+                max_iterations=iterations,
+                callback=callback,
+                interrupt_event=self._interrupt_event,
+                force_synthesis_threshold=max(3, int(0.30 * iterations)),
+                hurry_warning_threshold=max(4, int(0.40 * iterations)),
+            )
+        else:
+            engine = ReActEngine(
+                model_priority=model_ids,
+                max_iterations=iterations,
+                callback=callback,
+                interrupt_event=self._interrupt_event,
+            )
         try:
             result = engine.run(user_input, self.agent_context)
             if self._interrupt_event.is_set():
