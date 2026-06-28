@@ -12,6 +12,7 @@ from typing import Any
 from omniagent.engine.base_engine import BaseEngine
 from omniagent.engine.callbacks import ConsoleCallback, EngineCallback, SilentCallback
 from omniagent.engine.context import AgentContext
+from omniagent.engine.verify import format_verification_for_review, verify_execution
 from omniagent.utils.llm_client import chat_completion
 from omniagent.utils.response_adapter import parse_review
 
@@ -105,8 +106,20 @@ class ReflectionEngine(BaseEngine):
                 # Execute
                 output = self._execute(user_input, feedback, context)
 
-                # Review
-                review = self._review(user_input, output)
+                # Auto-Verify: 客观检查文件存在性 + Python 语法
+                verify_result = verify_execution(output)
+                verify_text = format_verification_for_review(verify_result)
+
+                # Review (注入验证结果)
+                review_input = output
+                if verify_text:
+                    review_input = output + verify_text
+                    logger.debug(
+                        "验证: %d 检查, %d 通过, %d 失败",
+                        verify_result["checks"], verify_result["passed"],
+                        verify_result["failed"],
+                    )
+                review = self._review(user_input, review_input)
                 score = review.get("score", 0)
                 passed = review.get("pass") and score >= self.pass_threshold
 
@@ -119,6 +132,9 @@ class ReflectionEngine(BaseEngine):
 
                 feedback = review.get("feedback", "请改进输出质量")
                 issues = review.get("issues", [])
+                # 自动验证发现的问题也加入反馈
+                if verify_result["issues"]:
+                    issues = list(issues) + verify_result["issues"]
                 logger.debug(f"审查未通过: {feedback}")
 
                 if issues:
