@@ -990,6 +990,13 @@ class REPL:
         from omniagent.engine.react_engine import ReActEngine
 
         iterations = self._estimate_react_iterations(user_input)
+        # Headless 模式：限制迭代上限，防止分析类任务陷入无限探索
+        headless_cap = getattr(self, '_headless_max_iterations', None)
+        if headless_cap is not None and iterations > headless_cap:
+            logger.info(
+                "Headless: 迭代数从 %d 限制到 %d (防止探索陷阱)", iterations, headless_cap
+            )
+            iterations = headless_cap
         console.print(ModeHeader("ReAct", iterations=iterations))
 
         # 追踪引擎状态
@@ -1788,6 +1795,7 @@ def run_headless(
     system_prompt: str | None = None,
     config_path: str | None = None,
     verbose: bool = False,
+    max_iterations: int | None = None,
 ) -> bool:
     """非交互式单任务执行 — 供 Agent-hub 等调度系统通过 CLI Bridge 调用。
 
@@ -1804,6 +1812,7 @@ def run_headless(
         system_prompt: 自定义系统提示词
         config_path: 模型配置文件路径
         verbose: 详细日志模式
+        max_iterations: 最大迭代次数（None=自动估算，headless 建议 ≤10）
 
     Returns:
         True 表示任务执行成功，False 表示失败
@@ -1900,8 +1909,16 @@ def run_headless(
     # 必须在 REPL 创建之后设置，因为 REPL.__init__ 会注册自己的 _approval_handler
     ToolNode.set_approval_handler(lambda tool_name, params_preview: True)
 
+    # ── Headless 迭代上限：分析类任务在 headless 模式下容易陷入探索陷阱 ──
+    # （反复读取文件而不产出 final_answer），因此限制最大迭代数。
+    # 调用方可显式传入 max_iterations 覆盖，否则默认 10（vs 交互模式的 12-20）。
+    if max_iterations is not None:
+        repl._headless_max_iterations = max_iterations
+    else:
+        repl._headless_max_iterations = 10
+
     # ── 执行任务 ──
-    logger.info("Headless 执行: mode=%s goal=%s", mode, goal[:100])
+    logger.info("Headless 执行: mode=%s goal=%s max_iter=%d", mode, goal[:100], repl._headless_max_iterations)
     try:
         repl._handle_chat(goal)
     except Exception as e:
