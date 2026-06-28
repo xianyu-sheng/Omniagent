@@ -1173,6 +1173,30 @@ class ReActEngine:
 
                 logger.debug(f"ReAct 思考: {thought}")
                 logger.debug(f"ReAct 行动: {action}({action_input})")
+
+                # ── Headless 探索硬阻止：超过合成阈值后拒绝纯探索工具 ──
+                # 防止模型在 list_files/read_file/search_files 循环中耗尽预算
+                EXPLORATION_TOOLS = {"read_file", "list_files", "search_files", "github_fetch"}
+                if remaining <= self.force_synthesis_threshold and action in EXPLORATION_TOOLS:
+                    obs_summary = _build_observation_summary(messages, tracker)
+                    block_msg = (
+                        f"🛑 探索预算已耗尽（剩余 {remaining} 轮）。"
+                        f"你不能再使用 {action} 读取新文件。\n\n"
+                        f"## 已收集的所有数据\n{obs_summary}\n\n"
+                        f"直接输出 final_answer。格式：\n"
+                        f'{{"final_answer": "## 分析报告\\n\\n'
+                        f'(在此处用已收集的数据写出完整的、结构化的分析报告)"}}'
+                    )
+                    messages.append({"role": "user", "content": block_msg})
+                    self.callback.on_warning(
+                        f"探索预算耗尽，拒绝 {action}，强制要求 final_answer"
+                    )
+                    logger.warning(
+                        "ReAct: 第 %d 轮拒绝探索工具 %s，剩余 %d 轮，强制合成",
+                        i + 1, action, remaining,
+                    )
+                    continue  # 跳过工具执行，下一轮 LLM 必须输出 final_answer
+
                 self.callback.on_act(action, action_input)
 
                 # ── 使用统一 ToolExecutor（共享引擎级断路器，含权限检查+重试+验证）──
