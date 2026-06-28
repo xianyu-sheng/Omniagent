@@ -89,6 +89,10 @@ class REPL:
         # ── 系统提示词：PromptStore 优先，CLI flag 其次，兜底迁移 ──
         self.prompt_store = PromptStore()
         self.prompt_memory = PromptMemoryManager(self.prompt_store)
+
+        # ── 统一记忆接口（合并 MemoryStore + PromptStore 记忆层）──
+        from omniagent.repl.unified_memory import UnifiedMemory
+        self.unified_memory = UnifiedMemory(prompt_store=self.prompt_store)
         if system_prompt:
             self.system_prompt = system_prompt
         else:
@@ -1556,15 +1560,12 @@ class REPL:
             logger.debug(f"项目上下文检测失败: {e}")
 
     def _inject_memories(self, user_input: str) -> None:
-        """将相关记忆注入上下文。"""
+        """将相关记忆注入上下文（统一接口，合并 MemoryStore + PromptStore 记忆层）。"""
         try:
-            from omniagent.repl.memory import MemoryStore
-            store = MemoryStore()
-            relevant = store.get_relevant(user_input, limit=3)
-            if relevant:
-                memory_text = store.format_for_context(relevant)
+            memory_text = self.unified_memory.format_for_prompt(user_input)
+            if memory_text:
                 self.ctx_mgr.add_system_message(memory_text)
-                logger.debug(f"注入 {len(relevant)} 条相关记忆")
+                logger.debug("统一记忆注入完成")
         except Exception as e:
             logger.debug("记忆注入失败: %s", e)
 
@@ -1581,24 +1582,22 @@ class REPL:
             logger.debug("session notes injection failed: %s", e)
 
     def _inject_prompt_store_context(self, user_input: str) -> None:
-        """注入渐进式加载的 domain + memory 系统提示词。
+        """注入领域知识（domains/*.md）。
 
-        基于用户输入的相关性评分，从 PromptStore 按需加载领域知识和长期记忆，
-        在 token 预算内贪心选择相关性最高的条目。
+        记忆注入已由 UnifiedMemory 统一处理，此处仅注入领域知识层。
         """
         try:
             relevant = self.prompt_store.load_relevant_prompts(user_input)
-            # 过滤掉 master（已经在 REPL 启动时注入），只保留 domain 和 memory
-            supplementary = [e for e in relevant if e.category != "master"]
-            if supplementary:
-                context_text = self.prompt_store.format_for_context(supplementary)
+            # 仅注入领域知识（master 在启动时注入，记忆由 UnifiedMemory 处理）
+            domain_entries = [e for e in relevant if e.category == "domain"]
+            if domain_entries:
+                context_text = self.prompt_store.format_for_context(domain_entries)
                 if context_text:
                     self.ctx_mgr.add_system_message(context_text)
-                    domains = [e.metadata.domain for e in supplementary if e.category == "domain"]
-                    if domains:
-                        logger.debug("注入领域提示: %s", ", ".join(domains))
+                    domains = [e.metadata.domain for e in domain_entries]
+                    logger.debug("注入领域提示: %s", ", ".join(domains))
         except Exception as e:
-            logger.debug("PromptStore 注入失败: %s", e)
+            logger.debug("PromptStore 领域注入失败: %s", e)
 
     def _evaluate_and_persist(self, user_input: str) -> None:
         """执行后自主评估：检测值得持久化的学习，写入 PromptStore。

@@ -38,11 +38,18 @@ class AgentContext:
         self._history.append(copy.copy(self._store))
 
     def set_conversation_messages(self, messages: list[dict[str, str]]) -> None:
-        """设置多轮对话历史（由 REPL 层注入）。"""
+        """设置多轮对话历史（由 REPL 层注入）。
+
+        Deprecated: 对话历史应通过 ContextManager 管理，此方法保留用于向后兼容。
+        """
         self._conversation_messages = messages
 
     def get_conversation_messages(self) -> list[dict[str, str]]:
-        """获取多轮对话历史。"""
+        """获取多轮对话历史。
+
+        Deprecated: 引擎应通过 BaseEngine._inject_history() 获取对话历史。
+        此方法保留用于向后兼容。
+        """
         return self._conversation_messages
 
     def to_dict(self) -> dict[str, Any]:
