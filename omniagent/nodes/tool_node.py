@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from omniagent.engine.context import AgentContext
+from omniagent.utils.llm_client import _create_http_client
 from omniagent.nodes.base import BaseNode
 
 logger = logging.getLogger(__name__)
@@ -1400,7 +1401,7 @@ class ToolNode(BaseNode):
 
         try:
             import httpx
-            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+            with _create_http_client(timeout=self.timeout, follow_redirects=True) as client:
                 resp = client.get(url, headers={"User-Agent": "OmniAgent-CLI/0.2"})
                 resp.raise_for_status()
 
@@ -1544,7 +1545,7 @@ class ToolNode(BaseNode):
             if action == "list_files":
                 # 使用 GitHub API 获取文件树
                 api_url = f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
-                with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+                with _create_http_client(timeout=self.timeout, follow_redirects=True) as client:
                     resp = client.get(api_url, headers=headers)
                     if resp.status_code == 404:
                         # 尝试 master 分支
@@ -1580,7 +1581,7 @@ class ToolNode(BaseNode):
                     }
 
                 raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{github_path}"
-                with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+                with _create_http_client(timeout=self.timeout, follow_redirects=True) as client:
                     resp = client.get(raw_url, headers=headers)
                     if resp.status_code == 404:
                         # 尝试 master 分支
@@ -1602,7 +1603,7 @@ class ToolNode(BaseNode):
             elif action == "fetch_readme":
                 for readme_name in ["README.md", "readme.md", "README.rst", "README"]:
                     raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{readme_name}"
-                    with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+                    with _create_http_client(timeout=self.timeout, follow_redirects=True) as client:
                         resp = client.get(raw_url, headers=headers)
                         if resp.status_code == 200:
                             text = resp.text

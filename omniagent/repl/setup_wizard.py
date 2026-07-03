@@ -8,7 +8,6 @@ Setup Wizard — 交互式配置引导。
 from __future__ import annotations
 
 import sys
-import msvcrt
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -32,10 +31,16 @@ console = Console()
 
 def _masked_input(prompt_text: str) -> str:
     """逐字符读取输入，实时显示 * 号掩码。回车确认，退格删除。
-    粘贴时只取第一行（避免粘贴多行导致重复）。"""
-    import msvcrt
-    import sys
+    粘贴时只取第一行（避免粘贴多行导致重复）。
+    Linux/macOS 使用 getpass 实现安全的密码输入。"""
+    if sys.platform != "win32":
+        import getpass
+        try:
+            return getpass.getpass(f"{prompt_text}: ")
+        except (KeyboardInterrupt, EOFError):
+            return ""
 
+    import msvcrt
     sys.stdout.write(f"{prompt_text}: ")
     sys.stdout.flush()
     chars: list[str] = []
@@ -63,6 +68,12 @@ def _masked_input(prompt_text: str) -> str:
             sys.stdout.write('*')
             sys.stdout.flush()
     return ''.join(chars)
+
+
+def _clean_api_key(raw: str) -> str:
+    """清理粘贴 API Key 时常见的空白、引号和多行内容。"""
+    first_line = raw.strip().splitlines()[0].strip() if raw.strip() else ""
+    return first_line.strip().strip("'\"").strip()
 
 
 def interactive_setup(registry: ModelRegistry) -> None:
@@ -130,10 +141,10 @@ def _setup_api_key() -> None:
     console.print(f"  环境变量: [dim]{provider.env_key}[/dim]")
     console.print(f"  可用模型: [dim]{', '.join(provider.models)}[/dim]\n")
 
-    api_key = _masked_input(f"请输入 {provider.name} 的 API Key（输入可见，回车确认）")
+    api_key = _clean_api_key(_masked_input(f"请输入 {provider.name} 的 API Key（可粘贴，输入会显示，回车确认）"))
 
-    if api_key.strip():
-        set_provider_key(provider.key, api_key.strip())
+    if api_key:
+        set_provider_key(provider.key, api_key)
         console.print(f"\n[green]已保存 {provider.name} 的 API Key[/green]\n")
     else:
         console.print("\n[yellow]已取消[/yellow]\n")
@@ -156,7 +167,8 @@ def _show_configured() -> None:
 
     for p in configured:
         key_display = p.api_key[:8] + "****" + p.api_key[-4:] if len(p.api_key) > 12 else "****"
-        table.add_row(p.name, key_display, ", ".join(p.models[:4]))
+        models = ", ".join(p.models[:4]) if p.models else f"获取失败: {p.model_error or '未知错误'}"
+        table.add_row(p.name, key_display, models)
 
     console.print(table)
     console.print()
@@ -183,7 +195,7 @@ def _select_model(registry: ModelRegistry) -> None:
     idx = 1
     for p in configured:
         if not p.models:
-            table.add_row("-", p.name, "实时获取失败", "请检查 API Key / 网络 / base_url")
+            table.add_row("-", p.name, "实时获取失败", p.model_error or "请检查 API Key / 网络 / base_url")
             continue
         for m in p.models:
             model_id = f"{p.key}/{m}"
@@ -196,7 +208,7 @@ def _select_model(registry: ModelRegistry) -> None:
     console.print()
 
     if not all_models:
-        console.print("[yellow]未能实时获取任何模型，请检查 API Key、网络或厂商 base_url[/yellow]\n")
+        console.print("[yellow]未能实时获取任何模型，请检查上方错误原因[/yellow]\n")
         return
 
     choice = IntPrompt.ask(

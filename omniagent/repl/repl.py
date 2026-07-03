@@ -263,19 +263,17 @@ class REPL:
         console.print()
 
     def _read_input(self) -> str:
-        """读取用户输入。Shift+Enter 换行，Enter 发送。
+        """读取用户输入。Shift+Enter / Alt+Enter 换行，Enter 发送。
 
         Windows: msvcrt.getwch() + GetAsyncKeyState 检测 Shift，
                  Console API 操作光标（兼容所有 Windows 终端）。
-        POSIX:   input() 回退（不支持 Shift+Enter）。
+        Linux/macOS: termios 原始模式，支持 Alt+Enter 换行、
+                 方向键、Home/End、粘贴多行内容。
         """
         import sys
 
         if sys.platform != "win32":
-            try:
-                return input("\033[1;36mYou\033[0m: ")
-            except EOFError:
-                raise KeyboardInterrupt
+            return self._read_input_unix()
 
         # ── Windows: 逐字符读取 ──
         import ctypes
@@ -449,6 +447,201 @@ class REPL:
         result = "\n".join(lines)
         sys.stdout.write("\n")
         return result.strip()
+
+    @staticmethod
+    def _read_input_unix() -> str:
+        """Linux/macOS 原始终端输入：支持 Alt+Enter 换行，方向键编辑。
+
+        使用时将终端设为原始模式，逐字节读取并解析 ANSI 转义序列。
+        粘贴多行文本会被自动检测并正确处理。
+        """
+        import sys
+        import termios
+        import tty
+        from select import select
+
+        PROMPT = "\033[1;36mYou\033[0m: "
+        CONTINUATION = "\033[90m...\033[0m "
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+
+            lines: list[str] = []
+            current_line: list[str] = []
+            cursor_pos: int = 0
+            prompt_active = True
+
+            def _redraw_line() -> None:
+                """清除当前行并重绘。"""
+                nonlocal prompt_active
+                # 光标移到行首
+                sys.stdout.write("\r")
+                # 清除到行尾
+                sys.stdout.write("\033[K")
+                # 打印提示符
+                if prompt_active and not lines:
+                    sys.stdout.write(PROMPT)
+                else:
+                    sys.stdout.write(CONTINUATION)
+                # 打印当前行内容
+                sys.stdout.write("".join(current_line))
+                # 光标定位
+                sys.stdout.write(f"\r\033[{len(_to_print(PROMPT if prompt_active and not lines else CONTINUATION)) + cursor_pos}C")
+                sys.stdout.flush()
+
+            def _to_print(s: str) -> str:
+                """剥离 ANSI 序列，计算可打印宽度（简化版）。"""
+                import re
+                return re.sub(r'\033\[[0-9;]*[a-zA-Z]', '', s)
+
+            def _prompt_width() -> int:
+                if prompt_active and not lines:
+                    return len(_to_print(PROMPT))
+                return len(_to_print(CONTINUATION))
+
+            def _move_cursor_to(target: int) -> None:
+                """移动光标到目标列（相对当前提示符后）。"""
+                nonlocal cursor_pos
+                pw = _prompt_width()
+                cursor_pos = max(0, min(target, len(current_line)))
+                sys.stdout.write(f"\r\033[{pw + cursor_pos}C")
+                sys.stdout.flush()
+
+            # 显示初始提示符
+            sys.stdout.write(PROMPT)
+            sys.stdout.flush()
+
+            # 缓冲区，用于累积多字节序列
+            seq_buffer = ""
+
+            while True:
+                # 用 select 检查是否有输入（超时处理粘贴检测）
+                if select([sys.stdin], [], [], 0.01)[0]:
+                    ch = sys.stdin.read(1)
+                else:
+                    continue
+
+                # 处理转义序列
+                if seq_buffer or ch == '\x1b':
+                    seq_buffer += ch
+                    if len(seq_buffer) == 1 and ch == '\x1b':
+                        continue  # 等待更多字节
+
+                    # 尝试匹配已知序列
+                    # Alt+Enter: \x1b\r
+                    if seq_buffer == '\x1b\r':
+                        # 插入换行
+                        lines.append("".join(current_line))
+                        current_line = []
+                        cursor_pos = 0
+                        sys.stdout.write("\r\n")
+                        sys.stdout.write(CONTINUATION)
+                        sys.stdout.flush()
+                        seq_buffer = ""
+                        continue
+
+                    # 方向键: \x1b[A (上), \x1b[B (下), \x1b[C (右), \x1b[D (左)
+                    if seq_buffer == '\x1b[A':    # Up — 忽略
+                        seq_buffer = ""
+                        continue
+                    if seq_buffer == '\x1b[B':    # Down — 忽略
+                        seq_buffer = ""
+                        continue
+                    if seq_buffer == '\x1b[C':    # Right
+                        if cursor_pos < len(current_line):
+                            cursor_pos += 1
+                            _move_cursor_to(cursor_pos)
+                        seq_buffer = ""
+                        continue
+                    if seq_buffer == '\x1b[D':    # Left
+                        if cursor_pos > 0:
+                            cursor_pos -= 1
+                            _move_cursor_to(cursor_pos)
+                        seq_buffer = ""
+                        continue
+
+                    # Home: \x1b[H 或 \x1b[1~
+                    if seq_buffer in ('\x1b[H', '\x1b[1~', '\x1bOH'):
+                        _move_cursor_to(0)
+                        seq_buffer = ""
+                        continue
+
+                    # End: \x1b[F 或 \x1b[4~ 或 \x1bOF
+                    if seq_buffer in ('\x1b[F', '\x1b[4~', '\x1bOF'):
+                        _move_cursor_to(len(current_line))
+                        seq_buffer = ""
+                        continue
+
+                    # Delete: \x1b[3~
+                    if seq_buffer == '\x1b[3~':
+                        if cursor_pos < len(current_line):
+                            current_line.pop(cursor_pos)
+                            _redraw_line()
+                        seq_buffer = ""
+                        continue
+
+                    # 未知转义序列 — 静默丢弃或超时后当作普通字符
+                    # 如果序列长度 >= 8 或超时，丢弃
+                    if len(seq_buffer) >= 8:
+                        seq_buffer = ""
+                        continue
+                    # 否则继续累积
+                    continue
+
+                # ── 普通字符处理 ──
+
+                if ch in ('\r', '\n'):
+                    # Enter → 提交
+                    # 将光标移到行尾
+                    _move_cursor_to(len(current_line))
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    break
+
+                elif ch == '\x03':   # Ctrl+C
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    raise KeyboardInterrupt
+
+                elif ch == '\x04':   # Ctrl+D
+                    if not current_line and not lines:
+                        # 空行 Ctrl+D → EOF
+                        sys.stdout.write("\r\n")
+                        sys.stdout.flush()
+                        raise KeyboardInterrupt
+                    # 否则当 Delete 处理
+                    if cursor_pos < len(current_line):
+                        current_line.pop(cursor_pos)
+                        _redraw_line()
+
+                elif ch in ('\x7f', '\x08'):  # Backspace
+                    if cursor_pos > 0:
+                        current_line.pop(cursor_pos - 1)
+                        _move_cursor_to(cursor_pos - 1)
+                        _redraw_line()
+
+                elif ch == '\t':     # Tab → 4 空格
+                    for _ in range(4):
+                        current_line.insert(cursor_pos, ' ')
+                    cursor_pos += 4
+                    _move_cursor_to(cursor_pos)
+                    _redraw_line()
+
+                elif ord(ch) >= 0x20:
+                    # 可见字符
+                    current_line.insert(cursor_pos, ch)
+                    cursor_pos += 1
+                    _redraw_line()
+
+            if current_line:
+                lines.append("".join(current_line))
+
+            return "\n".join(lines)
+
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def _handle_command(self, raw: str) -> bool:
         """处理斜杠命令。返回 True 表示需要退出。"""

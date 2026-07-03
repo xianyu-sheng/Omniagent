@@ -17,10 +17,13 @@ from urllib.parse import urlencode
 import httpx
 import yaml
 
+from omniagent.utils.llm_client import _create_http_client
+
 CREDENTIALS_PATH = Path.home() / ".omniagent" / "credentials.yaml"
 MODEL_LIST_TIMEOUT = 8.0
 
 logger = logging.getLogger(__name__)
+MODEL_FETCH_ERRORS: dict[str, str] = {}
 
 
 @dataclass
@@ -33,6 +36,7 @@ class ProviderInfo:
     models: list[str]       # 离线兜底模型列表（短名）
     api_key: str = ""       # 用户填入的 key
     model_list_path: str = "models"  # 支持 OpenAI 兼容 /models 时填入
+    model_error: str = ""    # 实时模型列表获取失败原因
 
 
 # ── 预设厂商 ──────────────────────────────────────────────
@@ -236,7 +240,9 @@ def _parse_model_payload(payload: Any) -> list[str]:
 
 def fetch_provider_models(provider: ProviderInfo, api_key: str) -> list[str]:
     """从厂商模型列表接口实时获取模型短名；失败时返回空列表。"""
+    MODEL_FETCH_ERRORS.pop(provider.key, None)
     if not api_key:
+        MODEL_FETCH_ERRORS[provider.key] = "API Key 为空"
         return []
 
     models: list[str] = []
@@ -244,23 +250,31 @@ def fetch_provider_models(provider: ProviderInfo, api_key: str) -> list[str]:
     after_id: str | None = None
     try:
         while True:
-            response = httpx.get(
-                _model_list_url(provider, after_id=after_id),
-                headers=_model_list_headers(provider, api_key),
-                timeout=MODEL_LIST_TIMEOUT,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            for model in _parse_model_payload(payload):
-                if model not in seen:
-                    models.append(model)
-                    seen.add(model)
+            with _create_http_client(timeout=MODEL_LIST_TIMEOUT) as client:
+                response = client.get(
+                    _model_list_url(provider, after_id=after_id),
+                    headers=_model_list_headers(provider, api_key),
+                )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    body = e.response.text.strip().replace("\n", " ")
+                    detail = body[:160] if body else e.response.reason_phrase
+                    MODEL_FETCH_ERRORS[provider.key] = f"HTTP {e.response.status_code}: {detail}"
+                    logger.debug("获取 %s 实时模型列表失败: %s", provider.key, MODEL_FETCH_ERRORS[provider.key])
+                    return []
+                payload = response.json()
+                for model in _parse_model_payload(payload):
+                    if model not in seen:
+                        models.append(model)
+                        seen.add(model)
 
-            if not (isinstance(payload, dict) and payload.get("has_more") and payload.get("last_id")):
-                break
-            after_id = str(payload["last_id"])
+                if not (isinstance(payload, dict) and payload.get("has_more") and payload.get("last_id")):
+                    break
+                after_id = str(payload["last_id"])
     except Exception as e:
-        logger.debug("获取 %s 实时模型列表失败: %s", provider.key, e)
+        MODEL_FETCH_ERRORS[provider.key] = f"{e.__class__.__name__}: {e}"
+        logger.debug("获取 %s 实时模型列表失败: %s", provider.key, MODEL_FETCH_ERRORS[provider.key])
         return []
 
     return models
@@ -318,6 +332,7 @@ def get_configured_providers(*, refresh_models: bool = True) -> list[ProviderInf
                 name=info.name, key=info.key, base_url=info.base_url,
                 env_key=info.env_key, models=models, api_key=creds[key],
                 model_list_path=info.model_list_path,
+                model_error=MODEL_FETCH_ERRORS.get(key, ""),
             )
             configured.append(info_copy)
     return configured

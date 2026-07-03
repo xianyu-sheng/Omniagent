@@ -17,6 +17,8 @@ from typing import Any
 
 import httpx
 
+from omniagent.utils.llm_client import _create_http_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -172,7 +174,7 @@ class SSETransport(MCPTransport):
     def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
         self.url = url
         self.headers = headers or {}
-        self._client = httpx.Client(timeout=30.0)
+        self._client = _create_http_client(timeout=30.0)
         self._request_id = 0
 
     def send(self, message: dict[str, Any]) -> None:

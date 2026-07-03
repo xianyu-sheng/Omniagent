@@ -22,6 +22,50 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+
+# ── 安全代理处理 ────────────────────────────────────────────
+
+def _build_proxy_config() -> httpx.Proxy | None:
+    """
+    从环境变量构建 httpx 兼容的代理配置。
+
+    httpx 不支持 socks:// 代理，而部分用户环境可能设置了
+    ALL_PROXY=socks://...（如 Clash 的混合端口），直接传给 httpx 会抛
+    ValueError: Unknown scheme for proxy URL。
+
+    此函数优先使用 HTTPS_PROXY/HTTP_PROXY，忽略不支持的 socks://。
+    """
+    for env_name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        val = os.getenv(env_name)
+        if val and (val.startswith("http://") or val.startswith("https://")):
+            return httpx.Proxy(url=val)
+
+    # ALL_PROXY 只在使用 http/https 协议时才接受
+    for env_name in ("ALL_PROXY", "all_proxy"):
+        val = os.getenv(env_name)
+        if val and (val.startswith("http://") or val.startswith("https://")):
+            return httpx.Proxy(url=val)
+
+    return None
+
+
+def _create_http_client(
+    timeout: float = 120.0,
+    proxy: httpx.Proxy | None | object = _build_proxy_config,  # sentinel
+    **kwargs: Any,
+) -> httpx.Client:
+    """
+    创建带安全代理配置的 httpx.Client。
+
+    自动从环境变量读取代理设置，过滤掉 httpx 不支持的 socks:// 协议。
+    可通过 proxy=None 强制不走代理。
+    额外关键字参数透传给 httpx.Client（如 follow_redirects）。
+    """
+    if proxy is _build_proxy_config:
+        proxy = _build_proxy_config()
+    return httpx.Client(timeout=timeout, proxy=proxy, **kwargs)
+
+
 # ── 全局凭证路径 ──────────────────────────────────────────
 _CREDENTIALS_PATH = Path.home() / ".omniagent" / "credentials.yaml"
 
@@ -228,7 +272,7 @@ def _call_openai_compat(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
-    with httpx.Client(timeout=timeout) as client:
+    with _create_http_client(timeout=timeout) as client:
         resp = client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
@@ -287,7 +331,7 @@ def _call_anthropic(
     if system_text:
         payload["system"] = system_text
 
-    with httpx.Client(timeout=timeout) as client:
+    with _create_http_client(timeout=timeout) as client:
         resp = client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
@@ -340,7 +384,7 @@ def _stream_openai_compat(
         "temperature": temperature,
         "stream": True,
     }
-    with httpx.Client(timeout=timeout) as client:
+    with _create_http_client(timeout=timeout) as client:
         with client.stream("POST", url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
@@ -391,7 +435,7 @@ def _stream_anthropic(
     if system_text:
         payload["system"] = system_text
 
-    with httpx.Client(timeout=timeout) as client:
+    with _create_http_client(timeout=timeout) as client:
         with client.stream("POST", url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():

@@ -16,6 +16,41 @@ from omniagent.repl.context_manager import ContextManager
 from omniagent.repl.model_registry import ModelRegistry, BUILTIN_MODES
 
 
+# ── Mock 辅助函数 ──────────────────────────────────────────
+
+def _make_mock_client(fake_get):
+    """
+    创建一个假的 _create_http_client 工厂，用于在测试中替换
+    provider_registry._create_http_client。
+
+    fake_get(url, headers) -> FakeResponse 是一个可调用对象，
+    返回模拟的 HTTP 响应。
+    """
+    from contextlib import contextmanager
+
+    class MockClient:
+        def __init__(self, get_fn):
+            self._get_fn = get_fn
+            self._calls: list[tuple] = []
+
+        def get(self, url, *, headers):
+            self._calls.append((url, headers))
+            return self._get_fn(url, headers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    @contextmanager
+    def _factory(*args, **kwargs):
+        client = MockClient(fake_get)
+        yield client
+
+    return _factory
+
+
 # ── ContextManager 测试 ──────────────────────────────────
 
 class TestContextManager:
@@ -259,12 +294,12 @@ class TestProviderRegistry:
 
         calls = []
 
-        def fake_get(url, headers, timeout):
-            calls.append((url, headers, timeout))
+        def fake_get(url, headers):
+            calls.append((url, headers))
             return FakeResponse()
 
         monkeypatch.setattr(provider_registry, "load_credentials", lambda: {"openai": "sk-test"})
-        monkeypatch.setattr(provider_registry.httpx, "get", fake_get)
+        monkeypatch.setattr(provider_registry, "_create_http_client", _make_mock_client(fake_get))
 
         configured = provider_registry.get_configured_providers()
         openai = next(p for p in configured if p.key == "openai")
@@ -286,12 +321,12 @@ class TestProviderRegistry:
 
         calls = []
 
-        def fake_get(url, headers, timeout):
-            calls.append((url, headers, timeout))
+        def fake_get(url, headers):
+            calls.append((url, headers))
             return FakeResponse()
 
         monkeypatch.setattr(provider_registry, "load_credentials", lambda: {"deepseek": "sk-test"})
-        monkeypatch.setattr(provider_registry.httpx, "get", fake_get)
+        monkeypatch.setattr(provider_registry, "_create_http_client", _make_mock_client(fake_get))
 
         configured = provider_registry.get_configured_providers()
         deepseek = next(p for p in configured if p.key == "deepseek")
@@ -304,11 +339,11 @@ class TestProviderRegistry:
     def test_refresh_failure_does_not_show_stale_builtin_models(self, monkeypatch):
         import omniagent.repl.provider_registry as provider_registry
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers):
             raise provider_registry.httpx.ConnectError("network down")
 
         monkeypatch.setattr(provider_registry, "load_credentials", lambda: {"openai": "sk-test"})
-        monkeypatch.setattr(provider_registry.httpx, "get", fake_get)
+        monkeypatch.setattr(provider_registry, "_create_http_client", _make_mock_client(fake_get))
 
         configured = provider_registry.get_configured_providers()
         openai = next(p for p in configured if p.key == "openai")
@@ -346,11 +381,11 @@ class TestProviderRegistry:
         ]
         calls = []
 
-        def fake_get(url, headers, timeout):
-            calls.append((url, headers, timeout))
+        def fake_get(url, headers):
+            calls.append((url, headers))
             return FakeResponse(payloads[len(calls) - 1])
 
-        monkeypatch.setattr(provider_registry.httpx, "get", fake_get)
+        monkeypatch.setattr(provider_registry, "_create_http_client", _make_mock_client(fake_get))
 
         models = provider_registry.fetch_provider_models(
             provider_registry.PROVIDERS["anthropic"],

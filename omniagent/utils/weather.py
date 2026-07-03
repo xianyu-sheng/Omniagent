@@ -18,6 +18,8 @@ from typing import Any
 
 import httpx
 
+from omniagent.utils.llm_client import _create_http_client
+
 logger = logging.getLogger(__name__)
 
 # ── 常见城市中文名 → 拼音/英文映射 ──────────────────────────
@@ -154,7 +156,7 @@ def get_weather(city: str = "Beijing", lang: str = "zh") -> dict[str, Any]:
 
     try:
         url = f"https://wttr.in/{resolved}?format=j1&lang={lang}"
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        with _create_http_client(timeout=15.0, follow_redirects=True) as client:
             resp = client.get(url, headers={
                 "Accept-Language": "zh-CN,zh;q=0.9",
                 "User-Agent": "Mozilla/5.0",

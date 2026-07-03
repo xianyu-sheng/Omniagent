@@ -148,7 +148,7 @@ def _cmd_set_model(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
     idx = 1
     for p in configured:
         if not p.models:
-            table.add_row("-", p.name, "实时获取失败", "请检查 API Key / 网络 / base_url")
+            table.add_row("-", p.name, "实时获取失败", p.model_error or "请检查 API Key / 网络 / base_url")
             continue
         for m in p.models:
             model_id = f"{p.key}/{m}"
@@ -163,7 +163,9 @@ def _cmd_set_model(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
     console.print()
 
     if not all_models:
-        return "❌ 未能实时获取任何模型，请检查 API Key、网络或厂商 base_url"
+        errors = [f"{p.name}: {p.model_error}" for p in configured if p.model_error]
+        detail = "\n".join(errors) if errors else "请检查 API Key、网络或厂商 base_url"
+        return f"❌ 未能实时获取任何模型\n{detail}"
 
     try:
         choice = _IntPrompt.ask(
@@ -1180,7 +1182,15 @@ def _generate_shortcut_steps(description: str, registry=None) -> list[str]:
         if not model_ids:
             return []
 
-        prompt = f"""根据以下描述，生成一组 shell 命令（Windows PowerShell 兼容）。
+        import sys
+        if sys.platform == "win32":
+            shell_hint = "Windows PowerShell"
+            example = '["Write-Host \'hello\'", "Get-ChildItem"]'
+        else:
+            shell_hint = "Linux bash / macOS zsh"
+            example = '["echo \'hello\'", "ls -la"]'
+
+        prompt = f"""根据以下描述，生成一组 shell 命令（{shell_hint} 兼容）。
 
 描述: {description}
 
@@ -1189,7 +1199,7 @@ def _generate_shortcut_steps(description: str, registry=None) -> list[str]:
 - 命令要实用、安全
 - 只返回 JSON 数组，不要其他内容
 
-示例: ["echo 'hello'", "dir"]"""
+示例: {example}"""
 
         messages = [
             {"role": "system", "content": "你是一个命令生成器。根据用户描述生成 shell 命令数组。只返回 JSON 数组。"},
