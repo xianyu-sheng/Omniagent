@@ -395,8 +395,18 @@ class PlanExecuteEngine:
         last_error = None
         for model_id in self.model_priority:
             try:
-                mt = max_tokens or getattr(self.model_configs.get(model_id), "max_tokens", None) or 8192
-                return chat_completion(model_id, messages, max_tokens=mt, temperature=0.3)
+                mc = self.model_configs.get(model_id)
+                mt = max_tokens or getattr(mc, "max_tokens", None) or 8192
+                # B7: 激活 ModelConfig.api_key / base_url（每模型覆盖全局凭证与端点）
+                creds = None
+                base = None
+                if mc:
+                    base = getattr(mc, "base_url", "") or None
+                    mk = getattr(mc, "api_key", "") or ""
+                    if mk and "/" in model_id:
+                        creds = {model_id.split("/", 1)[0].lower(): mk}
+                return chat_completion(model_id, messages, max_tokens=mt, temperature=0.3,
+                                       credentials=creds, base_url=base)
             except Exception as e:
                 last_error = e
                 logger.warning(f"模型 {model_id} 失败: {e}")

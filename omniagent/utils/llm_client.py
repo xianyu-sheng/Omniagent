@@ -170,7 +170,7 @@ def parse_model_id(model_id: str) -> tuple[str, str]:
     return provider.lower(), name
 
 
-def build_endpoint(model_id: str, credentials: dict[str, str] | None = None) -> ModelEndpoint:
+def build_endpoint(model_id: str, credentials: dict[str, str] | None = None, base_url: str | None = None) -> ModelEndpoint:
     """根据 model_id 构建完整的调用端点信息。"""
     provider, model_name = parse_model_id(model_id)
     if provider not in _PROVIDER_DEFAULTS:
@@ -187,7 +187,7 @@ def build_endpoint(model_id: str, credentials: dict[str, str] | None = None) -> 
     return ModelEndpoint(
         provider=provider,
         model_name=model_name,
-        base_url=defaults["base_url"],
+        base_url=base_url or defaults["base_url"],
         api_key=api_key,
     )
 
@@ -200,6 +200,7 @@ def chat_completion(
     messages: list[dict[str, str]],
     *,
     credentials: dict[str, str] | None = None,
+    base_url: str | None = None,
     max_tokens: int = 4096,
     temperature: float = 0.7,
     timeout: float = 120.0,
@@ -218,7 +219,7 @@ def chat_completion(
     """
     import time
 
-    endpoint = build_endpoint(model_id, credentials)
+    endpoint = build_endpoint(model_id, credentials, base_url)
     # B4: 按厂商输出上限钳制 max_tokens，防止 131072 等超限值引发 400 级联失败
     provider_cap = _PROVIDER_DEFAULTS.get(endpoint.provider, {}).get("max_output_tokens")
     if provider_cap and max_tokens > provider_cap:
@@ -361,6 +362,7 @@ def chat_completion_stream(
     messages: list[dict[str, str]],
     *,
     credentials: dict[str, str] | None = None,
+    base_url: str | None = None,
     max_tokens: int = 4096,
     temperature: float = 0.7,
     timeout: float = 300.0,
@@ -371,7 +373,7 @@ def chat_completion_stream(
     Yields:
         逐步生成的文本片段（delta）。
     """
-    endpoint = build_endpoint(model_id, credentials)
+    endpoint = build_endpoint(model_id, credentials, base_url)
 
     if endpoint.provider == "anthropic":
         yield from _stream_anthropic(endpoint, messages, max_tokens, temperature, timeout)
