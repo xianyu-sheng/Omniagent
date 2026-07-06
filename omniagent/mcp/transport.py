@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
+import select
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 
 import httpx
@@ -45,6 +47,9 @@ class StdioTransport(MCPTransport):
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._request_id = 0
+        # stdout 行缓冲：跨多次 _readline_with_timeout 调用保留未消费字节，
+        # 避免与 BufferedReader 内部缓冲冲突。
+        self._read_buf = bytearray()
         self._start()
 
     def _start(self) -> None:
@@ -83,23 +88,93 @@ class StdioTransport(MCPTransport):
             except Exception as e:
                 raise RuntimeError(f"MCP 发送失败: {e}")
 
-    def receive(self) -> dict[str, Any]:
-        """接收 JSON-RPC 消息。"""
+    def receive(self, timeout: float = 30.0) -> dict[str, Any]:
+        """接收 JSON-RPC 消息（带墙钟超时，避免 readline 无限阻塞）。"""
         if not self._proc or self._proc.poll() is not None:
             raise RuntimeError("MCP 子进程未运行")
 
         with self._lock:
+            deadline = time.monotonic() + timeout
+            line = self._readline_with_timeout(deadline)
+            if line is None:
+                raise RuntimeError(f"MCP 接收超时：{timeout}s 内无输出")
+            if line == "":
+                stderr = self._read_stderr_safely()
+                raise RuntimeError(f"MCP 子进程无输出（EOF）。stderr: {stderr[:500]}")
             try:
-                line = self._proc.stdout.readline()
-                if not line:
-                    stderr = self._proc.stderr.read() if self._proc.stderr else ""
-                    raise RuntimeError(f"MCP 子进程无输出。stderr: {stderr[:500]}")
                 return json.loads(line)
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"MCP 响应解析失败: {e}")
 
-    def request(self, method: str, params: dict[str, Any] | None = None, max_retries: int = 50) -> dict[str, Any]:
-        """发送请求并等待响应（原子操作）。"""
+    def _readline_with_timeout(self, deadline: float) -> str | None:
+        """从 stdout 读取一行，带整体 deadline 墙钟超时。
+
+        使用 select 等待数据可读，避免 ``readline()`` 在子进程挂起时无限阻塞
+        （B11）。返回值约定：
+          - 行字符串（含 ``\\n``，已 utf-8 解码）：读到完整一行；
+          - ``""``：遇到 EOF 且缓冲区无残留；
+          - ``None``：deadline 超时，未读到完整行。
+        """
+        stream = self._proc.stdout
+        try:
+            fd = stream.fileno()
+        except (AttributeError, OSError, ValueError):
+            return None
+        while True:
+            nl = self._read_buf.find(b"\n")
+            if nl >= 0:
+                line = bytes(self._read_buf[:nl + 1])
+                del self._read_buf[:nl + 1]
+                return line.decode("utf-8", errors="replace")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                ready, _, _ = select.select([fd], [], [], remaining)
+            except (OSError, ValueError):
+                return None
+            if not ready:
+                return None
+            try:
+                chunk = stream.buffer.read1(8192)
+            except Exception:
+                return None
+            if not chunk:
+                # EOF：返回缓冲区残留（无换行）或空串
+                if self._read_buf:
+                    line = bytes(self._read_buf)
+                    self._read_buf.clear()
+                    return line.decode("utf-8", errors="replace")
+                return ""
+            self._read_buf += chunk
+
+    def _read_stderr_safely(self) -> str:
+        """非阻塞读取 stderr 当前可读内容（仅用于错误诊断）。"""
+        if not self._proc or not self._proc.stderr:
+            return ""
+        try:
+            fd = self._proc.stderr.fileno()
+            chunks: list[bytes] = []
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0)
+                if not ready:
+                    break
+                data = self._proc.stderr.buffer.read1(4096)
+                if not data:
+                    break
+                chunks.append(data)
+            return b"".join(chunks).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def request(self, method: str, params: dict[str, Any] | None = None,
+                max_lines: int = 50, timeout: float = 30.0) -> dict[str, Any]:
+        """发送请求并等待响应（原子操作，带墙钟超时）。
+
+        - ``max_lines``：最多读取的行数上限（防止被无关通知/日志行无限消耗）。
+        - ``timeout``：整体墙钟超时（秒）；超时抛 ``RuntimeError``。
+          （B11：替代原先 ``max_retries`` 仅限行数、单行 readline 仍可无限阻塞的缺陷。）
+        """
         with self._lock:
             if not self._proc or self._proc.poll() is not None:
                 raise RuntimeError("MCP 子进程未运行")
@@ -121,12 +196,18 @@ class StdioTransport(MCPTransport):
             except Exception as e:
                 raise RuntimeError(f"MCP 发送失败: {e}")
 
-            # 等待响应（匹配 id），带重试上限
-            for _ in range(max_retries):
+            # 等待响应（匹配 id），带墙钟 deadline 与行数上限
+            deadline = time.monotonic() + timeout
+            for _ in range(max_lines):
+                line = self._readline_with_timeout(deadline)
+                if line is None:
+                    raise RuntimeError(
+                        f"MCP 请求超时：{timeout}s 内未收到 id={request_id} 的响应")
+                if line == "":
+                    stderr = self._read_stderr_safely()
+                    raise RuntimeError(
+                        f"MCP 子进程无输出（EOF）。stderr: {stderr[:500]}")
                 try:
-                    line = self._proc.stdout.readline()
-                    if not line:
-                        raise RuntimeError("MCP 子进程无输出")
                     response = json.loads(line)
                 except json.JSONDecodeError as e:
                     raise RuntimeError(f"MCP 响应解析失败: {e}")
@@ -137,7 +218,8 @@ class StdioTransport(MCPTransport):
                     logger.debug(f"MCP 通知: {response.get('method', 'unknown')}")
                     continue
 
-            raise RuntimeError(f"MCP 请求超时：未在 {max_retries} 次重试内收到响应")
+            raise RuntimeError(
+                f"MCP 请求超时：读取 {max_lines} 行后仍未收到 id={request_id} 的响应")
 
     def close(self) -> None:
         """关闭子进程。"""
