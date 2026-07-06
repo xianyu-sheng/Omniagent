@@ -27,8 +27,9 @@ class ModelConfig:
     alias: str = ""         # 简短别名，如 "claude", "gpt4"
     api_key: str = ""       # 可选，覆盖全局凭证
     base_url: str = ""      # 可选，自定义端点
-    max_tokens: int = 4096
+    max_tokens: int = 4096  # 生成输出上限（B4 钳制用）
     temperature: float = 0.7
+    context_window: int = 128000  # 上下文窗口（input+output 预算），供 ContextManager 注入（R4）
 
 
 @dataclass
@@ -102,11 +103,24 @@ class ModelRegistry:
         Args:
             model_id: "provider/model_name" 格式
             alias: 简短别名
-            **kwargs: api_key, base_url, max_tokens, temperature
+            **kwargs: api_key, base_url, max_tokens, temperature, context_window
         """
         config = ModelConfig(model_id=model_id, alias=alias, **kwargs)
         self.models[alias] = config
         return config
+
+    def context_window_for(self, aliases: list[str]) -> int:
+        """返回给定别名模型的上下文窗口最小值（瓶颈模型）；无有效值则 0。
+
+        R4：供 ContextManager 注入 max_tokens，使 needs_compact 按实际模型窗口
+        触发，而非 128000 硬编码（8k 模型永不触发 / 1M 模型过早压缩）。
+        """
+        windows = [
+            mc.context_window
+            for a in aliases
+            if (mc := self.models.get(a)) and getattr(mc, "context_window", 0) > 0
+        ]
+        return min(windows) if windows else 0
 
     def remove_model(self, alias: str) -> bool:
         """移除一个模型。"""
@@ -176,6 +190,7 @@ class ModelRegistry:
                     "base_url": m.base_url,
                     "max_tokens": m.max_tokens,
                     "temperature": m.temperature,
+                    "context_window": m.context_window,
                 }
                 for alias, m in self.models.items()
             },
@@ -208,6 +223,7 @@ class ModelRegistry:
                 base_url=mcfg.get("base_url", ""),
                 max_tokens=mcfg.get("max_tokens", 4096),
                 temperature=mcfg.get("temperature", 0.7),
+                context_window=mcfg.get("context_window", 128000),
             )
 
         # 加载角色

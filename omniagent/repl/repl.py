@@ -681,8 +681,21 @@ class REPL:
             console.print(Panel(output, title=f"[command]{cmd_name}[/command]", border_style="magenta"))
         return False
 
+    def _sync_context_window(self, model_aliases: list[str]) -> None:
+        """R4: 按激活模型的实际上下文窗口校准 ContextManager.max_tokens。
+
+        取激活模型中 context_window 的最小值（瓶颈模型），保证最小窗口模型
+        也不会超限；均未配置则保持默认。替代原先 128000 硬编码——8k 模型时
+        needs_compact 永不触发（实际已超限），1M 模型时过早压缩。
+        """
+        window = self.registry.context_window_for(model_aliases)
+        if window > 0:
+            self.ctx_mgr.max_tokens = window
+
     def _handle_chat(self, user_input: str) -> None:
         """处理多轮对话，支持 prompt 优化和多种思考范式。"""
+        # R4: 按激活模型上下文窗口校准 token 阈值（须在 needs_compact 之前）
+        self._sync_context_window(self.registry.get_role_priority("planner"))
         # 自动 compact 检查
         if self.ctx_mgr.needs_compact():
             console.print("[yellow]⚠️  对话历史较长，建议执行 /compact 压缩。[/yellow]")
