@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,65 @@ MAX_CONTINUATIONS = 3
 
 class ResponseTruncatedError(RuntimeError):
     """LLM 响应因 max_tokens 上限被截断，且续写次数耗尽仍不完整。"""
+
+
+# ── R3: 结构化 LLM 响应（含原生 function-calling tool_calls） ──
+
+
+@dataclass
+class LLMResponse:
+    """chat_completion_with_tools 的结构化返回。
+
+    - content: 模型文本回复（可能为空，当模型仅发起 tool_call 时）
+    - tool_calls: 原生 FC 解析出的工具调用列表，每项形如
+      {"id": str, "name": str, "arguments": dict}；无工具调用时为空列表
+    - finish_reason: OpenAI 风格的结束原因（stop|tool_calls|length|...）
+    - raw: 原始响应 JSON（调试用，可能为 None）
+    """
+
+    content: str = ""
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    finish_reason: str = ""
+    raw: dict[str, Any] | None = None
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return bool(self.tool_calls)
+
+
+# ── per-provider 长生命 httpx Client 池（R3 / §8.4.3 / §8.9.4） ──
+# 消除 chat_completion 每次调用新建+销毁 Client 的开销（同 provider 10+ 次
+# 调用不再各做一次完整 TLS 握手）。httpx.Client 本身线程安全，可被多线程
+# 并发复用；池以 (provider, base_url) 为键，proxy/timeout 在创建时固定，
+# 单次请求可通过 client.post(..., timeout=) 覆盖超时。
+_CLIENT_POOL: dict[str, httpx.Client] = {}
+_CLIENT_LOCK = threading.Lock()
+
+
+def _client_pool_key(endpoint: "ModelEndpoint") -> str:
+    return f"{endpoint.provider}|{endpoint.base_url}"
+
+
+def _get_pooled_client(endpoint: "ModelEndpoint", timeout: float = 120.0) -> httpx.Client:
+    """获取（或创建）per-provider 复用的长生命 httpx.Client。"""
+    key = _client_pool_key(endpoint)
+    with _CLIENT_LOCK:
+        client = _CLIENT_POOL.get(key)
+        if client is None or client.is_closed:
+            client = _create_http_client(timeout=timeout)
+            _CLIENT_POOL[key] = client
+        return client
+
+
+def close_clients() -> None:
+    """显式关闭所有池化 Client（进程退出或测试清理时调用）。"""
+    with _CLIENT_LOCK:
+        for client in _CLIENT_POOL.values():
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 — 关闭时忽略个别异常
+                pass
+        _CLIENT_POOL.clear()
 
 
 # ── 安全代理处理 ────────────────────────────────────────────
@@ -328,27 +388,28 @@ def _call_openai_compat_once(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
-    with _create_http_client(timeout=timeout) as client:
-        resp = client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        msg = data["choices"][0]["message"]
-        finish = data["choices"][0].get("finish_reason", "")
-        content = msg.get("content") or ""
-        reasoning = msg.get("reasoning_content") or msg.get("thinking") or ""
+    # R3: 复用 per-provider 长生命 Client（取代每次 with _create_http_client）
+    client = _get_pooled_client(endpoint, timeout)
+    resp = client.post(url, json=payload, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = data["choices"][0]["message"]
+    finish = data["choices"][0].get("finish_reason", "")
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or msg.get("thinking") or ""
 
-        if content:
-            logger.debug(f"API 响应: content={content[:300]}")
-        elif reasoning:
-            logger.debug(f"API 响应: content=空, reasoning_content={reasoning[:300]}")
-        else:
-            logger.warning(f"API 响应: content 和 reasoning_content 均为空! finish_reason={finish}")
+    if content:
+        logger.debug(f"API 响应: content={content[:300]}")
+    elif reasoning:
+        logger.debug(f"API 响应: content=空, reasoning_content={reasoning[:300]}")
+    else:
+        logger.warning(f"API 响应: content 和 reasoning_content 均为空! finish_reason={finish}")
 
-        # 推理模型：content 可能为空，真正的答案在 reasoning_content 末尾
-        if not content and reasoning:
-            content = reasoning
+    # 推理模型：content 可能为空，真正的答案在 reasoning_content 末尾
+    if not content and reasoning:
+        content = reasoning
 
-        return content, finish
+    return content, finish
 
 
 def _call_anthropic(
@@ -412,17 +473,264 @@ def _call_anthropic_once(
     if system_text:
         payload["system"] = system_text
 
-    with _create_http_client(timeout=timeout) as client:
-        resp = client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        # content 是文本块列表；拼接所有 text 块（比仅取 [0] 更鲁棒）
-        blocks = data.get("content", []) or []
-        text = "".join(
-            b.get("text", "") for b in blocks if isinstance(b, dict)
-        )
-        stop_reason = data.get("stop_reason", "")
-        return text, stop_reason
+    # R3: 复用 per-provider 长生命 Client
+    client = _get_pooled_client(endpoint, timeout)
+    resp = client.post(url, json=payload, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    # content 是文本块列表；拼接所有 text 块（比仅取 [0] 更鲁棒）
+    blocks = data.get("content", []) or []
+    text = "".join(
+        b.get("text", "") for b in blocks if isinstance(b, dict)
+    )
+    stop_reason = data.get("stop_reason", "")
+    return text, stop_reason
+
+
+# ── R3: 原生 function-calling 能力（Q2 三层降级前置） ──────
+
+
+def _normalize_openai_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """OpenAI 兼容厂商直接透传 tools（已是 {type:function, function:{...}} 形态）。"""
+    if not tools:
+        return None
+    return [
+        t if t.get("type") else {"type": "function", "function": t}
+        for t in tools
+    ]
+
+
+def _openai_to_anthropic_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """把 OpenAI 风格 tools 转为 Anthropic 原生格式 [{name, description, input_schema}]。"""
+    if not tools:
+        return None
+    converted = []
+    for t in tools:
+        fn = t.get("function", t)  # 兼容裸函数定义
+        converted.append({
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters") or fn.get("input_schema") or {"type": "object", "properties": {}},
+        })
+    return converted
+
+
+def _parse_openai_tool_calls(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """解析 OpenAI message.tool_calls 为统一结构。"""
+    out = []
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function", {})
+        args_raw = fn.get("arguments", "{}")
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+        except (json.JSONDecodeError, TypeError):
+            # 参数非合法 JSON — 保留原始字符串，调用方自行处理
+            args = {"_raw": args_raw}
+        out.append({
+            "id": tc.get("id", ""),
+            "name": fn.get("name", ""),
+            "arguments": args,
+        })
+    return out
+
+
+def _parse_anthropic_tool_calls(blocks: list[Any]) -> tuple[str, list[dict[str, Any]], str]:
+    """解析 Anthropic content blocks，返回 (text, tool_calls, stop_reason)。
+
+    text = 拼接所有 text 块；tool_calls 来自 tool_use 块。
+    """
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text":
+            text_parts.append(b.get("text", ""))
+        elif b.get("type") == "tool_use":
+            tool_calls.append({
+                "id": b.get("id", ""),
+                "name": b.get("name", ""),
+                "arguments": b.get("input") or {},
+            })
+    return "".join(text_parts), tool_calls, ""
+
+
+def chat_completion_with_tools(
+    model_id: str,
+    messages: list[dict[str, str]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    response_format: dict[str, Any] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    credentials: dict[str, str] | None = None,
+    base_url: str | None = None,
+    max_tokens: int = 4096,
+    temperature: float = 0.7,
+    timeout: float = 120.0,
+    max_retries: int = 3,
+) -> LLMResponse:
+    """带原生 function-calling 的 chat completion（R3 / Q2 三层降级前置）。
+
+    - OpenAI 兼容厂商：tools/response_format/tool_choice 直接透传；
+    - Anthropic：tools 转原生格式，response_format 以 system 提示词降级（Anthropic
+      无 OpenAI 风格 JSON mode，靠提示词 + 解析兜底），tool_choice 映射到
+      anthropic 的 tool_choice（auto/any/tool）；
+    - 返回 LLMResponse（content + tool_calls + finish_reason），不抛业务异常
+      之外的错误（429/5xx/网络仍走重试，与 chat_completion 一致）。
+
+    无 tools/response_format 时，行为退化为普通文本调用，但仍返回 LLMResponse
+    结构（F5 三层降级可据此统一处理）。
+    """
+    import time
+
+    endpoint = build_endpoint(model_id, credentials, base_url)
+    provider_cap = _PROVIDER_DEFAULTS.get(endpoint.provider, {}).get("max_output_tokens")
+    if provider_cap and max_tokens > provider_cap:
+        max_tokens = provider_cap
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        try:
+            if endpoint.provider == "anthropic":
+                return _call_anthropic_with_tools(
+                    endpoint, messages, tools, response_format, tool_choice,
+                    max_tokens, temperature, timeout,
+                )
+            return _call_openai_compat_with_tools(
+                endpoint, messages, tools, response_format, tool_choice,
+                max_tokens, temperature, timeout,
+            )
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status == 429 or 500 <= status < 600:
+                wait = 2 ** attempt
+                logger.warning(f"[{model_id}] {status} 失败，等待 {wait}s 重试 (第 {attempt + 1}/{max_retries} 次)")
+                time.sleep(wait)
+                last_error = e
+            else:
+                raise
+        except (
+            httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout,
+            httpx.RemoteProtocolError, httpx.WriteError, httpx.PoolTimeout,
+        ) as e:
+            wait = min(2 ** attempt, 8)
+            logger.warning(f"[{model_id}] 网络错误 ({type(e).__name__}): {e}，等待 {wait}s 重试")
+            time.sleep(wait)
+            last_error = e
+
+    raise last_error  # type: ignore[misc]
+
+
+def _call_openai_compat_with_tools(
+    endpoint: "ModelEndpoint",
+    messages: list[dict[str, str]],
+    tools: list[dict[str, Any]] | None,
+    response_format: dict[str, Any] | None,
+    tool_choice: str | dict[str, Any] | None,
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+) -> LLMResponse:
+    """OpenAI 兼容厂商的原生 FC 调用（单次，不带 B12 续写——FC 场景续写语义复杂，留给上层）。"""
+    url = f"{endpoint.base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {endpoint.api_key}",
+        "Content-Type": "application/json",
+    }
+    payload: dict[str, Any] = {
+        "model": endpoint.model_name,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    norm_tools = _normalize_openai_tools(tools)
+    if norm_tools:
+        payload["tools"] = norm_tools
+    if response_format:
+        payload["response_format"] = response_format
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+
+    client = _get_pooled_client(endpoint, timeout)
+    resp = client.post(url, json=payload, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    choice = data.get("choices", [{}])[0]
+    msg = choice.get("message", {})
+    content = msg.get("content") or ""
+    finish = choice.get("finish_reason", "")
+    tool_calls = _parse_openai_tool_calls(msg)
+    return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish, raw=data)
+
+
+def _call_anthropic_with_tools(
+    endpoint: "ModelEndpoint",
+    messages: list[dict[str, str]],
+    tools: list[dict[str, Any]] | None,
+    response_format: dict[str, Any] | None,
+    tool_choice: str | dict[str, Any] | None,
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+) -> LLMResponse:
+    """Anthropic 原生 tools 调用。
+
+    response_format（OpenAI JSON mode）在 Anthropic 无直接对应，降级为在 system
+    末尾追加"以 JSON 输出"提示词——真正的 JSON 解析由 response_adapter 兜底。
+    """
+    url = f"{endpoint.base_url}/v1/messages"
+    headers = {
+        "x-api-key": endpoint.api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    system_text = ""
+    chat_messages: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_text = msg["content"]
+        else:
+            chat_messages.append(msg)
+
+    if response_format and "json" in json.dumps(response_format).lower():
+        system_text = (system_text + "\n\n" if system_text else "") + "请严格以合法 JSON 输出，不要包含多余文本。"
+
+    payload: dict[str, Any] = {
+        "model": endpoint.model_name,
+        "messages": chat_messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if system_text:
+        payload["system"] = system_text
+    anthropic_tools = _openai_to_anthropic_tools(tools)
+    if anthropic_tools:
+        payload["tools"] = anthropic_tools
+    if tool_choice is not None:
+        # OpenAI: "auto"|"none"|"required"|{type:function,name}
+        # Anthropic: {type:"auto"|"any"|"tool", name?}
+        if tool_choice == "auto":
+            payload["tool_choice"] = {"type": "auto"}
+        elif tool_choice == "required":
+            payload["tool_choice"] = {"type": "any"}
+        elif tool_choice == "none":
+            # Anthropic 无 none；不传 tools 即可，这里保留 tools 但不强制
+            pass
+        elif isinstance(tool_choice, dict):
+            payload["tool_choice"] = {"type": "tool", "name": tool_choice.get("function", {}).get("name", "")}
+        else:
+            payload["tool_choice"] = {"type": "auto"}
+
+    client = _get_pooled_client(endpoint, timeout)
+    resp = client.post(url, json=payload, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    blocks = data.get("content", []) or []
+    text, tool_calls, _ = _parse_anthropic_tool_calls(blocks)
+    # Anthropic stop_reason → OpenAI 风格 finish_reason
+    stop = data.get("stop_reason", "")
+    finish = "tool_calls" if stop == "tool_use" else ("length" if stop == "max_tokens" else stop or "stop")
+    return LLMResponse(content=text, tool_calls=tool_calls, finish_reason=finish, raw=data)
 
 
 # ── 流式调用接口 ──────────────────────────────────────────
