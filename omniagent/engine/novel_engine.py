@@ -260,6 +260,7 @@ class NovelEngine(BaseEngine):
         """
         ctx = context or AgentContext()
         tracker = ToolExecutionTracker()
+        self._reset_interrupt()
 
         # ── 1. 识别小说 ──
         project = self.manager.detect_novel(user_input)
@@ -308,6 +309,10 @@ class NovelEngine(BaseEngine):
 
         # ── 3. 执行创作循环 ──
         for i in range(self.max_iterations):
+            if self._interrupted:
+                self.callback.on_warning("引擎被用户中断，停止迭代")
+                logger.info("Novel 被中断，退出迭代循环")
+                break
             logger.debug(f"Novel 迭代 {i + 1}/{self.max_iterations}")
 
             response = self._call_llm(messages)
@@ -359,6 +364,11 @@ class NovelEngine(BaseEngine):
 
                 observation = self._execute_tool(action, action_input, ctx, tracker)
                 self.callback.on_observe(observation)
+
+                # F6: 接近上下文窗口时截断工具输出，避免单次大观察撑爆历史
+                if self._near_context_window(messages):
+                    self.callback.on_warning("接近上下文窗口，已截断本次工具输出")
+                    observation = observation[:500] + "\n...(已截断：接近上下文窗口)"
 
                 obs_msg = f"Observation: {observation}"
                 messages.append({"role": "user", "content": obs_msg})

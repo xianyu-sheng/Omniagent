@@ -154,6 +154,7 @@ class PlanExecuteEngine(BaseEngine):
         """
         ctx = context or AgentContext()
         tracker = ToolExecutionTracker()
+        self._reset_interrupt()
 
         # Phase 1: Planning
         logger.info("Plan-Execute Phase 1: 规划中...")
@@ -172,6 +173,10 @@ class PlanExecuteEngine(BaseEngine):
         results = []
 
         for i, step in enumerate(steps[:self.max_steps]):
+            if self._interrupted:
+                self.callback.on_warning("引擎被用户中断，停止执行")
+                logger.info("Plan-Execute 被中断，退出步骤循环")
+                break
             step_id = step.get("id", i + 1)
             step_task = step.get("task", "")
             tool = step.get("tool")

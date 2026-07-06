@@ -97,8 +97,13 @@ class ReflectionEngine(BaseEngine):
             修正后的最终输出
         """
         feedback = ""
+        self._reset_interrupt()
 
         for round_num in range(1, self.max_rounds + 1):
+            if self._interrupted:
+                self.callback.on_warning("引擎被用户中断，停止修正")
+                logger.info("Reflection 被中断，退出修正循环")
+                break
             logger.debug(f"Reflection 第 {round_num} 轮")
 
             # Execute

@@ -45,6 +45,36 @@ class BaseEngine(ABC):
         # alias -> ModelConfig，供 _call_llm 读每模型 max_tokens/api_key/base_url（B4/B7）
         self.model_configs = model_configs or {}
         self.temperature = temperature
+        # F6: 协作式中断标志，外部调 interrupt() 后 run() 在下一轮退出
+        self._interrupted: bool = False
+
+    def interrupt(self) -> None:
+        """F6: 协作式中断——外部调用后，run() 在下一轮迭代顶部退出。"""
+        self._interrupted = True
+
+    def _reset_interrupt(self) -> None:
+        """每轮 run() 开头重置中断标志。"""
+        self._interrupted = False
+
+    def _context_window(self) -> int:
+        """当前激活模型的上下文窗口（取最小=瓶颈模型）；未知则 128000。"""
+        windows = [
+            getattr(mc, "context_window", 0)
+            for mc in self.model_configs.values()
+            if getattr(mc, "context_window", 0) > 0
+        ]
+        return min(windows) if windows else 128000
+
+    def _near_context_window(self, messages: list[dict[str, str]], ratio: float = 0.8) -> bool:
+        """F6: 估算 messages token 是否接近上下文窗口（默认 80%）。
+
+        粗估（字符数//2）仅用于预算预警/拒绝大 observation，非精确计费。
+        """
+        window = self._context_window()
+        if window <= 0:
+            return False
+        est = sum(len(m.get("content", "")) for m in messages) // 2
+        return est > ratio * window
 
     def _call_llm(self, messages: list[dict[str, str]], max_tokens: int | None = None) -> str:
         """调用 LLM，支持多模型 fallback。
