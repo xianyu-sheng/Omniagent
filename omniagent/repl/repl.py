@@ -696,6 +696,12 @@ class REPL:
 
     def _handle_chat(self, user_input: str) -> None:
         """处理多轮对话，支持 prompt 优化和多种思考范式。"""
+        # P2-修复2: 空输入防护 — 避免空 user 消息污染 history + 浪费 LLM token
+        # run() 主循环 line 165 也有防护，但 _handle_chat 是独立可调用的方法，
+        # 直接调（如测试或 API 入口）时无防护会 add_user_message("") 进入完整流程
+        if not user_input or not user_input.strip():
+            console.print("[dim]⚠️ 空输入已忽略[/dim]")
+            return
         # R4: 按激活模型上下文窗口校准 token 阈值（须在 needs_compact 之前）
         self._sync_context_window(self.registry.get_role_priority("planner"))
         # 自动 compact 检查

@@ -710,3 +710,87 @@ class TestToolDetection:
             f"write_code 意图应触发工具路由: {text}"
         )
 
+
+# ── _handle_chat 空输入防护测试 ──────────────────────────
+
+class TestHandleChatEmptyInput:
+    """P2-修复2（B-3）：_handle_chat 入口空输入防护。
+
+    run() 主循环 line 165 已有 if not user_input: continue 防护，但
+    _handle_chat 是独立可调用的方法（测试 / API 入口直接调），无防护时
+    会 add_user_message("") 进入完整流程，浪费 LLM token + 污染 history。
+    """
+
+    def _build_repl(self):
+        from omniagent.repl.repl import REPL
+        from omniagent.repl.model_registry import ModelRegistry
+
+        reg = ModelRegistry()
+        reg.add_model("openai/gpt-4o", "gpt4")
+        reg.assign_role("planner", ["gpt4"])
+        return REPL(registry=reg, streaming=False)
+
+    def test_empty_string_does_not_call_llm_or_pollute_history(self, monkeypatch):
+        """_handle_chat("") → 立即 return，不调 LLM，history 不变。"""
+        import omniagent.engine.base as engine_base
+        import omniagent.utils.llm_client as llm_client
+
+        llm_called: list[bool] = []
+
+        def fake_engine(*a, **kw):
+            llm_called.append(True)
+            return "{}"
+
+        def fake_util(*a, **kw):
+            llm_called.append(True)
+            return "ok"
+
+        def fake_util_stream(*a, **kw):
+            llm_called.append(True)
+            yield "ok"
+
+        monkeypatch.setattr(engine_base, "chat_completion", fake_engine)
+        monkeypatch.setattr(llm_client, "chat_completion", fake_util)
+        monkeypatch.setattr(llm_client, "chat_completion_stream", fake_util_stream)
+
+        repl = self._build_repl()
+        # 调用 _handle_chat("") — 期望立即 return
+        repl._handle_chat("")
+
+        # 关键断言：未触发任何 LLM 调用 + history 仍为空
+        assert llm_called == [], f"空输入不应触发 LLM，但调用了 {llm_called}"
+        assert repl.ctx_mgr.history == [], (
+            f"空输入不应污染 history，但有 {repl.ctx_mgr.history}"
+        )
+
+    def test_pure_spaces_does_not_call_llm_or_pollute_history(self, monkeypatch):
+        """_handle_chat("   ") → 立即 return（strip 后为空），同上行为。"""
+        import omniagent.engine.base as engine_base
+        import omniagent.utils.llm_client as llm_client
+
+        llm_called: list[bool] = []
+
+        def fake_engine(*a, **kw):
+            llm_called.append(True)
+            return "{}"
+
+        def fake_util(*a, **kw):
+            llm_called.append(True)
+            return "ok"
+
+        def fake_util_stream(*a, **kw):
+            llm_called.append(True)
+            yield "ok"
+
+        monkeypatch.setattr(engine_base, "chat_completion", fake_engine)
+        monkeypatch.setattr(llm_client, "chat_completion", fake_util)
+        monkeypatch.setattr(llm_client, "chat_completion_stream", fake_util_stream)
+
+        repl = self._build_repl()
+        repl._handle_chat("   ")
+
+        assert llm_called == [], f"纯空格不应触发 LLM，但调用了 {llm_called}"
+        assert repl.ctx_mgr.history == [], (
+            f"纯空格不应污染 history，但有 {repl.ctx_mgr.history}"
+        )
+
