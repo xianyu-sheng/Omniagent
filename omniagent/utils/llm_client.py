@@ -58,6 +58,144 @@ class LLMResponse:
         return bool(self.tool_calls)
 
 
+# ── §8.8.1：真实 token / 延迟统计（usage 不再丢弃）──────────────
+# chat_completion 返回 str 的契约不变（向后兼容，引擎/测试均不受影响），
+# 但每次成功调用经 usage 回调发出 (model_id, LLMUsage, latency)，供
+# UsageTracker 等订阅。usage 在 _call_*_once 内从响应 JSON 提取并累加到
+# 线程局部累加器，chat_completion 读取并发出（跨续写次数累加）。
+
+
+@dataclass
+class LLMUsage:
+    """一次 chat_completion 累计的 LLM 调用 token 用量。"""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def add(self, other: "LLMUsage") -> None:
+        self.prompt_tokens += other.prompt_tokens
+        self.completion_tokens += other.completion_tokens
+        self.total_tokens += other.total_tokens
+
+
+def _extract_usage(data: dict[str, Any] | None, provider: str) -> LLMUsage:
+    """从厂商响应 JSON 提取 usage，归一化为 LLMUsage。
+
+    OpenAI 兼容：``usage.{prompt,completion,total}_tokens``；
+    Anthropic：``usage.{input,output}_tokens``（无 total，求和）。
+    """
+    if not isinstance(data, dict):
+        return LLMUsage()
+    u = data.get("usage")
+    if not isinstance(u, dict):
+        return LLMUsage()
+    if provider == "anthropic":
+        p = int(u.get("input_tokens", 0) or 0)
+        c = int(u.get("output_tokens", 0) or 0)
+        return LLMUsage(p, c, p + c)
+    p = int(u.get("prompt_tokens", 0) or 0)
+    c = int(u.get("completion_tokens", 0) or 0)
+    t = u.get("total_tokens")
+    return LLMUsage(p, c, int(t) if t else (p + c))
+
+
+_usage_tl = threading.local()
+_USAGE_CALLBACKS: list[Any] = []
+_USAGE_CB_LOCK = threading.Lock()
+
+
+def register_usage_callback(cb) -> Any:
+    """注册 usage 回调 ``cb(model_id, usage: LLMUsage, latency: float)``。
+
+    返回 unsubscribe 函数。回调异常被隔离（仅告警），不影响主调用链。
+    """
+    with _USAGE_CB_LOCK:
+        _USAGE_CALLBACKS.append(cb)
+
+    def _unsubscribe() -> None:
+        with _USAGE_CB_LOCK:
+            try:
+                _USAGE_CALLBACKS.remove(cb)
+            except ValueError:
+                pass
+
+    return _unsubscribe
+
+
+def _emit_usage(model_id: str, usage: LLMUsage, latency: float) -> None:
+    with _USAGE_CB_LOCK:
+        cbs = list(_USAGE_CALLBACKS)
+    for cb in cbs:
+        try:
+            cb(model_id, usage, latency)
+        except Exception:
+            logger.warning("usage 回调执行异常（已隔离）", exc_info=True)
+
+
+def _acc_usage(provider: str, data: dict[str, Any] | None) -> None:
+    """把单次响应的 usage 累加到当前线程的累加器（若存在）。"""
+    acc = getattr(_usage_tl, "usage_acc", None)
+    if acc is not None:
+        acc.add(_extract_usage(data, provider))
+
+
+@dataclass
+class _UsageTotals:
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    latency_sum: float = 0.0
+
+
+class UsageTracker:
+    """累计 LLM 调用的真实 token / 延迟统计（订阅 usage 回调）。
+
+    用法：``tracker = UsageTracker()`` 后，所有 ``chat_completion`` 的真实
+    usage 都会被累计；``snapshot()`` 取各模型统计，``total_tokens()`` 取总
+    token，``close()`` 取消订阅。
+    """
+
+    def __init__(self) -> None:
+        self._totals: dict[str, _UsageTotals] = {}
+        self._lock = threading.Lock()
+        self._unsubscribe = register_usage_callback(self._on_usage)
+
+    def _on_usage(self, model_id: str, usage: LLMUsage, latency: float) -> None:
+        with self._lock:
+            t = self._totals.setdefault(model_id, _UsageTotals())
+            t.calls += 1
+            t.prompt_tokens += usage.prompt_tokens
+            t.completion_tokens += usage.completion_tokens
+            t.total_tokens += usage.total_tokens
+            t.latency_sum += latency
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {
+                m: {
+                    "calls": t.calls,
+                    "prompt_tokens": t.prompt_tokens,
+                    "completion_tokens": t.completion_tokens,
+                    "total_tokens": t.total_tokens,
+                    "latency_avg": (t.latency_sum / t.calls) if t.calls else 0.0,
+                }
+                for m, t in self._totals.items()
+            }
+
+    def total_tokens(self) -> int:
+        with self._lock:
+            return sum(t.total_tokens for t in self._totals.values())
+
+    def total_calls(self) -> int:
+        with self._lock:
+            return sum(t.calls for t in self._totals.values())
+
+    def close(self) -> None:
+        self._unsubscribe()
+
+
 # ── per-provider 长生命 httpx Client 池（R3 / §8.4.3 / §8.9.4） ──
 # 消除 chat_completion 每次调用新建+销毁 Client 的开销（同 provider 10+ 次
 # 调用不再各做一次完整 TLS 握手）。httpx.Client 本身线程安全，可被多线程
@@ -296,12 +434,20 @@ def chat_completion(
         max_tokens = provider_cap
     last_error = None
 
+    # §8.8.1：为本调用初始化 usage 累加器（线程局部，跨续写次数累加）
+    _usage_tl.usage_acc = LLMUsage()
+    t0 = time.monotonic()
+
     for attempt in range(max_retries):
         try:
             if endpoint.provider == "anthropic":
-                return _call_anthropic(endpoint, messages, max_tokens, temperature, timeout)
+                text = _call_anthropic(endpoint, messages, max_tokens, temperature, timeout)
             else:
-                return _call_openai_compat(endpoint, messages, max_tokens, temperature, timeout)
+                text = _call_openai_compat(endpoint, messages, max_tokens, temperature, timeout)
+            # 成功：发出 (model_id, 累计 usage, 延迟) 供 UsageTracker 等订阅
+            latency = time.monotonic() - t0
+            _emit_usage(model_id, getattr(_usage_tl, "usage_acc", LLMUsage()), latency)
+            return text
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
@@ -393,6 +539,8 @@ def _call_openai_compat_once(
     resp = client.post(url, json=payload, headers=headers, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
+    # §8.8.1：提取并累加真实 usage（不再丢弃）
+    _acc_usage(endpoint.provider, data)
     msg = data["choices"][0]["message"]
     finish = data["choices"][0].get("finish_reason", "")
     content = msg.get("content") or ""
@@ -478,6 +626,8 @@ def _call_anthropic_once(
     resp = client.post(url, json=payload, headers=headers, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
+    # §8.8.1：提取并累加真实 usage（Anthropic 用 input/output_tokens）
+    _acc_usage(endpoint.provider, data)
     # content 是文本块列表；拼接所有 text 块（比仅取 [0] 更鲁棒）
     blocks = data.get("content", []) or []
     text = "".join(
