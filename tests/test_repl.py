@@ -868,3 +868,84 @@ class TestChatTemplateNoPollution:
             f"chat 模板仍内联指令: {chat_tmpl.template!r}"
         )
 
+
+# ── ReAct 异常占位 assistant 消息 ──────────────────────────
+
+class TestReactExceptionAssistantPlaceholder:
+    """P2-修复5 (观察项-2)：ReAct 引擎异常时占位 assistant 消息防 history 孤立。
+
+    引擎抛异常时 user 消息已 add（repl.py:745），原代码仅 print + return，
+    history 留下孤立 user 消息。修复策略：add_assistant_message("[错误] ...")
+    占位，让 history 仍成对。
+    """
+
+    def _build_repl(self):
+        from omniagent.repl.repl import REPL
+        from omniagent.repl.model_registry import ModelRegistry
+
+        reg = ModelRegistry()
+        reg.add_model("openai/gpt-4o", "gpt4")
+        reg.assign_role("planner", ["gpt4"])
+        return REPL(registry=reg, streaming=False)
+
+    def test_react_exception_adds_error_assistant(self, monkeypatch):
+        """Mock ReActEngine.run 抛异常 → ctx_mgr 应有 user + [错误] assistant。"""
+        # Mock ReActEngine 让其抛 RuntimeError
+        from omniagent.engine import react_engine as react_engine_mod
+
+        class FakeReactEngine:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, user_input, context=None, ctx_mgr=None):
+                raise RuntimeError("simulated engine failure")
+
+        monkeypatch.setattr(react_engine_mod, "ReActEngine", FakeReactEngine)
+
+        repl = self._build_repl()
+        # 直接调 _run_react_engine 路径（绕过 _handle_chat 整流程以减少 mock 面）
+        # 手动加 user 消息模拟 line 745 的行为
+        repl.ctx_mgr.add_user_message("测试 ReAct 异常")
+        repl._run_react_engine("测试 ReAct 异常", ["gpt4"])
+
+        # 验证：history 含 user + [错误] assistant 成对消息
+        history = repl.ctx_mgr.history
+        assert len(history) == 2, f"应成对但 history 有 {len(history)} 条: {history}"
+
+        # 第 1 条是 user
+        assert history[0].role == "user"
+        assert history[0].content == "测试 ReAct 异常"
+
+        # 第 2 条是 [错误] 占位 assistant
+        assert history[1].role == "assistant"
+        assert "[错误]" in history[1].content
+        assert "simulated engine failure" in history[1].content
+
+    def test_react_exception_falls_back_to_trim_user(self, monkeypatch):
+        """add_assistant_message 失败时回退到 trim_last_user，history 仍清空。"""
+        from omniagent.engine import react_engine as react_engine_mod
+
+        class FakeReactEngine:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, user_input, context=None, ctx_mgr=None):
+                raise RuntimeError("simulated engine failure")
+
+        monkeypatch.setattr(react_engine_mod, "ReActEngine", FakeReactEngine)
+
+        repl = self._build_repl()
+        repl.ctx_mgr.add_user_message("user msg to be cleaned")
+        # Mock add_assistant_message 让其抛异常，触发 fallback trim_last_user
+        original_add = repl.ctx_mgr.add_assistant_message
+        def failing_add(*args, **kwargs):
+            raise RuntimeError("add failed")
+        monkeypatch.setattr(repl.ctx_mgr, "add_assistant_message", failing_add)
+
+        repl._run_react_engine("user msg to be cleaned", ["gpt4"])
+
+        # 验证：add_assistant_message 失败 → trim_last_user 兜底 → history 为空
+        assert repl.ctx_mgr.history == [], (
+            f"应清空 user 消息但 history 有 {repl.ctx_mgr.history}"
+        )
+

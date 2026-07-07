@@ -149,6 +149,18 @@ class ContextManager:
                 return self.history.pop(i).content
         return None
 
+    def trim_last_user(self) -> str | None:
+        """移除并返回最后一条 user 消息（用于引擎异常时清理孤立 user 消息）。
+
+        P2-修复5 (观察项-2)：当 LLM 引擎抛异常时，user 消息已 add 但无对应
+        assistant 响应，history 出现 user-only 序列。优先用 add_assistant_message
+        占位错误消息，无法占位时回退到此方法清理 user 消息。
+        """
+        for i in range(len(self.history) - 1, -1, -1):
+            if self.history[i].role == "user":
+                return self.history.pop(i).content
+        return None
+
     # ── Token 估算 ────────────────────────────────────────
 
     def _subscribe_usage(self) -> None:

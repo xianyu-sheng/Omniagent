@@ -107,8 +107,9 @@ class REPL:
         # 2. 渲染最终答案
         console.print(Panel(
             Markdown(result),
-            title=f"[command]{title}[/command]",
+            title=f"[bold]{title}[/bold]",
             border_style=border_style,
+            padding=(0, 1),
         ))
 
     @staticmethod
@@ -159,7 +160,7 @@ class REPL:
             try:
                 user_input = self._read_input()
             except (KeyboardInterrupt, EOFError):
-                console.print("\n[yellow]再见！[/yellow]")
+                console.print("\n[dim]再见！[/dim]")
                 break
 
             if not user_input:
@@ -168,7 +169,7 @@ class REPL:
             # 斜杠命令
             if user_input.startswith("/"):
                 if self._handle_command(user_input):
-                    console.print("[yellow]再见！[/yellow]")
+                    console.print("[dim]再见！[/dim]")
                     break
                 continue
 
@@ -260,7 +261,7 @@ class REPL:
   [dim]Ctrl+C 退出  ·  Shift+Enter 换行  ·  Enter 发送[/dim]"""
 
         console.print()
-        console.print("[bold green]你好，欢迎来到闲余生的个人AI编程工具[/bold green]")
+        
         console.print(Panel(content, border_style="cyan", padding=(0, 2)))
         console.print()
 
@@ -680,7 +681,7 @@ class REPL:
             return True
 
         if output:
-            console.print(Panel(output, title=f"[command]{cmd_name}[/command]", border_style="magenta"))
+            console.print(Panel(output, title=f"[bold]{cmd_name}[/bold]", border_style="dim", padding=(0, 1)))
         return False
 
     def _sync_context_window(self, model_aliases: list[str]) -> None:
@@ -700,13 +701,13 @@ class REPL:
         # run() 主循环 line 165 也有防护，但 _handle_chat 是独立可调用的方法，
         # 直接调（如测试或 API 入口）时无防护会 add_user_message("") 进入完整流程
         if not user_input or not user_input.strip():
-            console.print("[dim]⚠️ 空输入已忽略[/dim]")
+            console.print("[dim]· 空输入已忽略[/dim]")
             return
         # R4: 按激活模型上下文窗口校准 token 阈值（须在 needs_compact 之前）
         self._sync_context_window(self.registry.get_role_priority("planner"))
         # 自动 compact 检查
         if self.ctx_mgr.needs_compact():
-            console.print("[yellow]⚠️  对话历史较长，建议执行 /compact 压缩。[/yellow]")
+            console.print("[dim]· 对话较长，建议 [bold cyan]/compact[/bold cyan] 压缩[/dim]")
 
         # 保存 undo 快照
         self.ctx_mgr.save_snapshot()
@@ -753,7 +754,7 @@ class REPL:
         # 获取模型列表
         model_ids = self.registry.get_role_priority("planner")
         if not model_ids:
-            console.print("[error]❌ 未配置任何模型。请先使用 /set_model 添加模型。[/error]")
+            console.print("[red]· 未配置模型，请先 [bold cyan]/set_model[/bold cyan] 添加[/red]")
             return
 
         # 注入对话历史到 AgentContext，供引擎使用
@@ -782,7 +783,7 @@ class REPL:
                 self._run_direct(optimized, model_ids, intent=intent)
         except KeyboardInterrupt:
             # B2: Ctrl+C 取消当前运行，返回提示符而非退出整个 REPL
-            console.print("\n[yellow]⚠️ 已中断当前运行（Ctrl+C），返回提示符。[/yellow]")
+            console.print("\n[dim]· 已中断，返回提示符[/dim]")
 
     def _run_direct(self, user_input: str, model_ids: list[str], intent: str | None = None) -> None:
         """直接对话模式。自动检测工具需求并委派给 ReAct 引擎。"""
@@ -818,7 +819,7 @@ class REPL:
                     # ── 响应后验证 2：检测 LLM 是否回复了拒绝性内容 ──
                     if self._detect_denial(response_text):
                         console.print()
-                        console.print("[cyan]🔧 LLM 表示无法完成任务，自动切换到 ReAct 模式重试...[/cyan]")
+                        console.print("[dim]· LLM 无法完成任务 → ReAct 模式重试[/dim]")
                         self.ctx_mgr.trim_last_assistant()
                         self._run_react_engine(user_input, model_ids)
                         return
@@ -834,7 +835,7 @@ class REPL:
         """ReAct 引擎模式。"""
         from omniagent.engine.react_engine import ReActEngine
 
-        console.print("[cyan]🔄 ReAct 模式: 思考 → 行动 → 观察 → 循环[/cyan]")
+        console.print("[dim]· ReAct 思考 → 行动 → 观察[/dim]")
 
         callback = self._make_callback()
         engine = ReActEngine(model_priority=model_ids, max_iterations=10, callback=callback, model_configs=dict(self.registry.models))
@@ -844,13 +845,27 @@ class REPL:
             self._render_engine_result(callback, result, "ReAct 结果")
             self.status_bar.set_last_model(model_ids[0])
         except Exception as e:
+            # P2-修复5: 引擎异常时清理 user 消息（repl.py:745 已 add 但无 assistant
+            # 响应会留孤立），优先 add_assistant_message 占位错误消息，让 history 仍成对；
+            # add_assistant_message 失败时回退 trim user 消息。
             console.print(f"[error]❌ ReAct 引擎执行失败: {e}[/error]")
+            try:
+                # 用 "[错误] ..." 作为 assistant 回应占位，让 history 仍成对
+                self.ctx_mgr.add_assistant_message(
+                    f"[错误] ReAct 引擎执行失败: {e}", model_used=model_ids[0],
+                )
+            except Exception:
+                # 兜底：add_assistant_message 失败时回退 trim user
+                try:
+                    self.ctx_mgr.trim_last_user()
+                except Exception:
+                    pass
 
     def _run_plan_execute_engine(self, user_input: str, model_ids: list[str]) -> None:
         """Plan-Execute 引擎模式。"""
         from omniagent.engine.plan_execute_engine import PlanExecuteEngine
 
-        console.print("[cyan]📋 Plan-Execute 模式: 规划 → 逐步执行[/cyan]")
+        console.print("[dim]· Plan-Execute 规划 → 逐步执行[/dim]")
 
         callback = self._make_callback()
         engine = PlanExecuteEngine(model_priority=model_ids, max_steps=20, callback=callback, model_configs=dict(self.registry.models))
@@ -866,7 +881,7 @@ class REPL:
         """Reflection 引擎模式。"""
         from omniagent.engine.reflection_engine import ReflectionEngine
 
-        console.print("[cyan]🔍 Reflection 模式: 执行 → 审查 → 修正[/cyan]")
+        console.print("[dim]· Reflection 执行 → 审查 → 修正[/dim]")
 
         callback = self._make_callback()
         engine = ReflectionEngine(model_priority=model_ids, max_rounds=3, callback=callback, model_configs=dict(self.registry.models))
@@ -882,7 +897,7 @@ class REPL:
         """Plan + React 组合引擎模式。"""
         from omniagent.engine.combined_engines import PlanReactEngine
 
-        console.print("[cyan]📋🔄 Plan+React 模式: 全局规划 → 每步 ReAct 执行[/cyan]")
+        console.print("[dim]· Plan+React 全局规划 → 每步 ReAct 执行[/dim]")
 
         callback = self._make_callback()
         engine = PlanReactEngine(model_priority=model_ids, max_steps=10, react_iterations=8, callback=callback, model_configs=dict(self.registry.models))
@@ -898,7 +913,7 @@ class REPL:
         """Plan + Reflection 组合引擎模式。"""
         from omniagent.engine.combined_engines import PlanReflectionEngine
 
-        console.print("[cyan]📋🔍 Plan+Reflection 模式: 规划执行 → 反思修正[/cyan]")
+        console.print("[dim]· Plan+Reflection 规划执行 → 反思修正[/dim]")
 
         callback = self._make_callback()
         engine = PlanReflectionEngine(model_priority=model_ids, max_steps=10, review_rounds=2, callback=callback, model_configs=dict(self.registry.models))
@@ -914,7 +929,7 @@ class REPL:
         """ReAct + Reflection 组合引擎模式。"""
         from omniagent.engine.combined_engines import ReactReflectionEngine
 
-        console.print("[cyan]🔄🔍 React+Reflection 模式: ReAct 探索 → 反思审查[/cyan]")
+        console.print("[dim]· React+Reflection 探索 → 反思审查[/dim]")
 
         callback = self._make_callback()
         engine = ReactReflectionEngine(model_priority=model_ids, react_iterations=8, review_rounds=2, callback=callback, model_configs=dict(self.registry.models))
@@ -930,7 +945,7 @@ class REPL:
         """小说创作引擎模式（支持多小说隔离）。"""
         from omniagent.engine.novel_engine import NovelEngine
 
-        console.print("[magenta]Novel 模式: 小说创作助手[/magenta]")
+        console.print("[dim]· Novel 小说创作模式[/dim]")
 
         callback = self._make_callback()
         engine = NovelEngine(
@@ -958,7 +973,7 @@ class REPL:
 
         # 流式阶段：显示 spinner + 实时 token 计数
         with Live(
-            Spinner("dots", text="[cyan] 思考中...[/cyan]"),
+            Spinner("dots", text="[dim]思考中…[/dim]"),
             console=console,
             refresh_per_second=10,
             transient=True,  # 结束后自动清除 spinner
@@ -967,7 +982,7 @@ class REPL:
                 full_response.append(chunk)
                 token_count = len("".join(full_response))
                 live.update(
-                    Spinner("dots", text=f"[cyan] 生成中... {token_count} tokens[/cyan]")
+                    Spinner("dots", text=f"[dim]生成中… {token_count} tokens[/dim]")
                 )
 
         response_text = "".join(full_response)
@@ -976,8 +991,9 @@ class REPL:
         if response_text.strip():
             console.print(Panel(
                 Markdown(response_text),
-                title=f"[assistant]Assistant[/assistant] [dim]({model_id})[/dim]",
+                title=f"[bold]Assistant[/bold] [dim]({model_id})[/dim]",
                 border_style="green",
+                padding=(0, 1),
             ))
 
         self.ctx_mgr.add_assistant_message(response_text, model_used=model_id)
@@ -987,7 +1003,7 @@ class REPL:
         """阻塞式输出模型回复。返回响应文本。"""
         from omniagent.utils.llm_client import chat_completion
 
-        console.print(f"[dim]调用 {model_id}...[/dim]")
+        console.print(f"[dim]· 调用 {model_id}…[/dim]")
         response = chat_completion(model_id, messages)
 
         self.ctx_mgr.add_assistant_message(response, model_used=model_id)
@@ -1150,7 +1166,7 @@ class REPL:
                     _HANDLERS[cmd_name] = make_shortcut_handler(sc.name)
                     register_command(cmd_name, f"[快捷] {sc.description}", cmd_name)
             if sm.list_all():
-                console.print(f"[dim]已加载 {len(sm.list_all())} 个快捷指令[/dim]")
+                console.print(f"[dim]· 已加载 {len(sm.list_all())} 个快捷指令[/dim]")
         except Exception as e:
             logger.debug(f"加载快捷指令失败: {e}")
 
@@ -1169,7 +1185,7 @@ class REPL:
                     _HANDLERS[cmd_name] = make_skill_handler(sk.name)
                     register_command(cmd_name, f"[技能] {sk.description}", cmd_name)
             if skm.list_all():
-                console.print(f"[dim]已加载 {len(skm.list_all())} 个技能[/dim]")
+                console.print(f"[dim]· 已加载 {len(skm.list_all())} 个技能[/dim]")
         except Exception as e:
             logger.debug(f"加载技能失败: {e}")
 
