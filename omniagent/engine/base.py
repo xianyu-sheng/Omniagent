@@ -15,13 +15,17 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from omniagent.engine.callbacks import EngineCallback
 from omniagent.engine.context import AgentContext
 from omniagent.utils.llm_client import ResponseTruncatedError, chat_completion
+
+if TYPE_CHECKING:
+    from omniagent.engine.budget import BudgetManager
+    from omniagent.engine.tool_tracker import ToolExecutionTracker
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +178,163 @@ class BaseEngine(ABC):
                 logger.warning(f"模型 {model_id} 失败: {e}，尝试下一个...")
         self.callback.on_error(f"所有模型均调用失败: {last_error}")
         raise RuntimeError(f"所有模型均调用失败: {last_error}")
+
+    # ── F2: 合成提示注入 ─────────────────────────────────────
+
+    def _inject_synthesis_prompt(
+        self,
+        budget: BudgetManager,
+        tracker: ToolExecutionTracker | None,
+    ) -> tuple[str, str] | None:
+        """F2: 按剩余预算/工具调用/阶段选择合成提示场景（6 场景）。
+
+        返回 ``(scenario, prompt)`` 或 ``None``（无需注入）。调用方把 ``prompt``
+        作为 user 消息追加进 ``messages``，引导 LLM 在当前阶段做正确的事。
+
+        场景优先级：
+        1. **force_synthesis**：剩余预算 <15% 且有工具调用 → 必须立即合成最终答案；
+        2. （刚奖励过空洞补救 → 跳过，hint 已注入，避免连续 user 消息堆叠）；
+        3. **converge_synthesis**：收束阶段且有工具调用 → 准备收尾合成；
+        4. **soft_warning**：收束阶段但 0 工具调用 → 立即行动或基于已知回答；
+        5. **compression_reward**：刚触发压缩奖励 → 鼓励继续产出；
+        6. **progress_expansion**：中段执行且最近成功 → 进展良好继续；
+        7. **gentle_hint**：探索阶段且 0 工具调用 → 2-3 步后开始执行。
+        """
+        tool_calls = len(tracker.calls) if tracker else 0
+        last_success = bool(tracker and tracker.calls and tracker.calls[-1].success)
+        total = budget.total if budget.total > 0 else 1
+        remaining_ratio = budget.remaining / total
+
+        # 1. 强制合成：预算将尽且做过工
+        if remaining_ratio < 0.15 and tool_calls >= 1:
+            return (
+                "force_synthesis",
+                f"⚠️ 预算仅剩 {budget.remaining}/{budget.total} 轮，你已执行 {tool_calls} 次工具。"
+                "必须在本轮直接给出 final_answer——基于已执行的工具结果合成最终回答，"
+                "不要再调用工具，直接总结产物（文件路径/代码/命令输出）。",
+            )
+
+        # 2. 刚奖励过空洞补救：hint 已作为上一条 user 消息注入，跳过避免堆叠
+        if budget.rewards and budget.rewards[-1][0] == "hollow":
+            return None
+
+        # 3. 收束阶段且有工具：准备合成
+        if budget.is_converge_phase() and tool_calls >= 1:
+            return (
+                "converge_synthesis",
+                f"ℹ️ 已进入收束阶段（{budget.summary()}），已执行 {tool_calls} 次工具。"
+                "请停止探索，基于已有结果整理 final_answer，附上产物路径/代码/命令输出。",
+            )
+
+        # 4. 收束阶段但没工具：立即行动
+        if budget.is_converge_phase() and tool_calls == 0:
+            return (
+                "soft_warning",
+                "⚠️ 已进入收束阶段但未调用任何工具。请立即调用工具执行，"
+                "或基于已知信息直接给出 final_answer，不要再探索。",
+            )
+
+        # 5. 压缩奖励：鼓励继续
+        if budget.rewards and budget.rewards[-1][0] == "compression":
+            n = budget.rewards[-1][1]
+            return (
+                "compression_reward",
+                f"ℹ️ 上下文已压缩，奖励 +{n} 轮预算。把省下的预算用在产出上，继续执行剩余任务。",
+            )
+
+        # 6. 中段执行良好：鼓励
+        if budget.is_execute_phase() and tool_calls >= 3 and last_success:
+            return (
+                "progress_expansion",
+                f"✓ 进展良好（{tool_calls} 次工具，最近一次成功）。"
+                "继续执行剩余步骤，完成后给出 final_answer。",
+            )
+
+        # 7. 探索阶段无工具：温和提示
+        if budget.is_explore_phase() and tool_calls == 0:
+            return (
+                "gentle_hint",
+                "ℹ️ 当前为探索阶段。建议 2-3 步了解结构后立即开始执行（write_file/command），"
+                "不要无限探索。",
+            )
+
+        return None
+
+    # ── F2: mercy compile / exhaustion report ────────────────
+
+    def _synthesis_prompt(self, user_input: str, tracker: ToolExecutionTracker) -> str:
+        """构造 mercy compile 的无格式约束合成 prompt。"""
+        return (
+            "你是一个 Agent 的收尾合成器。Agent 已执行若干工具但未在预算内给出最终答案。\n"
+            f"用户原始需求：{user_input}\n\n"
+            f"已执行工具记录：\n{tracker.detail_log()}\n\n"
+            "请基于以上工具执行结果，直接给出最终回答——给用户看的自然语言总结，"
+            "附上产物路径/代码/命令输出。不要输出 JSON，不要 ReAct 格式，直接回答。"
+        )
+
+    def _exhaustion_report(self, user_input: str, tracker: ToolExecutionTracker) -> str:
+        """F2: 从 tracker.calls 程序化拼出结构化报告（成功/失败/参数/最多 10 条）。"""
+        lines = [
+            f"⚠️ 达到最大迭代次数，以下是已执行工具的结构化报告：",
+            "",
+            f"**用户需求**：{user_input}",
+            "",
+            f"**执行摘要**：{tracker.execution_summary()}",
+            "",
+            f"**详细记录**（最多 10 条）：",
+        ]
+        for i, call in enumerate(tracker.calls[-10:], 1):
+            status = "✓ 成功" if call.success else "✗ 失败"
+            params = call.params or {}
+            lines.append(f"{i}. {status} {call.tool_name}({params})")
+            if call.result_summary:
+                lines.append(f"   结果：{call.result_summary}")
+            if call.error:
+                lines.append(f"   错误：{call.error}")
+        lines.append("")
+        lines.append("请基于以上执行结果判断任务完成度，或重新发起更具体的指令。")
+        return "\n".join(lines)
+
+    def _mercy_compile(
+        self,
+        user_input: str,
+        tracker: ToolExecutionTracker | None,
+        messages: list[dict[str, str]],
+    ) -> str:
+        """F2: 迭代耗尽时的优雅降级链（mercy compile → exhaustion report → 报错）。
+
+        ① 换备选模型做一次**无 ReAct 格式约束**的合成（仅当有工具执行数据）；
+        ② 合成失败/无数据则从 ``tracker.calls`` 程序化拼出结构化报告；
+        ③ 连工具数据都没有才报错。
+
+        避免 §8.x 的"一次瞬时 API 故障直接杀掉整个运行"——``tracker.calls`` 数据
+        在手却未用，这里把它变成可用的部分结果。
+        """
+        # ① 备选模型合成（有工具数据才值得合成）
+        if tracker and tracker.has_executions():
+            try:
+                answer = self._call_llm([
+                    {"role": "system",
+                     "content": "你是 Agent 的收尾合成器，直接输出最终回答，不要 JSON/ReAct 格式。"},
+                    {"role": "user", "content": self._synthesis_prompt(user_input, tracker)},
+                ])
+                if answer and answer.strip():
+                    self.callback.on_warning("迭代耗尽，已用 LLM 合成最终回答（mercy compile）")
+                    return answer.strip()
+            except Exception as e:  # noqa: BLE001 — 合成失败回退报告，不抛
+                logger.warning(f"mercy compile 合成失败，回退结构化报告: {e}")
+            # ② 结构化报告
+            self.callback.on_warning("迭代耗尽，已生成结构化执行报告（exhaustion report）")
+            return self._exhaustion_report(user_input, tracker)
+
+        # ③ 无数据
+        self.callback.on_error("迭代耗尽且无工具执行数据，无法合成结果")
+        max_iter = getattr(self, "max_iterations", None)
+        budget_str = f" ({max_iter}) " if max_iter else " "
+        return (
+            f"达到最大迭代次数{budget_str}未能得出最终答案，"
+            "且未执行任何工具调用。请尝试简化问题或使用更具体的指令。"
+        )
 
     @abstractmethod
     def run(self, user_input: str, context: AgentContext | None = None) -> str:

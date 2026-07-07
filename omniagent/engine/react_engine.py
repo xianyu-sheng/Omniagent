@@ -13,8 +13,10 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from omniagent.engine.base import BaseEngine
+from omniagent.engine.budget import BudgetManager
 from omniagent.engine.callbacks import EngineCallback, mask_sensitive_params
 from omniagent.engine.context import AgentContext
+from omniagent.engine.hollow_detector import HollowDetector
 from omniagent.engine.tool_tracker import ToolExecutionTracker
 from omniagent.nodes.tool_executor import ToolExecutor
 from omniagent.nodes.tool_node import ToolNode, _DYNAMIC_TOOLS
@@ -225,6 +227,8 @@ class ReActEngine(BaseEngine):
         self.system_prompt = system_prompt or self._build_system_prompt()
         # F1: 工具执行门面（7 阶段流水线：校验/断路器/重试/封装）
         self._tool_executor = ToolExecutor()
+        # F2: 空洞回答检测器（无状态，实例共享）
+        self._hollow = HollowDetector()
 
     def _build_system_prompt(self) -> str:
         import sys
@@ -310,13 +314,30 @@ class ReActEngine(BaseEngine):
         requires_tools = self._input_requires_tools(user_input)
         no_tool_streak = 0  # 连续未执行工具的轮次
 
-        for i in range(self.max_iterations):
+        # F2: 三阶段软预算管理（每轮 run 新建，状态不跨 run 串扰）
+        budget = BudgetManager(self.max_iterations)
+        # F2: 空洞回答补救上限（最多拒绝 1 次，第二次强制接受避免死循环）
+        MAX_HOLLOW_REJECTIONS = 1
+        hollow_rejections = 0
+
+        while budget.can_continue():
+            budget.spend()
+            iteration = budget.spent
+
             # F6: 协作式中断检查
             if self._interrupted:
                 self.callback.on_warning("引擎被用户中断，停止迭代")
                 logger.info("ReAct 被中断，退出迭代循环")
                 break
-            logger.debug(f"ReAct 迭代 {i + 1}/{self.max_iterations}")
+            logger.debug(f"ReAct 迭代 {iteration}/{budget.total}")
+
+            # F2: 合成提示注入（按预算/工具/阶段选择场景）
+            # 首轮（iteration==1）跳过：user_input 刚注入，避免连续 user 消息堆叠
+            if iteration > 1:
+                synth = self._inject_synthesis_prompt(budget, tracker)
+                if synth is not None:
+                    messages.append({"role": "user", "content": synth[1]})
+                    logger.debug(f"ReAct 合成提示 [{synth[0]}]")
 
             # 调用 LLM
             response = self._call_llm(messages)
@@ -331,6 +352,26 @@ class ReActEngine(BaseEngine):
 
             final_answer = parsed.get("final_answer", "")
             if final_answer and final_answer.strip():
+                # ── F2: 空洞回答检测 ──
+                # 仅当"做过工或已进入收束阶段"且仍有预算且未超拒绝上限时拦截；
+                # 早鸟短回答（如"done"）在探索阶段无工具时不拦，避免误伤。
+                if (
+                    (tracker.has_executions() or budget.is_converge_phase())
+                    and budget.can_continue()
+                    and hollow_rejections < MAX_HOLLOW_REJECTIONS
+                ):
+                    hr = self._hollow.detect(final_answer, len(tracker.calls))
+                    if hr.is_hollow:
+                        hollow_rejections += 1
+                        budget.on_hollow_answer()
+                        messages.append({"role": "user", "content": hr.hint()})
+                        self.callback.on_warning(
+                            f"检测到空洞回答 (score={hr.score})，已奖励补救轮次并要求重写")
+                        logger.warning(
+                            f"ReAct: 空洞回答 hits={hr.hits}，要求重写 "
+                            f"({hollow_rejections}/{MAX_HOLLOW_REJECTIONS})")
+                        continue
+
                 # ── 关键验证：如果需要工具但未执行，拒绝接受 final_answer ──
                 if requires_tools and not tracker.has_executions():
                     no_tool_streak += 1
@@ -358,7 +399,7 @@ class ReActEngine(BaseEngine):
                         self.callback.on_finish(answer + warning)
                         return answer + warning
 
-                logger.info(f"ReAct 完成，共 {i + 1} 次迭代，工具调用 {len(tracker.calls)} 次")
+                logger.info(f"ReAct 完成，共 {iteration} 次迭代，工具调用 {len(tracker.calls)} 次")
                 answer = final_answer
                 if tracker.has_executions():
                     summary = tracker.execution_summary()
@@ -375,7 +416,14 @@ class ReActEngine(BaseEngine):
                 logger.debug(f"ReAct 行动: {action}({mask_sensitive_params(action_input)})")
                 self.callback.on_act(action, action_input)
 
-                observation = self._execute_tool(action, action_input, ctx, tracker)
+                # F2: 收束阶段工具门控（禁用纯探索型工具）
+                allow, gate_reason = budget.allow_tool(action)
+                if not allow:
+                    observation = f"⚠️ {gate_reason}"
+                    self.callback.on_warning(gate_reason)
+                    logger.info(f"ReAct: 收束阶段拦截工具 {action}")
+                else:
+                    observation = self._execute_tool(action, action_input, ctx, tracker)
                 self.callback.on_observe(observation)
 
                 # F6: 接近上下文窗口时拒绝大 observation（截断），防止下一轮超限
@@ -392,8 +440,12 @@ class ReActEngine(BaseEngine):
                 messages.append({"role": "user", "content": obs_msg})
                 logger.debug(f"ReAct 观察: {observation[:200]}")
                 no_tool_streak = 0
-                # F4: 每 5 轮压缩 in-run messages，抑制 O(n²) 增长
-                messages = self._maybe_compact_messages(messages, i + 1)
+                # F4: 每 5 轮压缩 in-run messages，抑制 O(n²) 增长；
+                # F2: 压缩成功时奖励预算（on_compression）
+                before_len = len(messages)
+                messages = self._maybe_compact_messages(messages, iteration)
+                if len(messages) < before_len:
+                    budget.on_compression()
             else:
                 # LLM 没有给出有效输出，尝试从最后一条观察中提取
                 last_obs = ""
@@ -410,24 +462,24 @@ class ReActEngine(BaseEngine):
                 self.callback.on_finish(result)
                 return result
 
-        # 循环结束：被中断 或 达到最大迭代次数
-        last_obs = ""
-        for m in reversed(messages):
-            if m.get("role") == "user" and m.get("content", "").startswith("Observation:"):
-                last_obs = m["content"][len("Observation:"):].strip()
-                break
+        # 循环结束：被中断 或 预算耗尽
         if self._interrupted:
+            last_obs = ""
+            for m in reversed(messages):
+                if m.get("role") == "user" and m.get("content", "").startswith("Observation:"):
+                    last_obs = m["content"][len("Observation:"):].strip()
+                    break
             prefix = "引擎被用户中断"
             if last_obs and len(last_obs) > 50:
                 msg = f"{prefix}，以下是中断前的执行结果：\n\n{last_obs[:self.observation_truncate]}"
             else:
                 msg = f"{prefix}，未生成明确结果。请重新发起任务。"
-        elif last_obs and len(last_obs) > 50:
-            # 最后一条观察有实质内容，返回它
-            msg = f"达到最大迭代次数 ({self.max_iterations})，以下是最后的执行结果：\n\n{last_obs[:self.observation_truncate]}"
-        else:
-            msg = f"达到最大迭代次数 ({self.max_iterations})，未能得出最终答案。请尝试简化问题或使用更具体的指令。"
-        self.callback.on_warning(msg)
+            self.callback.on_warning(msg)
+            self.callback.on_finish(msg)
+            return msg
+
+        # F2: 预算耗尽（非中断）→ mercy compile 优雅降级链
+        msg = self._mercy_compile(user_input, tracker, messages)
         self.callback.on_finish(msg)
         return msg
 
