@@ -33,15 +33,101 @@ console = Console()
 
 
 def _masked_input(prompt_text: str) -> str:
-    """逐字符读取输入，实时显示 * 号掩码。回车确认，退格删除。
-    粘贴时只取第一行（避免粘贴多行导致重复）。
-    Linux/macOS 使用 getpass 实现安全的密码输入。"""
+    """逐字符读取输入，实时显示 * 号掩码。回车确认，退格删除，Esc 清空。
+    粘贴时只取第一行（遇到换行即确认）。
+
+    Linux/macOS 用 termios 逐字符读取——**不要**用 ``getpass.getpass()``：
+    getpass 会完全关闭回显，导致粘贴时零视觉反馈（用户报告"粘贴没有反应"）。
+    本实现逐字符显示 ``*``，并在读取期间临时关闭 bracketed-paste 模式
+    （REPL 内 prompt_toolkit 会开启它，使粘贴带 ``\\e[200~..\\e[201~`` 标记），
+    让粘贴内容作为普通字符流入。转义序列（方向键 / 残留 paste 标记）会被丢弃。
+    """
     if sys.platform != "win32":
-        import getpass
+        import os
+        import select
+        import termios
+
         try:
-            return getpass.getpass(f"{prompt_text}: ")
-        except (KeyboardInterrupt, EOFError):
-            return ""
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+        except (AttributeError, ValueError, termios.error, OSError):
+            # stdin 非 TTY（管道 / 重定向 / 无终端）→ 回退 getpass
+            import getpass
+            try:
+                return getpass.getpass(f"{prompt_text}: ")
+            except (KeyboardInterrupt, EOFError):
+                return ""
+
+        sys.stdout.write(f"{prompt_text}: ")
+        # 关闭 bracketed-paste，使粘贴不带 \e[200~..\e[201~ 标记（REPL 会开启它）
+        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.flush()
+
+        new = termios.tcgetattr(fd)
+        # 关回显 + 关规范模式 + 关信号生成（ISIG）：使 Ctrl+C 等作为字节读入，
+        # 由本函数显式处理（\x03 → KeyboardInterrupt），与 Windows msvcrt 字节级行为一致
+        new[3] = new[3] & ~(termios.ECHO | termios.ICANON | termios.ISIG)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        chars: list[str] = []
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, new)
+            while True:
+                b = os.read(fd, 1)
+                if not b:  # EOF
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    break
+                ch = b.decode("latin-1")  # 1 字节 → 1 字符（API Key 为 ASCII）
+                if ch in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    break
+                if ch == "\x03":  # Ctrl+C
+                    raise KeyboardInterrupt
+                if ch in ("\x08", "\x7f"):  # Backspace / Delete
+                    if chars:
+                        chars.pop()
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                    continue
+                if ch == "\x15":  # Ctrl+U 清行
+                    for _ in chars:
+                        sys.stdout.write("\b \b")
+                    chars.clear()
+                    sys.stdout.flush()
+                    continue
+                if ch == "\x1b":  # Escape 或 CSI/SS3 转义序列
+                    # 非阻塞窥探后续字符：有则属转义序列（方向键 / paste 标记），读取并丢弃
+                    r, _, _ = select.select([fd], [], [], 0.05)
+                    if not r:
+                        # 孤立 Esc → 清空已输入
+                        for _ in chars:
+                            sys.stdout.write("\b \b")
+                        chars.clear()
+                        sys.stdout.flush()
+                    else:
+                        # 消费整个序列直到终止符（~ 或字母），与 Windows 行为一致地忽略功能键
+                        while True:
+                            r2, _, _ = select.select([fd], [], [], 0.05)
+                            if not r2:
+                                break
+                            c2 = os.read(fd, 1).decode("latin-1")
+                            if c2 == "" or c2 == "~" or c2.isalpha():
+                                break
+                    continue
+                if ord(ch) < 32:  # 其它控制字符忽略
+                    continue
+                chars.append(ch)
+                sys.stdout.write("*")
+                sys.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            # 不在此重新开启 bracketed-paste：REPL 的 prompt_toolkit 会在下一次
+            # 提示时自行重新施加终端状态；此处保持关闭可让本向导后续的 rich 菜单
+            # 接收纯字符（避免菜单里粘贴带标记）。
+            sys.stdout.flush()
+        return "".join(chars)
 
     import msvcrt
     sys.stdout.write(f"{prompt_text}: ")
