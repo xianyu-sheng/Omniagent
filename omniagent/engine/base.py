@@ -21,7 +21,11 @@ import httpx
 
 from omniagent.engine.callbacks import EngineCallback
 from omniagent.engine.context import AgentContext
-from omniagent.utils.llm_client import ResponseTruncatedError, chat_completion
+from omniagent.utils.llm_client import (
+    ResponseTruncatedError,
+    chat_completion,
+    chat_completion_with_tools,
+)
 
 if TYPE_CHECKING:
     from omniagent.engine.budget import BudgetManager
@@ -178,6 +182,129 @@ class BaseEngine(ABC):
                 logger.warning(f"模型 {model_id} 失败: {e}，尝试下一个...")
         self.callback.on_error(f"所有模型均调用失败: {last_error}")
         raise RuntimeError(f"所有模型均调用失败: {last_error}")
+
+    # ── F5: 三层 LLM 降级 _call_llm_native ───────────────────
+
+    def _call_with_tools_once(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None,
+        response_format: dict[str, Any] | None,
+        max_tokens: int | None = None,
+    ) -> Any:
+        """单层 native FC 调用，遍历 ``model_priority``。
+
+        返回 ``LLMResponse`` 或 ``None``（本层降级信号）。
+
+        错误分流（与 ``_call_llm`` 一致 + 降级语义）：
+        - 401/403 = 终端错误，立即上抛（认证坏 Key 切模型无意义）；
+        - 400 = 该模型可能**不支持 tools/response_format** → 试下一个模型，
+          全部 400 则本层降级（返回 None），让外层切到下一层 tier；
+        - 429/5xx/网络/截断 = 瞬时 → 试下一个模型，全败则本层降级。
+        """
+        last_error: Exception | None = None
+        for model_id in self.model_priority:
+            try:
+                mc = self.model_configs.get(model_id)
+                mt = max_tokens or getattr(mc, "max_tokens", None) or 4096
+                creds = None
+                base = None
+                if mc:
+                    base = getattr(mc, "base_url", "") or None
+                    mk = getattr(mc, "api_key", "") or ""
+                    if mk and "/" in model_id:
+                        creds = {model_id.split("/", 1)[0].lower(): mk}
+                return chat_completion_with_tools(
+                    model_id, messages, tools=tools, response_format=response_format,
+                    credentials=creds, base_url=base, max_tokens=mt,
+                    temperature=self.temperature,
+                )
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status in (401, 403):
+                    self.callback.on_error(
+                        f"模型 {model_id} 认证失败 ({status})，请检查 API Key")
+                    raise RuntimeError(
+                        f"模型 {model_id} 认证失败 ({status})，请检查 API Key") from e
+                # 400（不支持 tools/format）/ 429 / 5xx：试下一个模型
+                last_error = e
+                logger.warning(
+                    f"模型 {model_id} native 调用 HTTP {status}: {e}，尝试下一个...")
+            except (
+                httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout,
+                httpx.RemoteProtocolError, httpx.WriteError, httpx.PoolTimeout,
+            ) as e:
+                last_error = e
+                logger.warning(f"模型 {model_id} 网络错误 ({type(e).__name__}): {e}，尝试下一个...")
+            except Exception as e:  # noqa: BLE001 — 本层降级，不中断
+                last_error = e
+                logger.warning(f"模型 {model_id} native 调用失败: {e}，尝试下一个...")
+        logger.warning(f"_call_with_tools_once 本层全败 ({last_error})，降级")
+        return None
+
+    @staticmethod
+    def _tool_calls_to_react_json(tool_calls: list[dict[str, Any]]) -> str:
+        """把原生 tool_calls 合成 ReAct JSON 串，供 ``parse_react`` 统一解析。
+
+        ReAct 一轮一工具，取首个 tool_call。形如
+        ``{"thought":"","action":name,"action_input":args}``。
+        """
+        import json
+
+        tc = tool_calls[0] if tool_calls else {}
+        name = tc.get("name", "")
+        args = tc.get("arguments", {}) or {}
+        return json.dumps(
+            {"thought": "", "action": name, "action_input": args},
+            ensure_ascii=False,
+        )
+
+    def _call_llm_native(
+        self,
+        messages: list[dict[str, str]],
+        tools_schema: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """F5: 三层 LLM 降级（依赖 R3 ``chat_completion_with_tools``）。
+
+        ① **Native FC + 结构化输出**：``tools + response_format``——模型直接返回
+          原生 ``tool_calls``（最可靠，无 JSON 解析风险）；
+        ② **tools only**：去 ``response_format``，只传 tools + ``parse_react``——
+          部分模型不支持 response_format 但支持 tools；
+        ③ **schema only**：只传 ``response_format`` 不传 tools——模型不识别原生
+          tools 时退化为 JSON 模式文本，由 ``parse_react`` 解析；
+        三层全败回退 ``_call_llm``（纯文本 + ``parse_react``，引擎现状最低层）。
+
+        返回字符串：tier①/② 拿到原生 ``tool_calls`` 时合成 ReAct JSON，否则返回
+        ``content``（由调用方 ``parse_react``）。无 ``tools_schema`` 且无
+        ``response_format`` 时直接回退 ``_call_llm``。
+        """
+        if not tools_schema and not response_format:
+            return self._call_llm(messages, max_tokens=max_tokens)
+
+        tiers = [
+            ("tier1_tools+format", tools_schema, response_format),
+            ("tier2_tools_only", tools_schema, None),
+            ("tier3_format_only", None, response_format),
+        ]
+        # 过滤掉 tools/format 都没有的空层（避免与 fallback 重复）
+        tiers = [(n, t, f) for n, t, f in tiers if (t or f)]
+
+        for tier_name, tools, fmt in tiers:
+            resp = self._call_with_tools_once(messages, tools, fmt, max_tokens)
+            if resp is None:
+                continue  # 本层降级，试下一层
+            if resp.has_tool_calls:
+                logger.info(f"_call_llm_native {tier_name} 拿到原生 tool_calls")
+                return self._tool_calls_to_react_json(resp.tool_calls)
+            if resp.content and resp.content.strip():
+                logger.info(f"_call_llm_native {tier_name} 返回文本（parse_react）")
+                return resp.content
+            logger.warning(f"_call_llm_native {tier_name} 返回空，降级下一层")
+
+        logger.warning("_call_llm_native 三层全败，回退 _call_llm")
+        return self._call_llm(messages, max_tokens=max_tokens)
 
     # ── F2: 合成提示注入 ─────────────────────────────────────
 

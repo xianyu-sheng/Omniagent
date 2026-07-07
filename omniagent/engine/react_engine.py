@@ -215,6 +215,7 @@ class ReActEngine(BaseEngine):
         tools: dict[str, dict] | None = None,
         callback: EngineCallback | None = None,
         model_configs: dict[str, Any] | None = None,
+        native_fc: bool = False,
     ) -> None:
         # R2: 公共属性（model_priority/callback/model_configs/temperature）与
         # _call_llm 由 BaseEngine 提供，消除四份复制与参数漂移。
@@ -229,6 +230,9 @@ class ReActEngine(BaseEngine):
         self._tool_executor = ToolExecutor()
         # F2: 空洞回答检测器（无状态，实例共享）
         self._hollow = HollowDetector()
+        # F5: 原生 function-calling 三层降级开关（默认关——需逐模型验证 FC 兼容性，
+        # 见审计 §9 line 84 风险注）。开启后 run() 用 _call_llm_native 替代 _call_llm。
+        self.native_fc = native_fc
 
     def _build_system_prompt(self) -> str:
         import sys
@@ -314,6 +318,10 @@ class ReActEngine(BaseEngine):
         requires_tools = self._input_requires_tools(user_input)
         no_tool_streak = 0  # 连续未执行工具的轮次
 
+        # F5: native_fc 开启时预构建 tools schema 与 response_format（循环内复用）
+        tools_schema = self._build_tools_schema() if (self.native_fc and self.tools) else None
+        response_format = self._react_response_format() if tools_schema is not None else None
+
         # F2: 三阶段软预算管理（每轮 run 新建，状态不跨 run 串扰）
         budget = BudgetManager(self.max_iterations)
         # F2: 空洞回答补救上限（最多拒绝 1 次，第二次强制接受避免死循环）
@@ -339,8 +347,12 @@ class ReActEngine(BaseEngine):
                     messages.append({"role": "user", "content": synth[1]})
                     logger.debug(f"ReAct 合成提示 [{synth[0]}]")
 
-            # 调用 LLM
-            response = self._call_llm(messages)
+            # 调用 LLM（F5: native_fc 开启时走三层降级，否则纯文本 _call_llm）
+            if self.native_fc and tools_schema is not None:
+                response = self._call_llm_native(
+                    messages, tools_schema, response_format)
+            else:
+                response = self._call_llm(messages)
             messages.append({"role": "assistant", "content": response})
 
             # 解析 LLM 输出
@@ -486,6 +498,49 @@ class ReActEngine(BaseEngine):
     def _parse_response(self, response: str) -> dict[str, Any]:
         """解析 LLM 的 JSON 输出（委托给 response_adapter 中间件）。"""
         return parse_react(response)
+
+    def _build_tools_schema(self) -> list[dict[str, Any]]:
+        """F5: 从 ``self.tools`` 构建 OpenAI 风格 tools schema 供 native FC。
+
+        每个 tool 形如::
+
+            {"type": "function", "function": {
+                "name": ..., "description": ...,
+                "parameters": {"type": "object", "properties": {pname: {...}}, "required": []}
+            }}
+
+        参数统一标为 string（ReAct 工具参数本就是字符串/对象，由 ToolExecutor 再校验）。
+        """
+        schema: list[dict[str, Any]] = []
+        for t in self.tools.values():
+            params = t.get("params", {}) or {}
+            properties = {
+                pname: {"type": "string", "description": str(pdesc)}
+                for pname, pdesc in params.items()
+            }
+            schema.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "required": [],
+                    },
+                },
+            })
+        return schema
+
+    @staticmethod
+    def _react_response_format() -> dict[str, Any]:
+        """F5: ReAct 响应的 response_format（JSON 模式，可移植性最好）。
+
+        用 ``json_object`` 而非 ``json_schema``——前者 OpenAI 兼容厂商普遍支持，
+        后者 strict 模式对 schema 约束更挑剔。模型输出合法 JSON 即可由
+        ``parse_react`` 解析。
+        """
+        return {"type": "json_object"}
 
     def _execute_tool(
         self,
