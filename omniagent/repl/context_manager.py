@@ -53,6 +53,8 @@ class ContextManager:
         self.compact_force = compact_force
         self.history: list[ConversationTurn] = []
         self._undo_stack: list[list[ConversationTurn]] = []
+        # P3-Q10 / §8.26.9：undo 栈上限，防多次 /compact 全量 deepcopy 线性堆积累积内存。
+        self.max_undo_snapshots: int = 5
         self._total_input_tokens: int = 0
         self._total_output_tokens: int = 0
         # F3 压缩持久化（可选）：设置后每次压缩写一份 markdown 快照
@@ -136,8 +138,15 @@ class ContextManager:
     # ── /undo 回退 ────────────────────────────────────────
 
     def save_snapshot(self) -> None:
-        """保存当前历史快照（用于 undo）。"""
+        """保存当前历史快照（用于 undo）。
+
+        P3-Q10 / §8.26.9：栈有 ``max_undo_snapshots`` 上限，超出时丢弃最旧快照，
+        避免多次 /compact 全量 deepcopy 线性堆积累积内存。
+        """
         self._undo_stack.append(copy.deepcopy(self.history))
+        overflow = len(self._undo_stack) - self.max_undo_snapshots
+        if overflow > 0:
+            del self._undo_stack[:overflow]
 
     def undo(self) -> bool:
         """

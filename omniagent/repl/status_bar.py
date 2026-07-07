@@ -50,8 +50,34 @@ class StatusBar:
     def set_streaming(self, enabled: bool) -> None:
         self._streaming = enabled
 
+    @staticmethod
+    def _parse_pct(ratio) -> float:
+        """解析 '85.0%' / 0.85 / None → 百分比浮点。"""
+        try:
+            if isinstance(ratio, str):
+                return float(ratio.strip('%'))
+            return float(ratio) * 100 if ratio <= 1 else float(ratio)
+        except (ValueError, TypeError, AttributeError):
+            return 0.0
+
+    def _fallback_panel(self, hint: str = "状态不可用") -> Panel:
+        """render 异常时的降级面板（§8.18.1）。"""
+        return Panel(f"[dim]{hint}[/dim]", style="dim", height=1, padding=(0, 1))
+
     def render(self) -> Panel:
-        """渲染状态栏内容。"""
+        """渲染状态栏内容。
+
+        P3-Q10 / §8.18.1：整体 try/except 兜底——stats 下标/字段异常时不让 Live 崩，
+        返回固定"状态不可用"面板。
+        P3-Q10 / §8.18.2：``⚠需压缩`` 警告置于状态行**首位**，窄屏截断只丢次要信息，
+        提示 /compact 的核心信号不被吃掉。
+        """
+        try:
+            return self._render_impl()
+        except Exception:
+            return self._fallback_panel()
+
+    def _render_impl(self) -> Panel:
         stats = self.ctx_mgr.stats()
         mode = self.registry.get_current_mode()
 
@@ -61,13 +87,7 @@ class StatusBar:
         ratio = stats["usage_ratio"]
         bar_width = 20
 
-        # 进度条
-        filled = min(int(float(ratio.strip('%')) / 100 * bar_width), bar_width)
-        # 解析百分比数值
-        try:
-            pct_val = float(ratio.strip('%'))
-        except (ValueError, AttributeError):
-            pct_val = 0.0
+        pct_val = self._parse_pct(ratio)
         filled = min(int(pct_val / 100 * bar_width), bar_width)
         empty = bar_width - filled
 
@@ -88,20 +108,20 @@ class StatusBar:
         # 流式状态
         stream_icon = "⚡流式" if self._streaming else "⏸阻塞"
 
-        # 组装状态行
-        status_parts = [
+        # 组装状态行——⚠需压缩 置首，窄屏截断只丢末尾次要项（§8.18.2）
+        status_parts: list[str] = []
+        if stats["needs_compact"]:
+            status_parts.append("[bold red]⚠需压缩[/bold red]")
+        status_parts.extend([
             f"[bold cyan]模型:[/bold cyan] {model_display}",
             f"[bold cyan]范式:[/bold cyan] {mode.name}",
             f"[bold cyan]Token:[/bold cyan] {bar} {used:,}/{max_tok:,} ({ratio})",
             f"[bold cyan]消息:[/bold cyan] {stats['total_messages']}",
             f"[bold cyan]{stream_icon}[/bold cyan]",
-        ]
+        ])
 
         if stats["undo_available"] > 0:
             status_parts.append(f"[dim]↩×{stats['undo_available']}[/dim]")
-
-        if stats["needs_compact"]:
-            status_parts.append("[bold red]⚠需压缩[/bold red]")
 
         content = "  │  ".join(status_parts)
 
@@ -113,7 +133,19 @@ class StatusBar:
         )
 
     def print_status(self) -> None:
-        """打印一行紧凑的状态信息（非 Live 模式）。"""
+        """打印一行紧凑的状态信息（非 Live 模式）。
+
+        P3-Q10 / §8.18.1：整体 try/except 兜底，异常时打印降级提示不崩。
+        """
+        try:
+            self._print_status_impl()
+        except Exception:
+            try:
+                self.console.print("[dim]状态不可用[/dim]")
+            except Exception:
+                pass
+
+    def _print_status_impl(self) -> None:
         stats = self.ctx_mgr.stats()
         mode = self.registry.get_current_mode()
 
@@ -127,11 +159,7 @@ class StatusBar:
 
         stream = "⚡" if self._streaming else "⏸"
 
-        # 紧凑单行
-        try:
-            pct_val = float(ratio.strip('%'))
-        except (ValueError, AttributeError):
-            pct_val = 0.0
+        pct_val = self._parse_pct(ratio)
 
         if pct_val > 80:
             token_color = "red"
@@ -140,13 +168,14 @@ class StatusBar:
         else:
             token_color = "green"
 
+        # ⚠建议 /compact 置首，保证可见（§8.18.2）
+        warn = "[bold red]⚠ 建议 /compact[/bold red] │ " if stats["needs_compact"] else ""
+
         line = (
-            f"[dim]┌─ {model_display} │ {mode.name} │ "
+            f"[dim]┌─ {warn}{model_display} │ {mode.name} │ "
             f"[{token_color}]Token {used:,}/{max_tok:,} ({ratio})[/{token_color}] │ "
             f"消息 {stats['total_messages']} │ {stream}"
         )
-        if stats["needs_compact"]:
-            line += " │ [bold red]⚠ 建议 /compact[/bold red]"
         line += "[/dim]"
 
         self.console.print(line)
