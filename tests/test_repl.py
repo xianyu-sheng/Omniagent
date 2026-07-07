@@ -825,3 +825,46 @@ class TestDetectIntentConditionalQuery:
             f"条件句/实时天气应识别为 query，实际未识别: {text}"
         )
 
+
+# ── chat 模板不污染 user content ──────────────────────────
+
+class TestChatTemplateNoPollution:
+    """P3-修复4（B-4）：chat 模板不应内联指令到 user content。
+
+    优化前的 chat 模板会在 user 文本后追加「（这是一句问候/闲聊，简洁
+    友好地回应即可…）」，与 system_hint（repl.py add_system_message
+    注入）重复，且污染 user 消息发到 LLM。
+    """
+
+    @pytest.mark.parametrize("text", [
+        "你好",
+        "hi",
+        "谢谢",
+        "再见",
+        "早上好",
+    ])
+    def test_chat_intent_optimize_returns_original_text(self, text):
+        """optimize_prompt 对 chat 类输入应返回原文本，不追加指令。"""
+        from omniagent.repl.prompt_optimizer import optimize_prompt
+
+        optimized, system_hint, was_optimized = optimize_prompt(text)
+        # 核心断言：优化后文本与原文本完全一致（不追加任何指令）
+        assert optimized == text, (
+            f"chat 模板污染了 user content: 原={text!r}, 优化后={optimized!r}"
+        )
+        # 仍返回 system_hint 用于注入到 LLM system 消息
+        assert system_hint is not None
+        assert "友好" in system_hint
+        # was_optimized 标志不影响 — 模板被「应用」过但内容未改
+        # （模板现在是 {task}，无变换副作用）
+
+    def test_chat_template_does_not_inline_directive(self):
+        """防御性测试：模板字符串本身不应包含内联指令文本。"""
+        from omniagent.repl.prompt_optimizer import TEMPLATES
+
+        chat_tmpl = next(t for t in TEMPLATES if t.intent == "chat")
+        # 模板不应内联问候/闲聊指令
+        assert "问候" not in chat_tmpl.template or chat_tmpl.template == "{task}", (
+            f"chat 模板仍内联指令: {chat_tmpl.template!r}"
+        )
+

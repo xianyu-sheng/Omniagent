@@ -275,10 +275,10 @@ TEMPLATES: list[PromptTemplate] = [
             r"^(?:谢谢|感谢|thanks|thank\s+you|多谢|辛苦了)[\s!！。.~]*$",
             r"^(?:再见|拜拜|bye|goodbye|88)[\s!！。.~]*$",
         ],
-        template=(
-            "{task}\n\n"
-            "（这是一句问候/闲聊，简洁友好地回应即可，不要展开成长篇技术回答。）"
-        ),
+        # P3-修复4 (B-4)：chat 模板不内联指令到 user content ——
+        # 指令通过 system_hint 注入（repl.py add_system_message），无重复
+        # 避免「你好\n\n（这是一句问候/闲聊…）」污染 user 消息发到 LLM
+        template="{task}",
         system_hint="你是一个友好的助手。对问候和致谢给出简短、自然的回应。",
     ),
 
