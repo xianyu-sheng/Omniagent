@@ -25,6 +25,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _isolated_ctx(ctx: AgentContext) -> AgentContext:
+    """为 reflector 构造隔离 ctx（P3-Q9 / §8.19.6）。
+
+    新 store 不含 reactor 写入的 ``step_N_result`` 等中间状态，避免反思基线被
+    污染；仅复制对话消息作历史兜底（ctx_mgr 注入时 reflector 走 ctx_mgr）。
+    """
+    fresh = AgentContext()
+    fresh.set_conversation_messages(list(ctx.get_conversation_messages()))
+    return fresh
+
+
 class PlanReactEngine:
     """
     Plan + React 组合引擎。
@@ -97,11 +108,13 @@ class PlanReactEngine:
             console.print(f"\n[cyan]🔄 步骤 {step_id}/{len(steps)}: {step_task}[/cyan]")
 
             # 构建包含全局上下文的 ReAct 输入
+            # P3-Q9 / §8.19.1：prev_context 只含成功步骤，失败错误串不当"已发现信息"
             prev_context = ""
-            if results:
+            ok_results = [r for r in results if r.get("status") == "ok"]
+            if ok_results:
                 prev_context = "\n\n## 之前步骤已发现的信息:\n" + "\n".join(
                     f"- 步骤 {r['step_id']} ({r['task']}): {r['result'][:300]}"
-                    for r in results
+                    for r in ok_results
                 )
 
             # 注入已发现的关键信息
@@ -119,13 +132,15 @@ class PlanReactEngine:
             )
 
             # 用 ReAct 执行当前步骤
+            # P3-Q9 / §8.19.1：标记步骤成败，失败错误串不进入 discovered_info/prev_context
+            status = "ok"
             try:
                 step_result = self.reactor.run(react_input, context=ctx, ctx_mgr=ctx_mgr)
                 if not step_result or not step_result.strip():
                     step_result = f"(步骤 {step_id} 执行完成，无文本输出)"
                 console.print(f"[green]  ✓ 步骤 {step_id} 完成 ({len(step_result)} 字符)[/green]")
 
-                # 从结果中提取关键信息（文件路径、命令输出等）
+                # 仅从成功结果提取关键信息（文件路径、命令输出等）
                 import re
                 # 提取文件路径
                 paths = re.findall(r'[\w/\\.-]+\.(?:py|js|ts|json|yaml|yml|toml|md|txt|bat|ps1|png|ico)', step_result)
@@ -138,6 +153,7 @@ class PlanReactEngine:
                     discovered_info.append("操作系统: Linux")
 
             except Exception as e:
+                status = "failed"
                 step_result = f"步骤执行失败: {e}"
                 console.print(f"[red]  ✗ 步骤 {step_id} 失败: {e}[/red]")
 
@@ -145,10 +161,12 @@ class PlanReactEngine:
                 "step_id": step_id,
                 "task": step_task,
                 "result": step_result,
+                "status": status,
             })
 
-            # 存入上下文
+            # 存入上下文（标记状态，供跨引擎消费方区分成功/失败）
             ctx.set(f"step_{step_id}_result", step_result)
+            ctx.set(f"step_{step_id}_status", status)
 
         # Phase 3: 汇总
         console.print(f"\n[dim]📝 Phase 3: 汇总结果...[/dim]")
@@ -156,20 +174,34 @@ class PlanReactEngine:
         return summary
 
     def _summarize(self, user_input: str, results: list[dict], analysis: str = "") -> str:
-        """汇总所有步骤的结果。"""
+        """汇总所有步骤的结果。
+
+        P3-Q9 / §8.19.1：区分成功/失败步骤——失败步骤单列"失败的步骤"段，
+        不与成功结果混排，避免错误串被当正常结果整合。
+        """
+        ok_results = [r for r in results if r.get("status") == "ok"]
+        failed_results = [r for r in results if r.get("status") == "failed"]
+
         results_text = "\n\n".join(
             f"## 步骤 {r['step_id']}: {r['task']}\n{r['result']}"
-            for r in results
-        )
+            for r in ok_results
+        ) if ok_results else "(无成功完成的步骤)"
 
-        # 如果所有步骤结果都很短，直接返回
-        all_short = all(len(r['result']) < 100 for r in results)
-        if all_short and len(results) <= 2:
-            return f"## 执行计划\n{analysis}\n\n## 执行结果\n{results_text}"
+        failed_text = ""
+        if failed_results:
+            failed_text = "\n\n## 失败的步骤\n" + "\n".join(
+                f"- 步骤 {r['step_id']} ({r['task']}): {r['result']}"
+                for r in failed_results
+            )
+
+        # 如果所有成功步骤结果都很短，直接返回
+        all_short = all(len(r['result']) < 100 for r in ok_results)
+        if all_short and len(ok_results) <= 2:
+            return f"## 执行计划\n{analysis}\n\n## 执行结果\n{results_text}{failed_text}"
 
         messages = [
             {"role": "system", "content": "你是一个任务汇总专家。请根据各步骤的执行结果，给出最终的完整回答。整合所有步骤的输出，形成连贯的结论。用中文回答。"},
-            {"role": "user", "content": f"原始任务: {user_input}\n\n任务分析: {analysis}\n\n各步骤执行结果:\n{results_text}"},
+            {"role": "user", "content": f"原始任务: {user_input}\n\n任务分析: {analysis}\n\n各步骤执行结果:\n{results_text}{failed_text}"},
         ]
 
         try:
@@ -181,9 +213,9 @@ class PlanReactEngine:
                 except Exception:
                     continue
             # LLM 全部失败，返回原始结果
-            return f"## 执行计划\n{analysis}\n\n## 执行结果\n{results_text}"
+            return f"## 执行计划\n{analysis}\n\n## 执行结果\n{results_text}{failed_text}"
         except Exception:
-            return f"## 执行计划\n{analysis}\n\n## 执行结果\n{results_text}"
+            return f"## 执行计划\n{analysis}\n\n## 执行结果\n{results_text}{failed_text}"
 
 
 class PlanReflectionEngine:
@@ -232,10 +264,12 @@ class PlanReflectionEngine:
 
         # Phase 2: Reflection 审查和修正
         logger.info("PlanReflection Phase 2: 反思审查")
+        # P3-Q9 / §8.19.6：reflector 用隔离 ctx，避免 reactor 中间状态污染反思基线
+        reflector_ctx = _isolated_ctx(ctx)
         try:
             final_output = self.reflector.run(
                 f"原始任务: {user_input}\n\n执行结果:\n{initial_output}",
-                context=ctx, ctx_mgr=ctx_mgr,
+                context=reflector_ctx, ctx_mgr=ctx_mgr,
             )
         except Exception as e:
             logger.warning(f"Reflection 阶段失败: {e}")
@@ -291,10 +325,12 @@ class ReactReflectionEngine:
 
         # Phase 2: Reflection 审查和修正
         logger.info("ReactReflection Phase 2: 反思审查")
+        # P3-Q9 / §8.19.6：reflector 用隔离 ctx，避免 reactor 中间状态污染反思基线
+        reflector_ctx = _isolated_ctx(ctx)
         try:
             final_output = self.reflector.run(
                 f"原始任务: {user_input}\n\n执行结果:\n{initial_output}",
-                context=ctx, ctx_mgr=ctx_mgr,
+                context=reflector_ctx, ctx_mgr=ctx_mgr,
             )
         except Exception as e:
             logger.warning(f"Reflection 阶段失败: {e}")
