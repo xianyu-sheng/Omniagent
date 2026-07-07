@@ -794,3 +794,34 @@ class TestHandleChatEmptyInput:
             f"纯空格不应污染 history，但有 {repl.ctx_mgr.history}"
         )
 
+
+# ── detect_intent 条件句 + 实时天气关键词 ──────────────────
+
+class TestDetectIntentConditionalQuery:
+    """P3-修复3（B-2）：query trigger 补条件句与实时天气关键词。
+
+    原 trigger 全部要求"查询/查/看"等显式动作，无法覆盖：
+    1. 条件句「如果今天下雨就告诉我」「要是下雪就提醒我」等
+    2. 纯问句「今天会不会下雨」「现在天气怎么样」等
+    3. 简短问句「今天天气」等
+    """
+
+    @pytest.mark.parametrize("text", [
+        "如果今天下雨就告诉我",          # 条件句 + 实时天气
+        "要是下雪就提醒我",              # 条件句 + 提醒
+        "假如明天晴天就告诉我",          # 条件句 + 实时天气
+        "万一下午下暴雨就告诉我",        # 条件句 + 实时天气
+        "今天会不会下雨",                # 纯问句 + 实时天气
+        "今天天气",                      # 简短问句 + 实时天气
+        "现在天气怎么样",                # 实时问句
+        "目前气温",                      # 实时问句
+        "今天多云",                      # 实时天气
+    ])
+    def test_conditional_or_realtime_weather_detected_as_query(self, text):
+        """条件句 / 实时天气关键词输入应识别为 query 意图。"""
+        from omniagent.repl.prompt_optimizer import detect_intent
+
+        assert detect_intent(text) == "query", (
+            f"条件句/实时天气应识别为 query，实际未识别: {text}"
+        )
+
