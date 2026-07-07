@@ -28,3 +28,14 @@ def _disable_security_for_tests():
     ToolNode._validate_path = permissive_validate
     yield
     ToolNode._validate_path = original
+
+
+@pytest.fixture(autouse=True)
+def _auto_confirm_destructive(monkeypatch):
+    """P3-Q8：测试中破坏性操作的 Confirm.ask 自动确认，避免阻塞 stdin。
+
+    需要测试"取消"路径时，在用例内 ``monkeypatch.delenv("OMNIAGENT_ASSUME_YES")``
+    并 patch ``_confirm`` 即可。
+    """
+    monkeypatch.setenv("OMNIAGENT_ASSUME_YES", "1")
+    yield

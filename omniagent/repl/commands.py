@@ -23,6 +23,23 @@ if TYPE_CHECKING:
 console = Console()
 
 
+def _confirm(prompt: str, default: bool = False) -> bool:
+    """破坏性操作确认对话框（P3-Q8 / §8.20.9）。
+
+    - 脚本/测试可设 ``OMNIAGENT_ASSUME_YES=1`` 跳过确认（非交互 seam）；
+    - 非交互环境无 stdin（``EOFError``）时保守取 ``default``（通常取消），
+      避免 hang 或崩；
+    - 交互环境走 ``rich.prompt.Confirm.ask``。
+    """
+    if os.environ.get("OMNIAGENT_ASSUME_YES"):
+        return True
+    from rich.prompt import Confirm as _Confirm
+    try:
+        return _Confirm.ask(prompt, default=default)
+    except EOFError:
+        return default
+
+
 # ── 命令注册表 ────────────────────────────────────────────
 
 COMMANDS: dict[str, dict[str, Any]] = {}
@@ -50,7 +67,15 @@ def dispatch_command(
     handler = _HANDLERS.get(name)
     if not handler:
         return f"未知命令: {name}。输入 /help 查看可用命令。"
-    return handler(args=args, registry=registry, ctx_mgr=ctx_mgr, session_state=session_state)
+    # P3-Q8 / §8.20.8：dispatch 兜底——任一 handler 抛异常（/code subprocess、
+    # /run scheduler、/mcp 网络、/edit LLM）不再冒泡崩 REPL，转为友好错误。
+    # ExitSignal 是正常退出意图，必须放行不能吞。
+    try:
+        return handler(args=args, registry=registry, ctx_mgr=ctx_mgr, session_state=session_state)
+    except ExitSignal:
+        raise
+    except Exception as e:
+        return f"❌ 命令执行失败 ({name}): {e}"
 
 
 # ── 命令处理器 ────────────────────────────────────────────
@@ -361,6 +386,9 @@ register_command("/clear", "清空对话历史", "/clear")
 
 @_handler("/clear")
 def _cmd_clear(*, ctx_mgr: ContextManager, **kwargs: Any) -> str:
+    # P3-Q8 / §8.20.9：清空历史不可逆，加确认（默认 Yes，低摩擦——误触仍可在此取消）。
+    if not _confirm("确认清空全部对话历史？", default=True):
+        return "已取消"
     ctx_mgr.clear()
     return "✅ 对话历史已清空"
 
@@ -402,6 +430,10 @@ def _cmd_load(*, args: str, ctx_mgr: ContextManager, session_state: dict, regist
         data = load_session(name)
     except FileNotFoundError as e:
         return f"❌ {e}"
+
+    # P3-Q8 / §8.20.9：加载会话会覆盖当前对话历史（未保存则丢失），加确认。
+    if not _confirm(f"加载会话 '{name}' 将覆盖当前对话历史，确认？", default=False):
+        return "已取消"
 
     # 恢复对话历史
     ctx_mgr.save_snapshot()
@@ -645,11 +677,10 @@ def _cmd_code(*, args: str, registry: ModelRegistry, ctx_mgr: ContextManager, se
         # A11: 执行 LLM 生成代码前人机确认，显示完整代码
         from rich.console import Console as _Console
         from rich.syntax import Syntax as _Syntax
-        from rich.prompt import Confirm as _Confirm
         console = kwargs.get("console") or _Console()
         console.print("\n[bold]⚠️ 即将执行 LLM 生成的代码:[/bold]")
         console.print(_Syntax(code, "python", theme="monokai", line_numbers=True))
-        if not _Confirm.ask("确认执行以上代码？", default=False):
+        if not _confirm("确认执行以上代码？", default=False):
             result_lines.append("⏭️ 已取消执行")
             return "\n".join(result_lines)
         result_lines.append("\n▶️  运行代码...")
@@ -815,6 +846,9 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
             return "用法: /mcp remove <name>"
         name = parts[1]
         if name in registry.clients:
+            # P3-Q8 / §8.20.9：移除 MCP 服务器会断开连接并重建工具映射，加确认。
+            if not _confirm(f"移除 MCP 服务器 '{name}'？", default=False):
+                return "已取消"
             registry.clients[name].close()
             del registry.clients[name]
             # 重建工具映射
@@ -1119,6 +1153,16 @@ def _cmd_shortcut(*, args: str, registry: ModelRegistry, session_state: dict[str
         parts2 = sub_args.split(maxsplit=1)
         name = parts2[0]
         run_args = parts2[1] if len(parts2) > 1 else ""
+        # P3-Q8 / §8.20.2/9：快捷指令可能含 LLM 生成的 shell 命令，运行前展示步骤并确认。
+        sc = manager.get(name)
+        if sc is None:
+            return f"❌ 未找到快捷指令 '{name}'"
+        steps_preview = "\n".join(f"  {i}. {s}" for i, s in enumerate(sc.steps, 1))
+        console.print(Panel(steps_preview or "  (无步骤)", title=f"快捷指令 '{name}' 将执行"))
+        if not _confirm(
+            f"运行快捷指令 '{name}'（将执行以上 {len(sc.steps)} 步命令）？", default=False
+        ):
+            return "已取消"
         return manager.execute(name, run_args)
 
     elif sub == "delete":
