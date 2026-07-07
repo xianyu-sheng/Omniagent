@@ -712,9 +712,12 @@ class REPL:
         self._inject_memories(user_input)
 
         # ── Prompt 优化（按需） ──────────────────────────
+        # 意图检测始终执行（detect_intent 纯正则，开销可忽略）：供 direct 模式路由使用——
+        # query 意图（天气/价格/汇率/新闻等实时数据）必然需要工具，direct 模式不向 API
+        # 传工具，须路由到 ReAct（见 _detect_tool_need）。
+        intent = self._detect_intent(user_input)
         if self.optimize_prompts:
             optimized, system_hint, was_optimized = optimize_prompt(user_input)
-            intent = self._detect_intent(user_input)
             console.print(f"[dim]🎯 意图: {get_intent_display(intent)}[/dim]")
 
             if was_optimized:
@@ -770,16 +773,19 @@ class REPL:
                 self._run_novel_engine(optimized, model_ids)
             else:
                 # direct 模式 — 直接调 LLM
-                self._run_direct(optimized, model_ids)
+                self._run_direct(optimized, model_ids, intent=intent)
         except KeyboardInterrupt:
             # B2: Ctrl+C 取消当前运行，返回提示符而非退出整个 REPL
             console.print("\n[yellow]⚠️ 已中断当前运行（Ctrl+C），返回提示符。[/yellow]")
 
-    def _run_direct(self, user_input: str, model_ids: list[str]) -> None:
+    def _run_direct(self, user_input: str, model_ids: list[str], intent: str | None = None) -> None:
         """直接对话模式。自动检测工具需求并委派给 ReAct 引擎。"""
-        # 检测是否需要工具执行（仅匹配明确的编程/文件/命令任务）
-        if self._detect_tool_need(user_input):
-            console.print("[cyan]🔧 检测到需要工具执行，自动切换到 ReAct 模式...[/cyan]")
+        # 检测是否需要工具执行（编程/文件/命令任务，或 query 意图实时数据查询）
+        if self._detect_tool_need(user_input, intent=intent):
+            if intent == "query":
+                console.print("[cyan]🔧 检测到信息查询（需实时数据），自动切换到 ReAct 模式...[/cyan]")
+            else:
+                console.print("[cyan]🔧 检测到需要工具执行，自动切换到 ReAct 模式...[/cyan]")
             self._run_react_engine(user_input, model_ids)
             return
 
@@ -1043,8 +1049,17 @@ class REPL:
     ]
 
     @classmethod
-    def _detect_tool_need(cls, text: str) -> bool:
-        """检测用户输入是否明确需要工具执行（仅匹配编程/文件/命令任务）。"""
+    def _detect_tool_need(cls, text: str, intent: str | None = None) -> bool:
+        """检测用户输入是否明确需要工具执行。
+
+        - ``query`` 意图（天气/价格/汇率/新闻等实时数据）：必然需要工具。direct 模式
+          不向 API 传工具，而 prompt_optimizer 会向其注入"使用工具获取实时数据"指令，
+          LLM 无工具可调时只能给出前言式回复（如"我来帮你查询…"）而非真实数据，
+          故 query 意图直接判 True，路由到 ReAct。
+        - 其余意图：仅匹配编程/文件/命令类正则（``_TOOL_PATTERNS``）。
+        """
+        if intent == "query":
+            return True
         for pattern in cls._TOOL_PATTERNS:
             if pattern.search(text):
                 return True

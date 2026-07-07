@@ -653,3 +653,36 @@ class TestToolDetection:
         assert REPL._detect_tool_need("今天天气怎么样") is False
         assert REPL._detect_tool_need("how does machine learning work") is False
         assert REPL._detect_tool_need("你好") is False
+
+    def test_query_intent_routes_to_react(self):
+        """query 意图（天气/价格/汇率/新闻等实时数据）必然需要工具 → 路由 ReAct。
+
+        回归：direct 模式不向 API 传工具，而 prompt_optimizer 会注入"使用工具获取
+        实时数据"指令，LLM 无工具可调时只给前言式回复（"我来帮你查询…"）。故 query
+        意图直接判 True，绕过 direct 走 ReAct。
+        """
+        from omniagent.repl.repl import REPL
+        from omniagent.repl.prompt_optimizer import detect_intent
+
+        # 这些输入应被识别为 query 意图，且需要工具
+        cases = [
+            "今天苏州的天气怎么样",
+            "今天黄金价格多少",
+            "现在美元兑人民币汇率多少",
+            "查看今天的科技新闻",
+        ]
+        for text in cases:
+            assert detect_intent(text) == "query", f"意图识别失败: {text}"
+            assert REPL._detect_tool_need(text, intent="query") is True, f"query 应触发工具: {text}"
+
+    def test_non_query_intent_not_auto_triggered(self):
+        """非 query 意图（chat/explain）且无编程/文件/命令关键词时不触发工具。"""
+        from omniagent.repl.repl import REPL
+        # chat 意图 + 无工具关键词 → False
+        assert REPL._detect_tool_need("你好", intent="chat") is False
+        assert REPL._detect_tool_need("谢谢", intent="chat") is False
+        # explain 意图 + 无工具关键词 → False
+        assert REPL._detect_tool_need("解释一下装饰器", intent="explain") is False
+        # 无 intent 时，天气等实时查询不触发（无天气正则，避免误判）
+        assert REPL._detect_tool_need("今天天气怎么样", intent=None) is False
+
