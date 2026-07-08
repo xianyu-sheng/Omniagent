@@ -561,8 +561,42 @@ class REPL:
                     continue
 
                 # 处理转义序列
+                # v0.3.0+ 修复（C-1）：转义序列累积器**总是**累积。
+                # 但有双守卫保证 paste_mode 状态机不死锁：
+                #   ① paste end \x1b[201~ **总是**优先识别并关闭 paste_mode
+                #      （否则粘贴内容里的 ESC 字节会让累积器错位、最终丢失
+                #      paste end → paste_mode 永远 True → REPL 挂死）
+                #   ② paste_mode 期间累积到 8 字节**子串搜索** paste end：
+                #      - 含 paste end → 前部分追加 buffer + 关闭 paste_mode
+                #      - 不含 → 整批追加 buffer（保留用户主动复制的 ESC 字节）
                 if seq_buffer or ch == '\x1b':
                     seq_buffer += ch
+                    # 守卫 ①：paste end 总是截留（精确 6 字符匹配）
+                    if seq_buffer == '\x1b[201~':
+                        paste_mode = False
+                        seq_buffer = ''
+                        paste_last_byte_at = None
+                        _redraw_line()
+                        continue
+                    if paste_mode:
+                        # 守卫 ②：累积 8 字节时子串搜索 paste end
+                        if '\x1b[201~' in seq_buffer:
+                            idx = seq_buffer.index('\x1b[201~')
+                            for c in seq_buffer[:idx]:
+                                current_line.insert(cursor_pos, c)
+                                cursor_pos += 1
+                            paste_mode = False
+                            seq_buffer = ''
+                            paste_last_byte_at = None
+                            _redraw_line()
+                            continue
+                        if len(seq_buffer) >= 8:
+                            for c in seq_buffer:
+                                current_line.insert(cursor_pos, c)
+                                cursor_pos += 1
+                            seq_buffer = ''
+                            paste_last_byte_at = _time.monotonic()
+                        continue
                     if len(seq_buffer) == 1 and ch == '\x1b':
                         continue  # 等待更多字节
 
@@ -668,6 +702,13 @@ class REPL:
                         if cursor_pos > 0:
                             current_line.pop(cursor_pos - 1)
                             cursor_pos -= 1
+                    elif ch == '\x1b':
+                        # v0.3.0+ 修复（C-1 配套）：粘贴期间遇到 ESC 字节
+                        # 不再走转义序列累积器（已在上方 if 屏蔽），改当普通
+                        # 字符插入 buffer——用户主动复制粘贴含 ANSI 转义序列
+                        # 的代码（如 `echo -e "\033[31m红色\033[0m"`）应保留 ESC
+                        current_line.insert(cursor_pos, ch)
+                        cursor_pos += 1
                     elif ord(ch) >= 0x20:
                         current_line.insert(cursor_pos, ch)
                         cursor_pos += 1

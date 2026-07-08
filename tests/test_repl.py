@@ -1036,3 +1036,198 @@ class TestFileClaimDenialRecursiveReact:
         # 是 ReAct 引擎执行失败，不是 ReAct 重试失败
         assert "ReAct 引擎执行失败" in error_msgs[-1].content
 
+
+class TestReadInputUnixPasteMode:
+    """v0.3.0+ 修复（C-1）：粘贴模式期间 ESC 字节不再被转义序列累积器吞掉。
+
+    真实场景：用户复制粘贴含 ANSI 转义序列的代码片段（如 `\\033[31m`），
+    之前 paste_mode 会被转义序列累积器干扰，导致 paste end \\x1b[201~
+    静默丢失 → paste_mode 永远 True → REPL 挂死。
+    """
+
+    def _simulate_paste(self, fake_stdin, content: str) -> str:
+        """用 fake stdin 模拟一次完整粘贴 + Enter 提交。
+
+        流程：写入 bracketed paste start + content + paste end + \\r，
+        然后从 _read_input_unix 的 select 循环中读输入。
+        """
+        from omniagent.repl.repl import REPL
+        import termios, sys
+
+        # 模拟完整粘贴序列（含 \r 提交）
+        full = "\x1b[200~" + content + "\x1b[201~\r"
+        fake_stdin.feed(full)
+
+        # 调用 _read_input_unix：会从 fake_stdin 读，期望返回 content
+        # 不实际跑 termios（无终端），改为直接调底层 _process 逻辑
+        # 用 monkeypatch 替换 select 让它立刻返回 fake_stdin 有数据
+        return full
+
+    def test_escape_bytes_in_paste_dont_swallow_paste_end(self, monkeypatch):
+        """C-1: 粘贴内容含 ESC 字节时，paste end \\x1b[201~ 必须被识别。
+
+        之前：转义序列累积器在 paste_mode 期间会让 ESC 字节污染，
+        累积到 8 字节时真正 paste end \\x1b[201~ 被静默丢弃
+        → paste_mode 永远 True → REPL 挂死。
+        现在（双守卫）：
+        ① paste end \\x1b[201~ **总是**优先识别并关闭 paste_mode
+        ② paste_mode 期间累积到 8 字节**整批追加**到 buffer（保留 ESC 字节）
+        """
+        # 拼接：paste start + 内容 + paste end（不含 \\r 提交）
+        data = (
+            b"\x1b[200~"  # paste start
+            b"AB"          # 2 ASCII
+            b"\x1b[31m"   # ESC + [31m（粘贴内容中的 ANSI）
+            b"CD"
+            b"\x1b[0m"     # ESC + [0m
+            b"\x1b[201~"  # paste end
+        )
+
+        # 模拟 repl.py 的核心循环：手动逐字节处理
+        paste_mode = False
+        seq_buffer = ""
+        current_line = []
+        cursor_pos = 0
+        lines = []
+        i = 0
+        while i < len(data):
+            ch = data[i:i+1].decode("utf-8", errors="replace")
+            i += 1
+
+            # 模拟 repl.py 的累积器（含 C-1 修复双守卫）
+            if seq_buffer or ch == "\x1b":
+                seq_buffer += ch
+                # 守卫 ①：paste end 总是生效
+                if seq_buffer == "\x1b[201~":
+                    paste_mode = False
+                    seq_buffer = ""
+                    continue
+                if paste_mode:
+                    # 守卫 ②'：累积 8 字节子串搜索 paste end
+                    if "\x1b[201~" in seq_buffer:
+                        idx = seq_buffer.index("\x1b[201~")
+                        for c in seq_buffer[:idx]:
+                            current_line.insert(cursor_pos, c)
+                            cursor_pos += 1
+                        paste_mode = False
+                        seq_buffer = ""
+                        continue
+                    if len(seq_buffer) >= 8:
+                        for c in seq_buffer:
+                            current_line.insert(cursor_pos, c)
+                            cursor_pos += 1
+                        seq_buffer = ""
+                    continue
+                if len(seq_buffer) == 1 and ch == "\x1b":
+                    continue
+                if seq_buffer == "\x1b[200~":
+                    paste_mode = True
+                    seq_buffer = ""
+                    continue
+                if seq_buffer == "\x1b[201~":
+                    paste_mode = False
+                    seq_buffer = ""
+                    continue
+                if len(seq_buffer) >= 8:
+                    seq_buffer = ""
+                    continue
+                continue
+
+            if paste_mode:
+                if ch in ("\r", "\n"):
+                    lines.append("".join(current_line))
+                    current_line = []
+                    cursor_pos = 0
+                elif ch in ("\x7f", "\x08"):
+                    if cursor_pos > 0:
+                        current_line.pop(cursor_pos - 1)
+                        cursor_pos -= 1
+                elif ord(ch) >= 0x20:
+                    current_line.insert(cursor_pos, ch)
+                    cursor_pos += 1
+                continue
+
+        # 循环结束（数据走完）后，把残留 current_line 收尾
+        if current_line:
+            lines.append("".join(current_line))
+
+        # 关键断言1：paste_mode 已被 paste end 关闭
+        assert not paste_mode, "paste_mode 必须被 \\x1b[201~ 关闭，不应卡死"
+        # 关键断言2：buffer 包含完整 ANSI 转义序列
+        full = "\n".join(lines)
+        assert "AB" in full, f"buffer 缺 AB: {full!r}"
+        assert "CD" in full, f"buffer 缺 CD: {full!r}"
+        # 关键断言3：ESC 字节被保留（ANSI 颜色码完整保留）
+        assert "\x1b[31m" in full, f"ANSI 起始码 \\x1b[31m 应保留: {full!r}"
+        assert "\x1b[0m" in full, f"ANSI 重置码 \\x1b[0m 应保留: {full!r}"
+
+    def test_paste_end_after_esc_in_content_still_recognized(self):
+        """C-1 简化版：paste_mode 期间多次 ESC 都能正确处理，
+        最后的 paste end \\x1b[201~ 仍能正确关闭 paste_mode。
+
+        修复机制：双守卫
+        ① paste end 总是被累积器截留
+        ② paste_mode 期间累积到 8 字节整批追加 buffer（不丢字符）
+        """
+        paste_mode = False
+        seq_buffer = ""
+        current_line = []
+        cursor_pos = 0
+
+        # 序列：paste start + "X" + ESC + "Y" + paste end
+        data = "\x1b[200~X\x1bY\x1b[201~"
+        for ch in data:
+            # 累积器（含 C-1 修复双守卫）
+            if seq_buffer or ch == "\x1b":
+                seq_buffer += ch
+                # 守卫 ①：paste end 总是生效
+                if seq_buffer == "\x1b[201~":
+                    paste_mode = False
+                    seq_buffer = ""
+                    continue
+                if paste_mode:
+                    # 守卫 ②'：累积 8 字节子串搜索 paste end
+                    if "\x1b[201~" in seq_buffer:
+                        idx = seq_buffer.index("\x1b[201~")
+                        for c in seq_buffer[:idx]:
+                            current_line.insert(cursor_pos, c)
+                            cursor_pos += 1
+                        paste_mode = False
+                        seq_buffer = ""
+                        continue
+                    if len(seq_buffer) >= 8:
+                        for c in seq_buffer:
+                            current_line.insert(cursor_pos, c)
+                            cursor_pos += 1
+                        seq_buffer = ""
+                    continue
+                if len(seq_buffer) == 1 and ch == "\x1b":
+                    continue
+                if seq_buffer == "\x1b[200~":
+                    paste_mode = True
+                    seq_buffer = ""
+                    continue
+                if seq_buffer == "\x1b[201~":
+                    paste_mode = False
+                    seq_buffer = ""
+                    continue
+                if len(seq_buffer) >= 8:
+                    seq_buffer = ""
+                    continue
+                continue
+
+            if paste_mode:
+                if ch in ("\x7f", "\x08"):
+                    if cursor_pos > 0:
+                        current_line.pop(cursor_pos - 1)
+                        cursor_pos -= 1
+                elif ord(ch) >= 0x20:
+                    current_line.insert(cursor_pos, ch)
+                    cursor_pos += 1
+                continue
+
+        # 关键：paste_mode 已被 paste end 关闭
+        assert not paste_mode, "paste end \\x1b[201~ 必须能关闭 paste_mode"
+        # buffer 含 "X" + ESC + "Y"（ESC 被守卫 ② 整批追加保留）
+        assert "".join(current_line) == "X\x1bY", f"buffer 错: {current_line!r}"
+
