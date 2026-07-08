@@ -47,6 +47,18 @@
 - 观察项-1：ReAct 引擎异常时，防御性 catch 确保 user/assistant 消息成对，防止 history 孤立序列。
 - `_check_first_run` 提示信息统一 dim 风格。
 
+### 终端输入体验修复
+
+- **Shift+Enter 多行输入**：Linux 端 `_read_input_unix` 仅处理了 `Alt+Enter`（`\x1b\r`），
+  未处理现代终端（kitty/WezTerm/gnome-terminal）的 Shift+Enter 序列 `\x1b[13;2u`，
+  导致序列被丢弃无法换行。新增 `\x1b[13;2u` 匹配，与 Alt+Enter 同等处理为多行换行。
+- **Ctrl+Shift+V 粘贴异常**：粘贴时未启用终端粘贴括号模式（bracketed paste），粘贴内容
+  中的特殊字符（如 `\x1b`）被误解析为转义序列，导致字符错乱。启用 `\x1b[?2004h`
+  粘贴括号模式，粘贴期间批量修改缓冲区不触发逐字符 `_redraw_line()`，粘贴结束时
+  一次性重绘。
+- **键入延迟**：粘贴括号模式修复同步解决了粘贴延迟问题——粘贴 N 个字符从 O(N²) 次
+  `sys.stdout.flush()` 降为 1 次。正常打字 5-10 字符/秒不受影响。
+
 ## [0.2.0] — 2026-07-07
 
 本版本对照《差距分析与改进建议》审核文档（`docs/差距分析与改进建议.md`，31 轮审查

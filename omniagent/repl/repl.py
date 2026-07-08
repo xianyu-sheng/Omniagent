@@ -226,7 +226,7 @@ class REPL:
         # ── 随机提示 ──
         tips = [
             "[bold cyan]/help[/bold cyan] 查看命令  [dim]·[/dim]  [bold cyan]/model[/bold cyan] 切换模型  [dim]·[/dim]  [bold cyan]/mode[/bold cyan] 切换范式",
-            "Shift+Enter 多行输入  [dim]·[/dim]  Enter 发送  [dim]·[/dim]  Ctrl+C 退出",
+            "Shift+Enter / Alt+Enter 多行输入  [dim]·[/dim]  Enter 发送  [dim]·[/dim]  Ctrl+C 退出",
             "[bold cyan]/setup[/bold cyan] 配置向导  [dim]·[/dim]  [bold cyan]/tools[/bold cyan] 查看工具  [dim]·[/dim]  [bold cyan]/mcp[/bold cyan] 扩展",
         ]
         tip = random.choice(tips)
@@ -484,10 +484,19 @@ class REPL:
         try:
             tty.setraw(fd)
 
+            # ── 启用终端粘贴括号模式 ────────────────────
+            # 粘贴时终端发送 \x1b[200~ 开始 / \x1b[201~ 结束，
+            # 从而在粘贴期间批量处理字符，避免每字符一次重绘。
+            sys.stdout.write('\x1b[?2004h')
+            sys.stdout.flush()
+
             lines: list[str] = []
             current_line: list[str] = []
             cursor_pos: int = 0
             prompt_active = True
+
+            # ── 粘贴模式状态 ─────────────────────────────
+            paste_mode = False
 
             def _redraw_line() -> None:
                 """清除当前行并重绘（正确处理 CJK 宽字符）。"""
@@ -538,10 +547,34 @@ class REPL:
                     if len(seq_buffer) == 1 and ch == '\x1b':
                         continue  # 等待更多字节
 
+                    # ── 粘贴括号模式 ────────────────────
+                    if seq_buffer == '\x1b[200~':
+                        # 开始粘贴 — 暂停逐字符重绘
+                        paste_mode = True
+                        seq_buffer = ""
+                        continue
+                    if seq_buffer == '\x1b[201~':
+                        # 粘贴结束 — 一次性重绘
+                        paste_mode = False
+                        _redraw_line()
+                        seq_buffer = ""
+                        continue
+
                     # 尝试匹配已知序列
                     # Alt+Enter: \x1b\r
                     if seq_buffer == '\x1b\r':
                         # 插入换行
+                        lines.append("".join(current_line))
+                        current_line = []
+                        cursor_pos = 0
+                        sys.stdout.write("\r\n")
+                        sys.stdout.write(CONTINUATION)
+                        sys.stdout.flush()
+                        seq_buffer = ""
+                        continue
+
+                    # Shift+Enter（kitty 键盘协议）: \x1b[13;2u
+                    if seq_buffer == '\x1b[13;2u':
                         lines.append("".join(current_line))
                         current_line = []
                         cursor_pos = 0
@@ -599,6 +632,26 @@ class REPL:
                     # 否则继续累积
                     continue
 
+                # ── 粘贴模式：缓冲修改，不重绘 ──
+                if paste_mode:
+                    if ch in ('\r', '\n'):
+                        # 粘贴中的换行：完成当前行，开始新行
+                        lines.append("".join(current_line))
+                        current_line = []
+                        cursor_pos = 0
+                    elif ch == '\x03':   # Ctrl+C during paste
+                        sys.stdout.write("\r\n")
+                        sys.stdout.flush()
+                        raise KeyboardInterrupt
+                    elif ch in ('\x7f', '\x08'):  # Backspace
+                        if cursor_pos > 0:
+                            current_line.pop(cursor_pos - 1)
+                            cursor_pos -= 1
+                    elif ord(ch) >= 0x20:
+                        current_line.insert(cursor_pos, ch)
+                        cursor_pos += 1
+                    continue
+
                 # ── 普通字符处理 ──
 
                 if ch in ('\r', '\n'):
@@ -650,6 +703,9 @@ class REPL:
             return "\n".join(lines)
 
         finally:
+            # 禁用粘贴括号模式，恢复终端设置
+            sys.stdout.write('\x1b[?2004l')
+            sys.stdout.flush()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def _handle_command(self, raw: str) -> bool:
