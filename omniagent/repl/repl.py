@@ -92,6 +92,12 @@ class REPL:
             "_novel_manager": self._novel_manager,
         }
 
+        # v0.3.0+ 修复（C-3）：bash 风格——单次 Ctrl+C 重画 prompt 继续，
+        # 连续两次 Ctrl+C 才退出 REPL。修复前空 prompt + Ctrl+C 直接退出，
+        # 5/9 终端类型（xterm256color/alacritty/gnome-256color/screen-256color/vt100）
+        # 在空行 Ctrl+C 时丢失输入机会。
+        self._pending_exit: bool = False
+
     def _make_callback(self):
         """根据 verbose 状态创建引擎回调。"""
         from omniagent.engine.callbacks import ConsoleCallback
@@ -160,8 +166,18 @@ class REPL:
             try:
                 user_input = self._read_input()
             except (KeyboardInterrupt, EOFError):
-                console.print("\n[dim]再见！[/dim]")
-                break
+                # v0.3.0+ 修复（C-3）：bash 风格——单次 Ctrl+C 重画 prompt，
+                # 连续两次才退出。修复前空行 Ctrl+C 在 5/9 终端类型（xterm256color/
+                # alacritty/gnome-256color/screen-256color/vt100）直接退出 REPL。
+                if self._pending_exit:
+                    console.print("\n[dim]再见！[/dim]")
+                    break
+                self._pending_exit = True
+                console.print("\n[dim]· 已中断，按 Ctrl+C 再次退出[/dim]")
+                continue
+
+            # 成功读取输入 → 重置 pending_exit
+            self._pending_exit = False
 
             if not user_input:
                 continue
