@@ -390,25 +390,52 @@ def parse_model_id(model_id: str) -> tuple[str, str]:
     return provider.lower(), name
 
 
-def build_endpoint(model_id: str, credentials: dict[str, str] | None = None, base_url: str | None = None) -> ModelEndpoint:
-    """根据 model_id 构建完整的调用端点信息。"""
-    provider, model_name = parse_model_id(model_id)
-    if provider not in _PROVIDER_DEFAULTS:
-        raise ValueError(f"不支持的 provider: {provider}，支持: {list(_PROVIDER_DEFAULTS.keys())}")
 
-    defaults = _PROVIDER_DEFAULTS[provider]
+def _load_custom_provider_config(provider_key: str) -> dict | None:
+    """v0.4.0: 从 credentials.yaml 加载自定义模型商配置。"""
+    try:
+        import yaml as _yaml
+        path = Path.home() / ".omniagent" / "credentials.yaml"
+        if not path.exists():
+            return None
+        with open(path, encoding="utf-8") as f:
+            data = _yaml.safe_load(f) or {}
+        return data.get("_custom_providers", {}).get(provider_key)
+    except Exception:
+        return None
+
+
+def build_endpoint(model_id: str, credentials: dict[str, str] | None = None, base_url: str | None = None) -> ModelEndpoint:
+    """根据 model_id 构建完整的调用端点信息。
+
+    v0.4.0: 支持动态注册的自定义模型商。
+    """
+    provider, model_name = parse_model_id(model_id)
     creds = credentials or _load_credentials()
+
+    # v0.4.0: 先查内置 + 动态注册的 defaults
+    defaults = _PROVIDER_DEFAULTS.get(provider)
+    if defaults is None:
+        # 尝试从自定义模型商加载
+        custom = _load_custom_provider_config(provider)
+        if custom:
+            defaults = {"base_url": custom["base_url"],
+                        "env_key": "", "max_output_tokens": 8192}
+        else:
+            raise ValueError(
+                f"不支持的 provider: {provider}，内置: {list(_PROVIDER_DEFAULTS.keys())}。"
+                f"可使用 /setup 注册自定义模型商。"
+            )
+
     api_key = creds.get(provider, "")
     if not api_key:
         raise ValueError(
             f"未找到 {provider} 的 API Key。"
-            f"请在 {_CREDENTIALS_PATH} 或环境变量 {defaults['env_key']} 中配置。"
+            f"请在 {_CREDENTIALS_PATH} 或环境变量 {defaults.get('env_key', '')} 中配置。"
         )
     return ModelEndpoint(
         provider=provider,
         model_name=model_name,
-        # v0.3.0+ 修复（C-2 延伸）：base_url 优先级：函数参数 > <PROVIDER>_BASE_URL env > defaults
-        # 兼容 Claude Code / Anthropic SDK 用户通过 ANTHROPIC_BASE_URL 走代理的场景
         base_url=(
             base_url
             or os.getenv(f"{provider.upper()}_BASE_URL")

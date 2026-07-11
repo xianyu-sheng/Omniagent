@@ -350,6 +350,24 @@ def get_configured_providers(*, refresh_models: bool = True) -> list[ProviderInf
             model_error=MODEL_FETCH_ERRORS.get(key, ""),
         )
         configured.append(info_copy)
+
+    # v0.4.0: 合并自定义模型商
+    for key, cfg in _load_custom_providers().items():
+        api_key = cfg.get("api_key", "")
+        if not api_key:
+            continue
+        info_copy = ProviderInfo(
+            name=cfg.get("name", key),
+            key=key,
+            base_url=cfg.get("base_url", ""),
+            env_key="",
+            models=cfg.get("models", []),
+            api_key=api_key,
+            model_list_path="models",
+            model_error="",
+        )
+        configured.append(info_copy)
+
     return configured
 
 
@@ -394,3 +412,64 @@ def _sort_models_by_priority(
     not_in_priority = [m for m in fetched if m not in p_idx]
     in_priority.sort(key=lambda m: p_idx[m])
     return in_priority + not_in_priority
+
+# ── 动态模型商注册 (v0.4.0) ──────────────────────────────
+
+_CUSTOM_PROVIDERS_KEY = "_custom_providers"
+
+
+def register_custom_provider(name: str, base_url: str, api_key: str):
+    """动态注册自定义模型商。返回 ProviderInfo。
+
+    v0.4.0: 用户无需等代码更新即可接入任意 OpenAI 兼容 API。
+    自定义模型商存入 credentials.yaml 的 _custom_providers 段。
+    """
+    import re as _re
+    key = _re.sub(r"[^a-z0-9]", "", name.lower())[:20]
+
+    info = ProviderInfo(
+        name=name, key=key, base_url=base_url.rstrip("/"),
+        env_key="", models=[], api_key=api_key,
+        model_list_path="models",
+    )
+    models = fetch_provider_models(info, api_key)
+    if models:
+        info.models = models
+    else:
+        info.models = ["(auto-fetch failed, check base_url and API key)"]
+
+    _save_custom_provider(info)
+    return info
+
+
+def remove_custom_provider(key: str) -> bool:
+    """删除自定义模型商。"""
+    all_custom = _load_custom_providers()
+    if key not in all_custom:
+        return False
+    del all_custom[key]
+    creds = load_credentials()
+    creds[_CUSTOM_PROVIDERS_KEY] = all_custom
+    save_credentials(creds)
+    return True
+
+
+def _load_custom_providers() -> dict:
+    """从 credentials.yaml 加载自定义模型商。"""
+    if not CREDENTIALS_PATH.exists():
+        return {}
+    with open(CREDENTIALS_PATH, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data.get(_CUSTOM_PROVIDERS_KEY, {}) or {}
+
+
+def _save_custom_provider(info: ProviderInfo) -> None:
+    """持久化自定义模型商。"""
+    all_custom = _load_custom_providers()
+    all_custom[info.key] = {
+        "name": info.name, "base_url": info.base_url,
+        "api_key": info.api_key, "models": info.models,
+    }
+    creds = load_credentials()
+    creds[_CUSTOM_PROVIDERS_KEY] = all_custom
+    save_credentials(creds)
