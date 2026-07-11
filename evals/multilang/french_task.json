@@ -1,0 +1,7 @@
+{
+  "id": "multilang-french",
+  "category": "multilingual",
+  "prompt": "Réécris cette fonction Python pour utiliser asyncio: def fetch_all(urls):\n    results = []\n    for url in urls:\n        resp = requests.get(url)\n        results.append(resp.text)\n    return results",
+  "expected_tools": ["write_file", "command"],
+  "success_criteria": "La fonction est réécrite en utilisant asyncio + aiohttp (ou httpx async) avec gather pour la concurrence."
+}

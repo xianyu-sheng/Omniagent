@@ -1,0 +1,7 @@
+{
+  "id": "multilang-chinese",
+  "category": "multilingual",
+  "prompt": "用 asyncio 重写这个函数: def fetch_all(urls):\n    results = []\n    for url in urls:\n        resp = requests.get(url)\n        results.append(resp.text)\n    return results",
+  "expected_tools": ["write_file", "command"],
+  "success_criteria": "函数被改写为使用 asyncio + aiohttp (或 httpx async) 并发执行."
+}

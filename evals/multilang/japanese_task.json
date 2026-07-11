@@ -1,0 +1,7 @@
+{
+  "id": "multilang-japanese",
+  "category": "multilingual",
+  "prompt": "この関数を async/await を使うように書き直してください: def fetch_all(urls):\n    results = []\n    for url in urls:\n        resp = requests.get(url)\n        results.append(resp.text)\n    return results",
+  "expected_tools": ["write_file", "command"],
+  "success_criteria": "関数が asyncio + aiohttp (または httpx async) を使った並行処理に書き換えられている。"
+}

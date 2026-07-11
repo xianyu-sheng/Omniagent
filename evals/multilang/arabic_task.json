@@ -1,0 +1,7 @@
+{
+  "id": "multilang-arabic",
+  "category": "multilingual",
+  "prompt": "أعد كتابة هذه الدالة باستخدام asyncio: def fetch_all(urls):\n    results = []\n    for url in urls:\n        resp = requests.get(url)\n        results.append(resp.text)\n    return results",
+  "expected_tools": ["write_file", "command"],
+  "success_criteria": "تمت إعادة كتابة الدالة باستخدام asyncio + aiohttp (أو httpx async) مع gather للتزامن."
+}

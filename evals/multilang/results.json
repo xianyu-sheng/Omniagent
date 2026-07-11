@@ -1,0 +1,70 @@
+{
+  "summary": {
+    "model": "deepseek/deepseek-v4-pro",
+    "max_turns": 3,
+    "workdir": "/tmp/omniagent_real_workdir",
+    "total_tasks": 5,
+    "successes": 3,
+    "success_rate": "60%",
+    "total_tokens": 145768
+  },
+  "results": [
+    {
+      "task": "chinese_task.json",
+      "language": "中文 (Chinese)",
+      "success": true,
+      "total_tokens": 26841,
+      "total_calls": 7,
+      "tool_calls": 4,
+      "tools_used": ["list_files", "write_file", "write_file", "command"],
+      "turns_used": 2,
+      "scoring": "executed all 2 expected tools"
+    },
+    {
+      "task": "french_task.json",
+      "language": "Français (French)",
+      "success": false,
+      "total_tokens": 25841,
+      "total_calls": 7,
+      "tool_calls": 4,
+      "tools_used": ["write_file", "list_files", "read_file", "write_file"],
+      "turns_used": 3,
+      "scoring": "missing expected tools: ['command']",
+      "bug_observed": "LLM 在 3 轮内未执行 command 工具（语法验证），仅 write_file + read_file 自我声明完成"
+    },
+    {
+      "task": "japanese_task.json",
+      "language": "日本語 (Japanese)",
+      "success": true,
+      "total_tokens": 31239,
+      "total_calls": 8,
+      "tool_calls": 5,
+      "tools_used": ["write_file", "write_file", "read_file", "write_file", "command"],
+      "turns_used": 3,
+      "scoring": "executed all 2 expected tools"
+    },
+    {
+      "task": "korean_task.json",
+      "language": "한국어 (Korean)",
+      "success": false,
+      "total_tokens": 25379,
+      "total_calls": 7,
+      "tool_calls": 3,
+      "tools_used": ["write_file", "write_file", "read_file"],
+      "turns_used": 3,
+      "scoring": "missing expected tools: ['command']",
+      "bug_observed": "LLM 声称 '작업이 완료되었습니다' 但未实际执行 command 验证，引擎按 max_turns=3 早停"
+    },
+    {
+      "task": "arabic_task.json",
+      "language": "العربية (Arabic)",
+      "success": true,
+      "total_tokens": 36468,
+      "total_calls": 9,
+      "tool_calls": 5,
+      "tools_used": ["write_file", "write_file", "read_file", "command", "command"],
+      "turns_used": 3,
+      "scoring": "executed all 2 expected tools"
+    }
+  ]
+}

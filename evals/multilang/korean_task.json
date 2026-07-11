@@ -1,0 +1,7 @@
+{
+  "id": "multilang-korean",
+  "category": "multilingual",
+  "prompt": "이 함수를 async/await를 사용하도록 다시 작성하세요: def fetch_all(urls):\n    results = []\n    for url in urls:\n        resp = requests.get(url)\n        results.append(resp.text)\n    return results",
+  "expected_tools": ["write_file", "command"],
+  "success_criteria": "함수가 asyncio + aiohttp (또는 httpx async)을 사용한 동시 처리로 재작성되었다."
+}
