@@ -111,6 +111,10 @@ class ModelPool:
         with self._lock:
             return list(self._entries.values())
 
+    def is_empty(self) -> bool:
+        with self._lock:
+            return len(self._entries) == 0
+
     # ── 健康更新 ───────────────────────────────────────
 
     def record_success(self, alias: str, latency: float = 0.0) -> None:
