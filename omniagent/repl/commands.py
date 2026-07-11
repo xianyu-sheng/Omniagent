@@ -916,7 +916,7 @@ def _cmd_setup(*, session_state: dict, **kwargs: Any) -> str:
 
     repl = session_state.get("_repl")
     if repl:
-        interactive_setup(repl.registry)
+        interactive_setup(repl.registry, model_pool=repl.model_pool)
         return ""
     return "❌ 无法获取 REPL 状态"
 

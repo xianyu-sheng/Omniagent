@@ -207,7 +207,7 @@ def _purge_provider_models(registry: "ModelRegistry", provider_key: str) -> int:
     return removed
 
 
-def interactive_setup(registry: ModelRegistry) -> None:
+def interactive_setup(registry: ModelRegistry, model_pool=None) -> None:
     """
     交互式配置引导。
 
@@ -235,13 +235,13 @@ def interactive_setup(registry: ModelRegistry) -> None:
         elif choice == "2":
             _show_configured()
         elif choice == "3":
-            _select_model(registry)
+            _select_model(registry, model_pool)
         elif choice == "4":
             _select_mode(registry)
         elif choice == "5":
             _remove_api_key(registry)
         elif choice == "6":
-            _register_custom(registry)
+            _register_custom(registry, model_pool)
 
 
 def _setup_api_key() -> None:
@@ -319,8 +319,8 @@ def _show_configured() -> None:
     console.print()
 
 
-def _select_model(registry: ModelRegistry) -> None:
-    """交互式选择模型 — 展示所有可用模型，用户选择。"""
+def _select_model(registry: ModelRegistry, model_pool=None) -> None:
+    """交互式选择模型 — 展示所有可用模型，用户选择。v0.4.0: also populates ModelPool."""
     configured = get_configured_providers()
 
     if not configured:
@@ -370,6 +370,20 @@ def _select_model(registry: ModelRegistry) -> None:
             alias = short_name.replace(".", "-")
             registry.add_model(model_id, alias)
             selected_models.append(f"{alias} ({model_id})")
+            # v0.4.0: also register in model pool for auto-routing
+            if model_pool:
+                provider_info = PROVIDERS.get(provider)
+                api_key = ""
+                base_url = ""
+                if provider_info:
+                    creds = load_credentials()
+                    from omniagent.repl.provider_registry import _resolve_api_key
+                    api_key = _resolve_api_key(provider, provider_info, creds)
+                    base_url = provider_info.base_url
+                model_pool.register(
+                    model_id, alias=alias, weight=3.0,
+                    api_key=api_key, base_url=base_url,
+                )
 
     if selected_models:
         # 自动设置 planner 角色
@@ -494,7 +508,7 @@ def _mode_scene(mode_name: str) -> str:
 
 # ── v0.4.0: 自定义模型商注册 ──────────────────────────────
 
-def _register_custom(registry) -> None:
+def _register_custom(registry, model_pool=None) -> None:
     """注册自定义模型商——用户输入名称、base_url、API key。"""
     console.print("\n[bold cyan]═══ 注册自定义模型商 ═══[/bold cyan]")
     console.print("[dim]适用于任意 OpenAI 兼容 API（豆包、零一万物、本地模型等）[/dim]\n")
@@ -529,10 +543,7 @@ def _register_custom(registry) -> None:
             if len(info.models) > 5:
                 console.print(f"  ... 等 {len(info.models)} 个模型")
 
-        # Auto-register models to pool
-        model_pool = getattr(registry, '_pool', None) or getattr(
-            getattr(registry, '_repl', None), 'model_pool', None
-        )
+        # Auto-register models to pool (v0.4.0)
         if info.models and "(auto-fetch" not in str(info.models[0]):
             for model_name in info.models[:5]:  # register top 5
                 model_id = f"{info.key}/{model_name}"
