@@ -923,7 +923,7 @@ def _cmd_setup(*, session_state: dict, **kwargs: Any) -> str:
 
 # /model ───────────────────────────────────────────────────
 
-register_command("/model", "交互式切换模型", "/model")
+# v0.4.0 removed: register_command("/model", "交互式切换模型", "/model")
 
 @_handler("/model")
 def _cmd_model(*, session_state: dict, registry: ModelRegistry, **kwargs: Any) -> str:

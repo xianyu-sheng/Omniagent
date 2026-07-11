@@ -42,6 +42,7 @@ class StatusBar:
         self.registry = registry
         self._streaming = True
         self._last_model: str | None = None
+        self._auto_router = None  # v0.4.0: set by REPL
 
     def set_last_model(self, model_id: str) -> None:
         """记录最近一次使用的模型。"""
@@ -101,7 +102,12 @@ class StatusBar:
         bar = f"[{bar_color}]{'█' * filled}[/{bar_color}][dim]{'░' * empty}[/dim]"
 
         # 当前模型
-        model_display = self._last_model or "未设置"
+        # v0.4.0: auto-routing indicator
+        if self._auto_router and not self._auto_router.is_empty():
+            active = self._auto_router.get_active_model_id() or self._last_model
+            model_display = f"[bold green]auto[/bold green] {active or '—'}"
+        else:
+            model_display = self._last_model or "未设置"
         if len(model_display) > 25:
             model_display = "..." + model_display[-22:]
 
@@ -153,7 +159,11 @@ class StatusBar:
         max_tok = stats["max_tokens"]
         ratio = stats["usage_ratio"]
 
-        model_display = self._last_model or "—"
+        if self._auto_router and not self._auto_router.is_empty():
+            active = self._auto_router.get_active_model_id() or self._last_model
+            model_display = f"auto {active or '—'}"
+        else:
+            model_display = self._last_model or "—"
         if len(model_display) > 30:
             model_display = "..." + model_display[-27:]
 

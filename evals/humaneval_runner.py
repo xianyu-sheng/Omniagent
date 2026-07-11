@@ -1,14 +1,12 @@
 """
-HumanEval 评测适配器 — 将 omniagent 的多模型路由接到 HumanEval 基准。
+HumanEval benchmark adapter for omniagent.
 
-HumanEval（OpenAI, 2021）是衡量 LLM 代码生成能力的标准基准：
-- 164 道 Python 函数补全题
-- 每道题包含函数签名 + docstring + 测试用例
-- 评估指标：pass@k（k 次采样中至少一次通过测试的概率）
+HumanEval (OpenAI, 2021): 164 Python function-completion tasks.
+Metric: pass@k (probability that at least 1 of k samples passes all tests).
 
-用法：
+Usage:
     python evals/humaneval_runner.py --model deepseek/deepseek-v4-pro --num-tasks 20
-    python evals/humaneval_runner.py --model deepseek/deepseek-v4-pro --num-tasks 164 --num-samples 3
+    python evals/humaneval_runner.py --model deepseek/deepseek-v4-pro --num-tasks 164
 """
 
 from __future__ import annotations
@@ -35,45 +33,88 @@ def load_tasks(path: Path | None = None) -> list[dict[str, Any]]:
 
 
 def build_prompt(task: dict[str, Any]) -> str:
+    """Build a prompt that asks for ONLY the indented function body."""
     return (
-        "You are a Python code generator. Output ONLY executable Python code, "
-        "no explanation, no markdown fences, no conversation.\n\n"
+        "Write ONLY the indented body of the following Python function. "
+        "Do NOT repeat the def line, docstring, or imports. "
+        "Output raw Python code only, no markdown, no explanation.\n\n"
         f"{task['prompt']}"
     )
 
 
 def extract_code(generated: str, entry_point: str) -> str:
-    # 1) Try to find a markdown code block — take the LAST one containing the entry point
+    """Extract ONLY the indented function body from LLM output.
+
+    The HumanEval prompt already contains imports + helper functions +
+    function signature + docstring. We need just the indented body
+    to append to the prompt.
+    """
+    # 1) Extract from markdown code block if present
     blocks = list(re.finditer(r"```(?:python)?\s*\n(.*?)```", generated, re.DOTALL))
     for m in reversed(blocks):
         block = m.group(1)
-        if f"def {entry_point}" in block:
+        if f"def {entry_point}" in block or "    " in block[:40]:
             generated = block
             break
 
-    # 2) Find the function definition and take everything from there
-    sig_pattern = rf"def\s+{re.escape(entry_point)}\s*\("
-    match = re.search(sig_pattern, generated)
-    if match:
-        generated = generated[match.start():]
-
-    # 3) Trim trailing non-code (anything after the last meaningful line)
+    # 2) Find the function body: lines AFTER the def line and docstring
     lines = generated.split("\n")
-    # Find last line that looks like code (not blank, not a comment-only, not a markdown fence)
-    while lines and (
-        not lines[-1].strip()
-        or lines[-1].strip().startswith("```")
-        or lines[-1].strip().startswith("Here")
-    ):
-        lines.pop()
-    generated = "\n".join(lines)
+    body_start = 0
+    in_docstring = False
 
-    return generated.strip()
+    for i, line in enumerate(lines):
+        s = line.strip()
+
+        # Skip the def line
+        if s.startswith(f"def {entry_point}"):
+            continue
+
+        # Handle docstrings
+        if s.startswith('"""') or s.startswith("'''"):
+            if not in_docstring:
+                in_docstring = True
+                dq = s[:3]
+                if s.count(dq) >= 2 and len(s) > 3:  # single-line docstring
+                    in_docstring = False
+                continue
+            else:
+                in_docstring = False
+                continue
+        if in_docstring:
+            continue
+
+        # This is the first body line
+        if s and not s.startswith("```") and not s.startswith("Here"):
+            body_start = i
+            break
+        body_start = i + 1
+
+    body_lines = lines[body_start:]
+
+    # 3) Trim trailing noise
+    while body_lines and (
+        not body_lines[-1].strip()
+        or body_lines[-1].strip().startswith("```")
+        or body_lines[-1].strip().startswith("Here")
+    ):
+        body_lines.pop()
+
+    return "\n".join(body_lines)
 
 
 def evaluate_task(task: dict[str, Any], completion: str) -> dict[str, Any]:
-    full_code = completion + "\n\n" + task["test"] + "\n\n"
-    full_code += f"check({task['entry_point']})\n"
+    """Evaluate a HumanEval task.
+
+    The prompt contains imports + helper functions + function signature.
+    The completion is just the indented body.
+    Full code = prompt + body + test + check().
+    """
+    full_code = (
+        task["prompt"] + "\n"
+        + completion + "\n\n"
+        + task["test"] + "\n\n"
+        + f"check({task['entry_point']})\n"
+    )
 
     result = {"task_id": task["task_id"], "passed": False, "error": None}
     namespace: dict[str, Any] = {}
@@ -123,7 +164,11 @@ def run_humaneval(
                 if eval_result["passed"]:
                     break
             except Exception as e:
-                samples.append({"task_id": task_id, "passed": False, "error": str(e)})
+                samples.append({
+                    "task_id": task_id,
+                    "passed": False,
+                    "error": f"API: {e}",
+                })
 
         any_passed = any(s["passed"] for s in samples)
         status = "PASS" if any_passed else "FAIL"
@@ -136,6 +181,7 @@ def run_humaneval(
             "passed": samples[0]["passed"] if samples else False,
             "pass_at_k": any_passed,
             "samples": len(samples),
+            "error": samples[0].get("error") if not any_passed else None,
         })
 
     return results
@@ -145,7 +191,6 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(results)
     passed = sum(1 for r in results if r["pass_at_k"])
     return {
-        "model": results[0].get("model", "unknown") if results else "unknown",
         "total": total,
         "passed": passed,
         "pass_rate": f"{passed}/{total} ({passed/total*100:.1f}%)" if total else "N/A",

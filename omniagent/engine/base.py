@@ -47,12 +47,14 @@ class BaseEngine(ABC):
         callback: EngineCallback | None = None,
         model_configs: dict[str, Any] | None = None,
         temperature: float = 0.3,
+        model_pool: Any = None,  # v0.4.0: ModelPool for health tracking
     ) -> None:
         self.model_priority = list(model_priority)
         self.callback = callback or EngineCallback()
         # alias -> ModelConfig，供 _call_llm 读每模型 max_tokens/api_key/base_url（B4/B7）
         self.model_configs = model_configs or {}
         self.temperature = temperature
+        self.model_pool = model_pool  # v0.4.0
         # F6: 协作式中断标志，外部调 interrupt() 后 run() 在下一轮退出
         self._interrupted: bool = False
         # F4: 本次 run 注入的 ContextManager（run 起点设置，供 _history_messages 消费）
@@ -179,10 +181,15 @@ class BaseEngine(ABC):
                     if mk and "/" in model_id:
                         creds = {model_id.split("/", 1)[0].lower(): mk}
                 logger.debug(tp(f"调用模型 {model_id}"))
-                return chat_completion(
+                result = chat_completion(
                     model_id, messages, max_tokens=mt,
                     temperature=self.temperature, credentials=creds, base_url=base,
                 )
+                # v0.4.0: record success to model pool
+                if self.model_pool:
+                    import time as _time
+                    self.model_pool.record_success(model_id, _time.monotonic())
+                return result
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
                 if status in (401, 403):
@@ -195,6 +202,8 @@ class BaseEngine(ABC):
                     raise RuntimeError(
                         f"模型 {model_id} 请求被拒 (400)，请检查参数/模型名") from e
                 # 429/5xx/其他 HTTP：瞬时，切下一个模型
+                if self.model_pool:
+                    self.model_pool.record_failure(model_id)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} HTTP {status} 失败: {e}，尝试下一个..."))
             except (

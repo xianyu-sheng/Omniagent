@@ -85,11 +85,20 @@ class REPL:
         # 状态栏
         self.status_bar = StatusBar(console, self.ctx_mgr, self.registry)
 
+        # v0.4.0: Auto router + model pool (replaces role_priority)
+        from omniagent.repl.model_pool import ModelPool
+        from omniagent.repl.auto_router import AutoRouter
+        self.model_pool = ModelPool()
+        self.auto_router = AutoRouter(self.model_pool)
+        self.status_bar._auto_router = self.auto_router  # for "auto" display
+
         # 会话状态，供命令处理器共享
         self._session_state: dict[str, Any] = {
             "agent_context": self.agent_context,
             "_repl": self,
             "_novel_manager": self._novel_manager,
+            "model_pool": self.model_pool,
+            "auto_router": self.auto_router,
         }
 
         # v0.3.0+ 修复（C-3）：bash 风格——单次 Ctrl+C 重画 prompt 继续，
@@ -219,7 +228,14 @@ class REPL:
 
             if self.registry.list_models():
                 models = self.registry.list_models()
-                console.print(f"[dim]· 已自动加载 {len(models)} 个模型，输入 [bold cyan]/model[/bold cyan] 切换[/dim]\n")
+                # v0.4.0: auto-populate model pool from registry
+                for m in models:
+                    self.model_pool.register(
+                        m.model_id, alias=m.alias,
+                        weight=getattr(m, 'weight', 1.0),
+                        api_key=m.api_key, base_url=m.base_url,
+                    )
+                console.print(f"[dim]· 已自动加载 {len(models)} 个模型到调用池，输入 [bold cyan]/setup[/bold cyan] 配置模型池[/dim]\n")
 
         # 加载自定义快捷指令和技能
         self._load_custom_commands()
@@ -245,7 +261,7 @@ class REPL:
 
         # ── 随机提示 ──
         tips = [
-            "[bold cyan]/help[/bold cyan] 查看命令  [dim]·[/dim]  [bold cyan]/model[/bold cyan] 切换模型  [dim]·[/dim]  [bold cyan]/mode[/bold cyan] 切换范式",
+            "[bold cyan]/help[/bold cyan] 查看命令  [dim]·[/dim]  [bold cyan]/mode[/bold cyan] 切换范式",
             "Shift+Enter / Alt+Enter 多行输入  [dim]·[/dim]  Enter 发送  [dim]·[/dim]  Ctrl+C 退出",
             "[bold cyan]/setup[/bold cyan] 配置向导  [dim]·[/dim]  [bold cyan]/tools[/bold cyan] 查看工具  [dim]·[/dim]  [bold cyan]/mcp[/bold cyan] 扩展",
         ]
@@ -844,7 +860,7 @@ class REPL:
             console.print("[dim]· 空输入已忽略[/dim]")
             return
         # R4: 按激活模型上下文窗口校准 token 阈值（须在 needs_compact 之前）
-        self._sync_context_window(self.registry.get_role_priority("planner"))
+        self._sync_context_window(self.auto_router.route(user_input, count=3))
         # 自动 compact 检查
         if self.ctx_mgr.needs_compact():
             console.print("[dim]· 对话较长，建议 [bold cyan]/compact[/bold cyan] 压缩[/dim]")
@@ -892,9 +908,16 @@ class REPL:
         self.ctx_mgr.add_user_message(optimized)
 
         # 获取模型列表
-        model_ids = self.registry.get_role_priority("planner")
+        # v0.4.0: auto-route based on task difficulty
+        if self.auto_router.is_empty():
+            # Fallback to static registry for backward compat
+            model_ids = self.registry.get_role_priority("planner")
+        else:
+            model_ids = self.auto_router.route(
+                optimized, self.ctx_mgr.get_messages(), count=3
+            )
         if not model_ids:
-            console.print("[red]· 未配置模型，请先 [bold cyan]/set_model[/bold cyan] 添加[/red]")
+            console.print("[red]· 未配置模型，请先 [bold cyan]/setup[/bold cyan] 配置[/red]")
             return
 
         # 注入对话历史到 AgentContext，供引擎使用
@@ -1000,7 +1023,7 @@ class REPL:
         console.print("[dim]· ReAct 思考 → 行动 → 观察[/dim]")
 
         callback = self._make_callback()
-        engine = ReActEngine(model_priority=model_ids, max_iterations=10, callback=callback, model_configs=dict(self.registry.models))
+        engine = ReActEngine(model_priority=model_ids, model_pool=self.model_pool, max_iterations=10, callback=callback, model_configs=dict(self.registry.models))
         try:
             result = engine.run(user_input, self.agent_context, ctx_mgr=self.ctx_mgr)
             self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
@@ -1030,7 +1053,7 @@ class REPL:
         console.print("[dim]· Plan-Execute 规划 → 逐步执行[/dim]")
 
         callback = self._make_callback()
-        engine = PlanExecuteEngine(model_priority=model_ids, max_steps=20, callback=callback, model_configs=dict(self.registry.models))
+        engine = PlanExecuteEngine(model_priority=model_ids, model_pool=self.model_pool, max_steps=20, callback=callback, model_configs=dict(self.registry.models))
         try:
             result = engine.run(user_input, self.agent_context, ctx_mgr=self.ctx_mgr)
             self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
@@ -1046,7 +1069,7 @@ class REPL:
         console.print("[dim]· Reflection 执行 → 审查 → 修正[/dim]")
 
         callback = self._make_callback()
-        engine = ReflectionEngine(model_priority=model_ids, max_rounds=3, callback=callback, model_configs=dict(self.registry.models))
+        engine = ReflectionEngine(model_priority=model_ids, model_pool=self.model_pool, max_rounds=3, callback=callback, model_configs=dict(self.registry.models))
         try:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
@@ -1062,7 +1085,7 @@ class REPL:
         console.print("[dim]· Plan+React 全局规划 → 每步 ReAct 执行[/dim]")
 
         callback = self._make_callback()
-        engine = PlanReactEngine(model_priority=model_ids, max_steps=10, react_iterations=8, callback=callback, model_configs=dict(self.registry.models))
+        engine = PlanReactEngine(model_priority=model_ids, model_pool=self.model_pool, max_steps=10, react_iterations=8, callback=callback, model_configs=dict(self.registry.models))
         try:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
@@ -1078,7 +1101,7 @@ class REPL:
         console.print("[dim]· Plan+Reflection 规划执行 → 反思修正[/dim]")
 
         callback = self._make_callback()
-        engine = PlanReflectionEngine(model_priority=model_ids, max_steps=10, review_rounds=2, callback=callback, model_configs=dict(self.registry.models))
+        engine = PlanReflectionEngine(model_priority=model_ids, model_pool=self.model_pool, max_steps=10, review_rounds=2, callback=callback, model_configs=dict(self.registry.models))
         try:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
@@ -1094,7 +1117,7 @@ class REPL:
         console.print("[dim]· React+Reflection 探索 → 反思审查[/dim]")
 
         callback = self._make_callback()
-        engine = ReactReflectionEngine(model_priority=model_ids, react_iterations=8, review_rounds=2, callback=callback, model_configs=dict(self.registry.models))
+        engine = ReactReflectionEngine(model_priority=model_ids, model_pool=self.model_pool, react_iterations=8, review_rounds=2, callback=callback, model_configs=dict(self.registry.models))
         try:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
