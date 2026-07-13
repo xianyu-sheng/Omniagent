@@ -363,10 +363,11 @@ def _load_credentials() -> dict[str, str]:
             data = yaml.safe_load(f) or {}
             creds = {k.lower(): v for k, v in data.items()}
 
-    # 环境变量作为补充 / 覆盖
+    # v0.4.0 修复: 环境变量作为补充（yaml 优先，env 仅在 yaml 未配置时生效）
+    # 此前无条件覆盖导致 ~/.bashrc 旧 key 覆盖 yaml 新 key，对齐 provider_registry 行为
     for provider, cfg in _PROVIDER_DEFAULTS.items():
         env_val = os.getenv(cfg["env_key"])
-        if env_val:
+        if env_val and not creds.get(provider):
             creds[provider] = env_val
 
     # v0.3.0+ 修复（C-2）：anthropic 额外 fallback ANTHROPIC_AUTH_TOKEN
