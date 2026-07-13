@@ -78,11 +78,14 @@ class ReflectionEngine(BaseEngine):
         reviewer_model_priority: list[str] | None = None,
         callback: EngineCallback | None = None,
         model_configs: dict[str, Any] | None = None,
+        model_pool: Any = None,          # v0.4.0
+        auto_router: Any = None,         # v0.4.0 Step 13
     ) -> None:
         # R2: 公共属性与 _call_llm 由 BaseEngine 提供。
         super().__init__(
             model_priority, callback=callback,
             model_configs=model_configs, temperature=0.3,
+            model_pool=model_pool, auto_router=auto_router,
         )
         self.max_rounds = max_rounds
         self.pass_threshold = pass_threshold

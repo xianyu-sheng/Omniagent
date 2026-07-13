@@ -230,12 +230,15 @@ class ReActEngine(BaseEngine):
         project_root: str | None = None,
         max_subagent_iterations: int = 6,
         max_subagent_depth: int = 1,
+        model_pool: Any = None,          # v0.4.0
+        auto_router: Any = None,         # v0.4.0 Step 13
     ) -> None:
         # R2: 公共属性（model_priority/callback/model_configs/temperature）与
         # _call_llm 由 BaseEngine 提供，消除四份复制与参数漂移。
         super().__init__(
             model_priority, callback=callback,
             model_configs=model_configs, temperature=0.3,
+            model_pool=model_pool, auto_router=auto_router,
         )
         self.max_iterations = max_iterations
         self.tools = tools or BUILTIN_TOOLS

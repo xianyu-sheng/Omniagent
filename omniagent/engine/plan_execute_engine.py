@@ -139,11 +139,14 @@ class PlanExecuteEngine(BaseEngine):
         enable_parallel: bool = False,
         max_parallel_workers: int = 4,
         max_mini_react_rounds: int = 3,
+        model_pool: Any = None,          # v0.4.0
+        auto_router: Any = None,         # v0.4.0 Step 13
     ) -> None:
         # R2: 公共属性与 _call_llm 由 BaseEngine 提供。
         super().__init__(
             model_priority, callback=callback,
             model_configs=model_configs, temperature=0.3,
+            model_pool=model_pool, auto_router=auto_router,
         )
         self.max_steps = max_steps
         # P2-E2 双模型：规划用 model_priority（默认），执行/总结用 executor_model_priority

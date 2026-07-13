@@ -52,13 +52,17 @@ class PlanReactEngine:
         react_iterations: int = 8,
         callback: EngineCallback | None = None,
         model_configs: dict[str, Any] | None = None,
+        model_pool: Any = None,          # v0.4.0
+        auto_router: Any = None,         # v0.4.0 Step 13
     ) -> None:
         self.model_priority = model_priority
         self.max_steps = max_steps
         self.react_iterations = react_iterations
         self.callback = callback or EngineCallback()
-        self.planner = PlanExecuteEngine(model_priority, max_steps=max_steps, callback=self.callback, model_configs=model_configs)
-        self.reactor = ReActEngine(model_priority, max_iterations=react_iterations, callback=self.callback, model_configs=model_configs)
+        self.model_pool = model_pool
+        self.auto_router = auto_router
+        self.planner = PlanExecuteEngine(model_priority, max_steps=max_steps, callback=self.callback, model_configs=model_configs, model_pool=model_pool, auto_router=auto_router)
+        self.reactor = ReActEngine(model_priority, max_iterations=react_iterations, callback=self.callback, model_configs=model_configs, model_pool=model_pool, auto_router=auto_router)
 
     def run(
         self,
@@ -235,19 +239,25 @@ class PlanReflectionEngine:
         pass_threshold: int = 7,
         callback: EngineCallback | None = None,
         model_configs: dict[str, Any] | None = None,
+        model_pool: Any = None,          # v0.4.0
+        auto_router: Any = None,         # v0.4.0 Step 13
     ) -> None:
         self.model_priority = model_priority
         self.max_steps = max_steps
         self.review_rounds = review_rounds
         self.pass_threshold = pass_threshold
         self.callback = callback or EngineCallback()
-        self.planner = PlanExecuteEngine(model_priority, max_steps=max_steps, callback=self.callback, model_configs=model_configs)
+        self.model_pool = model_pool
+        self.auto_router = auto_router
+        self.planner = PlanExecuteEngine(model_priority, max_steps=max_steps, callback=self.callback, model_configs=model_configs, model_pool=model_pool, auto_router=auto_router)
         self.reflector = ReflectionEngine(
             model_priority,
             max_rounds=review_rounds,
             pass_threshold=pass_threshold,
             callback=self.callback,
             model_configs=model_configs,
+            model_pool=model_pool,
+            auto_router=auto_router,
         )
 
     def run(
@@ -296,19 +306,25 @@ class ReactReflectionEngine:
         pass_threshold: int = 7,
         callback: EngineCallback | None = None,
         model_configs: dict[str, Any] | None = None,
+        model_pool: Any = None,          # v0.4.0
+        auto_router: Any = None,         # v0.4.0 Step 13
     ) -> None:
         self.model_priority = model_priority
         self.react_iterations = react_iterations
         self.review_rounds = review_rounds
         self.pass_threshold = pass_threshold
         self.callback = callback or EngineCallback()
-        self.reactor = ReActEngine(model_priority, max_iterations=react_iterations, callback=self.callback, model_configs=model_configs)
+        self.model_pool = model_pool
+        self.auto_router = auto_router
+        self.reactor = ReActEngine(model_priority, max_iterations=react_iterations, callback=self.callback, model_configs=model_configs, model_pool=model_pool, auto_router=auto_router)
         self.reflector = ReflectionEngine(
             model_priority,
             max_rounds=review_rounds,
             pass_threshold=pass_threshold,
             callback=self.callback,
             model_configs=model_configs,
+            model_pool=model_pool,
+            auto_router=auto_router,
         )
 
     def run(

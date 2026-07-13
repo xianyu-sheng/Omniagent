@@ -226,12 +226,15 @@ class NovelEngine(BaseEngine):
         callback: EngineCallback | None = None,
         novel_manager: NovelManager | None = None,
         model_configs: dict[str, Any] | None = None,
+        model_pool: Any = None,          # v0.4.0
+        auto_router: Any = None,         # v0.4.0 Step 13
     ) -> None:
         # R2: 继承 BaseEngine；创意写作用较高 temperature（0.8）。
         # 此前 novel 的 _call_llm 未读 ModelConfig（B7 漂移），现统一由基类接入。
         super().__init__(
             model_priority, callback=callback,
             model_configs=model_configs, temperature=0.8,
+            model_pool=model_pool, auto_router=auto_router,
         )
         self.max_iterations = max_iterations
         self.tools = NOVEL_TOOLS

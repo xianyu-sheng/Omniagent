@@ -1223,6 +1223,8 @@ class REPL:
             callback=callback,
             novel_manager=self._novel_manager,
             model_configs=dict(self.registry.models),
+            model_pool=self.model_pool,
+            auto_router=self.auto_router,
         )
         try:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
