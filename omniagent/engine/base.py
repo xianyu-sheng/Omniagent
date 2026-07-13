@@ -132,20 +132,21 @@ class BaseEngine(ABC):
         turn: int,
         every: int = 5,
     ) -> list[dict[str, str]]:
-        """F4: 每 ``every`` 轮压缩 in-run messages，复用 ContextManager 的 F3 压缩逻辑。
+        """F4 + v0.5.0 P0-2: 每 ``every`` 轮压缩 in-run messages，复用 F3 + 分层策略。
 
-        引擎局部 ``messages`` 在迭代中 O(n) 增长，每轮重发给 LLM 造成 O(n²) token
-        成本（§8.9.6）。每 5 轮用临时 ContextManager 跑一次 F3 compact（6 段/安全
-        截断），把早期轨迹摘要化、保留近期上下文。无 model_priority 或 LLM 失败时
-        自动回退正则摘要（F3 已实现）。
+        新增：压缩前对工具观察消息（"Observation: ..."）做分类压缩，
+        减少工具输出占用的 prompt 空间，让 LLM 摘要更聚焦于推理链。
         """
         if turn <= 0 or turn % every != 0:
             return messages
         try:
             from omniagent.repl.context_manager import ContextManager
 
+            # v0.5.0 P0-2：预处理工具观察消息
+            preprocessed = self._preprocess_tool_observations(messages)
+
             tmp = ContextManager(max_tokens=self._context_window())
-            for m in messages:
+            for m in preprocessed:
                 tmp.add_message(m.get("role", "user"), m.get("content", ""))
             tmp.compact(model_priority=self.model_priority or None)
             compacted = tmp.get_messages()
@@ -153,6 +154,48 @@ class BaseEngine(ABC):
         except Exception as e:  # noqa: BLE001 — 压缩绝不能中断主循环
             logger.warning(f"in-run 压缩失败（已忽略，沿用原 messages）: {e}")
             return messages
+
+    @staticmethod
+    def _preprocess_tool_observations(
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """v0.5.0 P0-2：对引擎内的工具观察消息做分类压缩。
+
+        引擎层中工具结果以 "Observation: [tool_name] ..." 格式存储在
+        role="user" 的消息中。此方法检测该模式并应用 ToolOutputClassifier
+        压缩，减少后续 compact 的输入噪音。
+        """
+        import re
+
+        # 尝试加载分类器（懒导入避免循环依赖）
+        try:
+            from omniagent.repl.context_strategies import ToolOutputClassifier
+            classifier = ToolOutputClassifier()
+        except Exception:
+            return messages  # 分类器不可用时原样返回
+
+        # 匹配 "Observation: tool_name" 或 "Observation: [tool_name]"
+        obs_pattern = re.compile(r"^Observation:\s*(?:\[(\w+)\]\s*)?(.*)", re.DOTALL)
+
+        result = []
+        for m in messages:
+            content = m.get("content", "")
+            obs_match = obs_pattern.match(content)
+            if obs_match:
+                tool_name = obs_match.group(1) or "unknown"
+                tool_output = obs_match.group(2)
+                try:
+                    compressed_output = classifier.compress(tool_name, tool_output, max_chars=500)
+                    result.append({
+                        "role": m.get("role", "user"),
+                        "content": f"Observation: [{tool_name}] {compressed_output}",
+                    })
+                except Exception:
+                    result.append(m)  # 压缩失败，原样保留
+            else:
+                result.append(m)
+
+        return result
 
     def _call_llm(
         self,

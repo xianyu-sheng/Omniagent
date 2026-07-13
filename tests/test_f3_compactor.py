@@ -46,20 +46,23 @@ class TestThreeTierStrategy:
         assert cm.history[0].role == "system"
         assert "6 段摘要" in cm.history[0].content
 
-    def test_tier3_safe_truncation_no_llm(self, monkeypatch):
-        """>85% → 安全截断，不调 LLM。"""
-        cm = ContextManager(max_tokens=8000)
-        _add_rounds(cm, 4, big_user="x" * 14000)  # ~7000/8000 = 0.875
-        assert cm.usage_ratio() > 0.85
+    def test_tier3_crisis_no_llm(self, monkeypatch):
+        """v0.5.0: 空间危急 (>95%) → Q3 用 _auto_summary 正则兜底，不调 LLM。"""
+        # 使用极小的 max_tokens 使 ratio 超 95% 进入 critical
+        cm = ContextManager(max_tokens=3000)
+        _add_rounds(cm, 4, big_user="x" * 7000)  # ~3500/3000 > 0.95
+        assert cm.usage_ratio() > 0.95
 
         def boom(*a, **k):
-            raise AssertionError("Tier 3 不应调用 LLM")
+            raise AssertionError("危急状态下不应调用 LLM")
 
         monkeypatch.setattr(llm, "chat_completion", boom)
         result = cm.compact()
-        assert "安全截断" in result
-        # 安全截断后消息数应显著减少（8 → ≤6）
-        assert len(cm.history) <= 6
+        # Q3 危急 → _auto_summary() 正则兜底，输出含"用户需求"等
+        assert len(result) > 0
+        assert "安全截断" not in result  # 不再是旧的安全截断
+        # 压缩后消息数减少
+        assert len(cm.history) < 8
 
     def test_manual_summary_forces_tier2_even_if_low(self, monkeypatch):
         """手动摘要 + 有 older → 即使 ratio 低也执行 Tier 2 写入。"""

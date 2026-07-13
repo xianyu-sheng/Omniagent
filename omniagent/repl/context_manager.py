@@ -62,6 +62,39 @@ def _estimate_tokens(text: str) -> int:
         return max(words, int(words * 1.3), char_based)
 
 
+def _infer_turn_type(role: str, content: str) -> str:
+    """根据 role 和 content 推断 turn 类型（v0.5.0 分层上下文标注）。"""
+    if role == "user":
+        return "user_input"
+    if role == "assistant":
+        # 检测是否包含工具调用标记
+        if "<function_call>" in content or "tool_calls" in content:
+            return "tool_call"
+        return "assistant_output"
+    if role == "tool":
+        return "tool_result"
+    if role == "system":
+        return "system"
+    return "general"
+
+
+def _guess_tool_name(turn: Any) -> str:
+    """从 ConversationTurn 中猜测工具名称（v0.5.0）。"""
+    # 从 metadata 中查找
+    meta = getattr(turn, "metadata", {}) or {}
+    if "tool_name" in meta:
+        return str(meta["tool_name"])
+    # 从 content 前缀猜测（Observation: tool_name ...）
+    content = getattr(turn, "content", "")
+    if content.startswith("Observation:"):
+        # 尝试提取工具名
+        import re as _re
+        m = _re.match(r"Observation:\s*(\w+)", content)
+        if m:
+            return m.group(1)
+    return "unknown"
+
+
 @dataclass
 class ConversationTurn:
     """一轮对话记录。"""
@@ -71,6 +104,11 @@ class ConversationTurn:
     model_used: str | None = None
     node_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # v0.5.0：分层上下文标注
+    task_tier: int = 3  # Q1-Q5，来自 AutoRouter 路由决策
+    turn_type: str = "general"  # user_input | assistant_output | tool_call | tool_result
+    semantic_group_id: str | None = None  # 语义块分组 ID
+    turn_index: int = 0  # 对话中的全局位置序号
     # P3-Q7 / §8.9.2：token 估算懒缓存——content 添加后不变，避免状态栏/每轮全量重算。
     _token_count: int | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -119,15 +157,67 @@ class ContextManager:
         self._real_usage: dict[str, int] | None = None
         self._suppress_usage: bool = False  # compact 自身摘要调用期间抑制记录
         self._usage_unsub: Any = None
+        # v0.5.0：分层上下文管理
+        self._active_tier: int = 3  # 当前活跃任务层级 (Q1-Q5)
+        self._turn_counter: int = 0  # 全局轮次计数器
+        self._semantic_group_counter: int = 0  # 语义块 ID 计数器
+        self._working_memory: dict[str, Any] = {}  # 跨压缩持久化的工作记忆
         if track_real_usage:
             self._subscribe_usage()
 
     # ── 对话管理 ──────────────────────────────────────────
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """添加一条消息到历史。"""
-        turn = ConversationTurn(role=role, content=content, **kwargs)
+        """添加一条消息到历史。
+
+        v0.5.0：自动标注 task_tier、turn_type、turn_index。
+        """
+        # 自动推断 turn_type
+        turn_type = kwargs.pop("turn_type", None)
+        if turn_type is None:
+            turn_type = _infer_turn_type(role, content)
+        # 自动标注 task_tier（可通过 kwargs 覆盖）
+        task_tier = kwargs.pop("task_tier", None)
+        if task_tier is None:
+            task_tier = self._active_tier
+        # 自增轮次计数器
+        self._turn_counter += 1
+        turn = ConversationTurn(
+            role=role, content=content,
+            task_tier=task_tier,
+            turn_type=turn_type,
+            turn_index=self._turn_counter,
+            **kwargs,
+        )
         self.history.append(turn)
+
+    def set_active_tier(self, tier: int) -> None:
+        """设置当前活跃任务层级（由 AutoRouter 在路由后调用）。"""
+        if 1 <= tier <= 5:
+            self._active_tier = tier
+
+    @property
+    def active_tier(self) -> int:
+        """当前活跃任务层级。"""
+        return self._active_tier
+
+    def begin_semantic_group(self) -> str:
+        """开始一个语义块，返回 group_id。"""
+        self._semantic_group_counter += 1
+        return f"sg-{self._semantic_group_counter}"
+
+    def end_semantic_group(self, group_id: str) -> None:
+        """标记语义块结束（当前为预留接口，后续压缩时使用）。"""
+        # v0.5.0：预留接口，当前仅记录 group_id 供后续 compress 读取
+        pass
+
+    def update_working_memory(self, key: str, value: Any) -> None:
+        """更新工作记忆中的键值对（跨压缩持久化）。"""
+        self._working_memory[key] = value
+
+    def get_working_memory(self) -> dict[str, Any]:
+        """获取当前工作记忆的浅拷贝。"""
+        return dict(self._working_memory)
 
     def add_user_message(self, content: str) -> None:
         self.add_message("user", content)
@@ -268,11 +358,77 @@ class ContextManager:
 
     # ── /compact 压缩 ────────────────────────────────────
 
+    @staticmethod
+    def _reorder_for_summary(model_priority: list[str] | None) -> list[str]:
+        """v0.5.0：摘要调用优先选快模型（flash/mini/haiku），降延迟。
+
+        摘要不需要旗舰模型的能力，用轻量模型可以节省 70-80% 延迟。
+        """
+        if not model_priority:
+            return []
+        fast_keywords = ("flash", "mini", "haiku", "lite", "turbo", "v4-flash")
+        fast = [m for m in model_priority if any(k in m.lower() for k in fast_keywords)]
+        slow = [m for m in model_priority if m not in fast]
+        return fast + slow  # 快模型优先，慢模型兜底
+
     # F3：6 段结构化摘要的段名（顺序即输出顺序）
     _SIX_SEGMENTS = (
         "原始目标", "已完成步骤", "关键约束",
         "当前文件状态", "剩余待办", "关键数据",
     )
+
+    def _preprocess_older(
+        self,
+        older: list[ConversationTurn],
+        strategy: Any = None,
+    ) -> list[ConversationTurn]:
+        """v0.5.0 P0-1：语义分块预处理 older 消息。
+
+        1. 用 SemanticChunker 将 older 分组成语义块
+        2. 对工具链块中的工具结果做分类压缩（减少 LLM 摘要的输入噪音）
+        3. 对非工具块不做处理
+        4. 返回预处理后的 turns 列表（保持原始顺序）
+        """
+        if not older or len(older) <= 2:
+            return list(older)  # 太少，不分块
+
+        try:
+            from omniagent.repl.semantic_chunker import SemanticChunker
+            from omniagent.repl.context_strategies import ToolOutputClassifier
+
+            chunker = SemanticChunker()
+            chunks = chunker.group(older)
+
+            # 如果只有一个块，不需要预处理
+            if len(chunks) <= 1:
+                return list(older)
+
+            classifier = ToolOutputClassifier()
+            max_chars = getattr(strategy, "tool_output_max_chars", 500) if strategy else 500
+
+            processed: list[ConversationTurn] = []
+            for chunk in chunks:
+                if chunk.has_tool_calls and chunk.is_atomic:
+                    # 工具链块：压缩其中的工具结果
+                    for turn in chunk.turns:
+                        tt = getattr(turn, "turn_type", "general")
+                        if tt == "tool_result":
+                            tool_name = _guess_tool_name(turn)
+                            compressed = classifier.compress(tool_name, turn.content, max_chars=max_chars)
+                            import copy
+                            new_turn = copy.copy(turn)
+                            new_turn.content = compressed
+                            processed.append(new_turn)
+                        else:
+                            processed.append(turn)
+                else:
+                    # 非工具块：原样保留
+                    processed.extend(chunk.turns)
+
+            return processed
+        except Exception:
+            # 预处理失败不应中断压缩流程
+            return list(older)
 
     def compact(
         self,
@@ -280,53 +436,123 @@ class ContextManager:
         model_priority: list[str] | None = None,
         *,
         session_id: str | None = None,
+        budget_phase: str | None = None,
     ) -> str:
-        """压缩对话历史（F3 三层策略 + 6 段结构化摘要）。
+        """压缩对话历史（v0.5.0 分层策略 + F3 6 段结构化摘要）。
 
-        分流 by usage_ratio():
-        - Tier 1 (<compact_threshold=60% 且无手动摘要): 跳过，不改写历史；
-        - Tier 2 (60-85%): LLM 6 段压缩 older，保留 recent 3 轮；
-        - Tier 3 (>compact_force=85%): _safe_truncation 安全截断（不调 LLM，
-          避免超限输入触发 400），保留 system + 最近 30% 非系统消息。
+        分流逻辑（tier-aware）：
+        1. 从 TieredStrategySelector 获取当前 tier 的压缩策略
+        2. 语义分块预处理 older（P0-1：工具输出预压缩）
+        3. 根据 SpaceBudget 判定空间状态（充裕/紧张/危急）
+        4. 充裕 → LLM 压缩（3 或 6 段，取决于 tier）
+        5. 紧张 → 最小模型 + 极简 prompt 或正则兜底
+        6. 危急 → 按 tier 分层截断（drop/label/auto_summary/structured_truncate/cross_tier_evict）
 
         B5 兼容：older 为空时直接返回（不反向增加消息）。
         """
+        from omniagent.repl.context_strategies import (
+            SpaceBudget,
+            TieredStrategySelector,
+            handle_crisis,
+        )
+
+        # 获取当前 tier 的压缩策略
+        selector = TieredStrategySelector()
+        strategy = selector.select(self._active_tier, phase=budget_phase)
+        trigger = strategy.trigger_threshold
+
         ratio = self.usage_ratio()
-        older, recent = self._split_recent(keep_rounds=3)
+        older, recent = self._split_recent(keep_rounds=strategy.keep_recent_rounds)
 
         # B5：无可压缩的早期消息 → 不改写历史
         if not older:
             return summary or "（无可压缩的早期对话，无需压缩）"
 
-        # Tier 1：<60% 且无手动摘要 → 跳过
-        if ratio < self.compact_threshold and not summary:
-            return f"（当前上下文使用率 {ratio:.0%}，低于 {self.compact_threshold:.0%} 阈值，无需压缩）"
+        # v0.5.0 P0-1：语义分块预处理 — 压缩 older 中的工具输出，减少 LLM 输入噪音
+        older = self._preprocess_older(older, strategy)
+
+        # 使用策略阈值判断是否需要压缩
+        if ratio < trigger and not summary:
+            return (
+                f"（当前上下文使用率 {ratio:.0%}，"
+                f"低于 Q{self._active_tier} 阈值 {trigger:.0%}，无需压缩）"
+            )
 
         self.save_snapshot()
+
+        # 评估空间状态
+        space_state = SpaceBudget.evaluate(ratio)
 
         # P3-Q1 续：压缩自身的 LLM 摘要调用会经 usage 回调，但其 prompt 是被
         # 压缩的 older 片段、非当前 history → 抑制记录，避免污染 current_token_usage
         prev_suppress = self._suppress_usage
         self._suppress_usage = True
         try:
-            if ratio > self.compact_force and not summary:
-                # Tier 3：>85% 安全截断（不调 LLM）
-                new_history = self._safe_truncation()
-                summary = (
-                    f"（上下文使用率 {ratio:.0%} 超过 {self.compact_force:.0%}，"
-                    f"已安全截断，保留 system + 最近 {len(new_history)} 条消息）"
+            if space_state == "critical" and not summary:
+                # 危急：无法调用 LLM → 分层截断
+                current_idx = self._turn_counter
+                new_history, crisis_summary = handle_crisis(
+                    older, recent, strategy, current_idx,
                 )
-            else:
-                # Tier 2：60-85% LLM 6 段压缩（或手动摘要）
-                summary = summary or self._llm_summary_6seg(model_priority, older)
-                new_history = [
-                    ConversationTurn(
-                        role="system",
-                        content=(
-                            f"[对话历史已压缩] 以下是之前 {len(older)} 条消息的 6 段摘要：\n\n{summary}"
-                        ),
+                summary = crisis_summary or (
+                    f"（上下文使用率 {ratio:.0%}，空间危急，"
+                    f"Q{self._active_tier} 分层截断完成）"
+                )
+            elif space_state == "tight" and not summary:
+                # 紧张：用最小模型 + 极简 prompt，或正则兜底
+                if self._active_tier <= 2:
+                    # Q1-Q2: 正则兜底
+                    summary = self._auto_summary(messages=list(older))
+                elif self._active_tier == 3:
+                    # Q3: 尝试最小模型
+                    summary = self._llm_summary_nseg(
+                        model_priority, older,
+                        n_segments=3,
+                        max_prompt_chars=1500,
                     )
-                ] + recent
+                else:
+                    # Q4-Q5: 先压缩工具输出腾空间，再调 LLM
+                    summary = self._llm_summary_after_tool_trim(
+                        model_priority, older,
+                        n_segments=strategy.summary_segments,
+                        strategy=strategy,
+                    )
+                summary_turn = ConversationTurn(
+                    role="system",
+                    content=(
+                        f"[对话历史已压缩（空间紧张）] "
+                        f"以下是之前 {len(older)} 条消息的摘要：\n\n{summary}"
+                    ),
+                    task_tier=self._active_tier,
+                    turn_type="system",
+                    turn_index=self._turn_counter + 1,
+                )
+                new_history = [summary_turn] + recent
+                self._turn_counter += 1
+            else:
+                # 充裕：正常 LLM 压缩
+                if self._active_tier <= 2 and not summary:
+                    # Q1-Q2: 3 段简化摘要
+                    summary = summary or self._llm_summary_nseg(
+                        model_priority, older, n_segments=3,
+                    )
+                else:
+                    # Q3-Q5: 6 段结构化摘要（或手动摘要）
+                    summary = summary or self._llm_summary_6seg(
+                        model_priority, older,
+                    )
+                summary_turn = ConversationTurn(
+                    role="system",
+                    content=(
+                        f"[对话历史已压缩] "
+                        f"以下是之前 {len(older)} 条消息的 {strategy.summary_segments} 段摘要：\n\n{summary}"
+                    ),
+                    task_tier=self._active_tier,
+                    turn_type="system",
+                    turn_index=self._turn_counter + 1,
+                )
+                new_history = [summary_turn] + recent
+                self._turn_counter += 1
         finally:
             self._suppress_usage = prev_suppress
 
@@ -388,11 +614,18 @@ class ContextManager:
         try:
             from omniagent.utils.llm_client import chat_completion
 
-            # 构建对话文本并头尾截断
+            # 构建对话文本：tier-aware 截断（高阶任务保留更多细节）
             parts = []
-            for t in messages[-20:]:  # 最多取 20 条喂给 LLM
+            for t in messages[-15:]:
                 tag = {"user": "用户", "assistant": "助手", "system": "系统", "tool": "工具"}.get(t.role, t.role)
-                parts.append(f"[{tag}] {t.content[:300]}")
+                turn_tier = getattr(t, "task_tier", 3)
+                if turn_tier >= 4:
+                    limit = 500  # Q4-Q5：保留更多细节，含代码参数、架构决策
+                elif turn_tier >= 2:
+                    limit = 300  # Q2-Q3：标准截断
+                else:
+                    limit = 150  # Q1：激进截断
+                parts.append(f"[{tag}] {t.content[:limit]}")
             conversation = self._head_tail_truncate("\n".join(parts))
 
             system_prompt = (
@@ -411,9 +644,9 @@ class ContextManager:
             ]
 
             # 备选模型重试：依次尝试 model_priority，首个成功且解析通过即返回
-            for model_id in (model_priority or []):
+            for model_id in self._reorder_for_summary(model_priority):
                 try:
-                    raw = chat_completion(model_id, msgs, max_tokens=800, temperature=0.3)
+                    raw = chat_completion(model_id, msgs, max_tokens=1000, temperature=0.1)
                     parsed = self._parse_six_segments(raw)
                     if parsed:
                         return parsed
@@ -473,6 +706,154 @@ class ContextManager:
             logger.debug(f"压缩快照已持久化: {path}")
         except Exception as e:  # noqa: BLE001 — 持久化失败不影响压缩主流程
             logger.warning(f"压缩快照持久化失败（已忽略）: {e}")
+
+    def _llm_summary_nseg(
+        self,
+        model_priority: list[str] | None,
+        messages: list[ConversationTurn],
+        *,
+        n_segments: int = 3,
+        max_prompt_chars: int | None = None,
+    ) -> str:
+        """v0.5.0：通用 n 段 LLM 摘要（3 段用于 Q1-Q2，6 段用于 Q3+）。
+
+        与 _llm_summary_6seg 的区别：支持可变段数 + prompt 长度限制。
+        """
+        try:
+            from omniagent.utils.llm_client import chat_completion
+
+            # 构建对话文本
+            parts = []
+            for t in messages[-15:]:
+                tag = {"user": "用户", "assistant": "助手", "system": "系统", "tool": "工具"}.get(t.role, t.role)
+                turn_tier = getattr(t, "task_tier", 3)
+                limit = 500 if turn_tier >= 4 else (300 if turn_tier >= 2 else 150)
+                parts.append(f"[{tag}] {t.content[:limit]}")
+            conversation = "\n".join(parts)
+            if max_prompt_chars and len(conversation) > max_prompt_chars:
+                conversation = self._head_tail_truncate(conversation)
+
+            if n_segments <= 3:
+                system_prompt = (
+                    "请将以下对话压缩为简洁的 3 段摘要，每段以【段名】开头，"
+                    "该段无内容时写\"无\"。总长不超过 300 字。段名与顺序固定：\n"
+                    "【原始目标】用户的需求。\n"
+                    "【已完成步骤】已执行的操作。\n"
+                    "【当前状态】涉及的文件和关键结论。"
+                )
+                segments_to_parse = ("原始目标", "已完成步骤", "当前状态")
+            else:
+                system_prompt = (
+                    "请将以下对话压缩为严格的 6 段结构化摘要，每段以【段名】开头，"
+                    "该段无内容时写\"无\"。总长不超过 600 字。段名与顺序固定：\n"
+                    "【原始目标】用户的核心需求与最终目标。\n"
+                    "【已完成步骤】已执行的操作及其结果（含工具调用）。\n"
+                    "【关键约束】用户强调的约束、偏好、技术栈、命名规范。\n"
+                    "【当前文件状态】已创建/修改/读取的文件路径及其状态。\n"
+                    "【剩余待办】尚未完成的任务与下一步。\n"
+                    "【关键数据】必须记住的**具体数值**——代码参数值、配置常量、"
+                    "超时时间、并发数、阈值、端口号、版本号、ID 等。请逐一列出。"
+                )
+                segments_to_parse = self._SIX_SEGMENTS
+
+            msgs = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": conversation},
+            ]
+
+            for model_id in self._reorder_for_summary(model_priority):
+                try:
+                    # 3 段约需 300 tokens，6 段约需 1000 tokens（中文字 ×2）
+                    tok_budget = 300 if n_segments <= 3 else 1000
+                    raw = chat_completion(model_id, msgs, max_tokens=tok_budget, temperature=0.1)
+                    parsed = self._parse_n_segments(raw, segments_to_parse)
+                    if parsed:
+                        return parsed
+                except Exception as e:
+                    logger.warning(f"{n_segments} 段摘要模型 {model_id} 失败: {e}，尝试下一个")
+                    continue
+
+            return self._auto_summary(messages=messages)
+        except Exception as e:
+            logger.warning(f"{n_segments} 段摘要整体失败，回退自动摘要: {e}")
+            return self._auto_summary(messages=messages)
+
+    def _parse_n_segments(self, raw: str, segments: tuple[str, ...]) -> str | None:
+        """解析 LLM 输出为 n 段；至少含第一段才算有效。"""
+        if not raw or not raw.strip():
+            return None
+        pattern = re.compile(r"【([^】]+)】")
+        matches = list(pattern.finditer(raw))
+        if not matches:
+            return None
+        found: dict[str, str] = {}
+        for i, m in enumerate(matches):
+            name = m.group(1).strip()
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+            found[name] = raw[start:end].strip()
+
+        if segments[0] not in found:
+            return None
+
+        lines = []
+        for seg in segments:
+            content = found.get(seg, "无")
+            lines.append(f"【{seg}】{content}")
+        return "\n".join(lines)
+
+    def _llm_summary_after_tool_trim(
+        self,
+        model_priority: list[str] | None,
+        messages: list[ConversationTurn],
+        *,
+        n_segments: int = 6,
+        strategy: Any = None,
+    ) -> str:
+        """v0.5.0：先压缩工具输出腾空间，再调 LLM 做摘要。
+
+        用于空间紧张时的 Q4-Q5 任务。如果 older 消息中没有工具结果，
+        则直接走正常 6 段 LLM 摘要路径（避免不必要的 prompt 截断）。
+        """
+        try:
+            from omniagent.repl.context_strategies import ToolOutputClassifier
+
+            # 检查是否有工具结果需要压缩
+            has_tool_results = any(
+                getattr(t, "turn_type", "general") == "tool_result"
+                for t in messages
+            )
+
+            if not has_tool_results:
+                # 纯用户/助手对话 → 走正常 6 段路径，不做 prompt 截断
+                return self._llm_summary_6seg(model_priority, messages)
+
+            # 有工具结果 → 压缩后做截断安全的 LLM 摘要
+            classifier = ToolOutputClassifier()
+            trimmed = []
+            for turn in messages:
+                if getattr(turn, "turn_type", "general") == "tool_result":
+                    tool_name = _guess_tool_name(turn)
+                    compressed_content = classifier.compress(
+                        tool_name, turn.content,
+                        max_chars=300,
+                        phase="converge",
+                    )
+                    import copy
+                    new_turn = copy.copy(turn)
+                    new_turn.content = compressed_content
+                    trimmed.append(new_turn)
+                else:
+                    trimmed.append(turn)
+
+            return self._llm_summary_nseg(
+                model_priority, trimmed,
+                n_segments=n_segments,
+                max_prompt_chars=3000,  # 放宽到 3000（原 2000 过激）
+            )
+        except Exception as e:
+            logger.warning(f"工具输出预压缩失败: {e}，回退自动摘要")
+            return self._auto_summary(messages=messages)
 
     def _auto_summary(self, messages: list | None = None) -> str:
         """智能自动摘要（保留关键信息）——6 段 LLM 失败时的正则兜底。"""

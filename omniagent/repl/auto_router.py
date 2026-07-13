@@ -28,10 +28,12 @@ class AutoRouter:
         model_pool: ModelPool | None = None,
         estimator: DifficultyEstimator | None = None,
         history: RoutingHistory | None = None,
+        context_manager: Any = None,
     ):
         self.pool = model_pool or ModelPool()
         self.estimator = estimator or DifficultyEstimator()
         self.history = history or RoutingHistory()
+        self.ctx_mgr = context_manager  # v0.5.0：分层上下文管理
 
     def route(
         self,
@@ -48,6 +50,10 @@ class AutoRouter:
         # Step 10: 估算任务 tier，设置到 profile 上供 ModelPool 层级队列使用
         task_tier = DifficultyEstimator.estimate_tier(profile)
         setattr(profile, "_tier", task_tier)
+
+        # v0.5.0：同步任务 tier 到 ContextManager，用于分层上下文管理
+        if self.ctx_mgr is not None:
+            self.ctx_mgr.set_active_tier(task_tier)
 
         entries = self.pool.select_best(profile, count=count)
 

@@ -93,7 +93,7 @@ class REPL:
         from omniagent.repl.model_pool import ModelPool
         from omniagent.repl.auto_router import AutoRouter
         self.model_pool = ModelPool()
-        self.auto_router = AutoRouter(self.model_pool)
+        self.auto_router = AutoRouter(self.model_pool, context_manager=self.ctx_mgr)
         self.status_bar._auto_router = self.auto_router  # for "auto" display
 
         # 会话状态，供命令处理器共享
