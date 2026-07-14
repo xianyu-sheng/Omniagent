@@ -1047,6 +1047,58 @@ class REPL:
             sys.stdout.flush()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
+    def _classify_slash_input(self, raw: str) -> str:
+        """LLM + 规则校验：判断以 / 开头的输入是命令还是普通对话。
+
+        LLM 先行，规则兜底。返回 'command' 或 'chat'。
+        """
+        parts = raw.split(maxsplit=1)
+        cmd_name = parts[0].lower()
+        has_args = len(parts) > 1
+
+        # ── 规则快速通道：无歧义场景直接判定 ──
+        # 文件路径：含多个 /（如 /home/user/file）
+        if cmd_name.count("/") > 1:
+            return "chat"
+        # 已知命令且无参数：/exit, /help, /models 等
+        if cmd_name in COMMANDS and not has_args:
+            return "command"
+
+        # ── LLM 分类：有歧义的场景（已知命令+参数 或 未知命令）──
+        try:
+            from omniagent.utils.llm_client import chat_completion
+
+            model_ids = self.registry.get_role_priority("planner")
+            effective = [m for m in model_ids if m not in getattr(self, "_failed_models", set())]
+            if not effective:
+                effective = model_ids
+            if effective:
+                prompt = (
+                    "你是一个输入分类器。判断以下用户输入是斜杠命令还是普通对话。\n"
+                    "斜杠命令：用户想执行一个操作（如 /help, /exit, /code 写代码）\n"
+                    "普通对话：用户想聊天或提问，只是输入恰好以 / 开头\n\n"
+                    f"用户输入: {raw}\n\n"
+                    "只回复一个词: command 或 chat"
+                )
+                result = chat_completion(
+                    effective[0],
+                    [{"role": "user", "content": prompt}],
+                    max_tokens=10,
+                    temperature=0,
+                )
+                result_lower = result.strip().lower()
+                if "chat" in result_lower:
+                    return "chat"
+                if "command" in result_lower:
+                    return "command"
+        except Exception:
+            pass  # LLM 不可用，走规则兜底
+
+        # ── 规则兜底 ──
+        if cmd_name in COMMANDS:
+            return "command"
+        return "chat"
+
     def _handle_command(self, raw: str) -> bool:
         """处理斜杠命令。返回 True 表示需要退出。"""
         from omniagent.repl.commands import ExitSignal
@@ -1054,6 +1106,11 @@ class REPL:
         parts = raw.split(maxsplit=1)
         cmd_name = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
+
+        # v0.5.2: LLM + 规则校验——判断输入是否是真正的命令
+        if self._classify_slash_input(raw) == "chat":
+            self._handle_chat(raw)
+            return False
 
         try:
             output = dispatch_command(
