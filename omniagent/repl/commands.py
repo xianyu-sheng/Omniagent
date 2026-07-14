@@ -947,11 +947,16 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
     registry = repl._mcp_registry
 
     if sub == "add":
-        if len(parts) < 3:
-            return "用法: /mcp add <name> <command_or_url> [args...]\n示例:\n  /mcp add fs npx -y @modelcontextprotocol/server-filesystem .\n  /mcp add web http://localhost:3000/sse"
-        name = parts[1]
-        target = parts[2]
-        extra_args = parts[3:] if len(parts) > 3 else []
+        # v0.5.3: 过滤掉 '--' 分隔符（兼容 claude mcp add ... -- ... 写法）
+        clean_parts = [p for p in parts if p != "--"]
+        if len(clean_parts) < 3:
+            resp = "用法: /mcp add <name> <command_or_url> [args...]"
+            if any(p == "--" for p in parts):
+                resp += "\n💡 提示: -- 分隔符不是必需的，直接 /mcp add <name> <command> [args...] 即可"
+            return resp + "\n示例:\n  /mcp add fs npx -y @modelcontextprotocol/server-filesystem .\n  /mcp add web http://localhost:3000/sse"
+        name = clean_parts[1]
+        target = clean_parts[2]
+        extra_args = clean_parts[3:] if len(clean_parts) > 3 else []
 
         try:
             if target.startswith("http"):
