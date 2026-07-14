@@ -129,6 +129,9 @@ class REPL:
         self._pt_session: Any = None
         self._init_prompt_toolkit()
 
+        # v0.5.2: 会话内失败模型集合——一次失败后本会话不再重试
+        self._failed_models: set[str] = set()
+
         # v0.5.0: 工具权限门控
         from omniagent.repl.permissions import PermissionGate, PermissionMode
         self._permission_gate = PermissionGate(mode=PermissionMode.DEFAULT)
@@ -1147,6 +1150,16 @@ class REPL:
             console.print("[red]· 未配置模型，请先 [bold cyan]/setup[/bold cyan] 配置[/red]")
             return
 
+        # v0.5.2: 过滤本会话已失败的模型（统一入口，覆盖所有引擎模式）
+        model_ids = [m for m in model_ids if m not in self._failed_models]
+        if not model_ids:
+            self._failed_models.clear()
+            model_ids = self.registry.get_role_priority("planner")
+            if not model_ids:
+                console.print("[red]· 所有模型均已失败且无法恢复[/red]")
+                return
+            console.print("[dim]· 所有模型已重置失败状态，重新尝试[/dim]")
+
         # 注入对话历史到 AgentContext，供引擎使用
         self.agent_context.set_conversation_messages(self.ctx_mgr.get_messages())
 
@@ -1188,8 +1201,18 @@ class REPL:
 
         messages = self.ctx_mgr.get_messages()
 
+        # v0.5.2: 过滤本会话已失败的模型，避免每次对话都重试不可用模型
+        effective_ids = [m for m in model_ids if m not in self._failed_models]
+        if not effective_ids:
+            # 所有模型都已失败过——重置并重新尝试（给一次重试机会）
+            self._failed_models.clear()
+            effective_ids = model_ids
+        elif len(effective_ids) < len(model_ids):
+            skipped = set(model_ids) - set(effective_ids)
+            console.print(f"[dim]· 跳过 {len(skipped)} 个已失败模型（本会话）[/dim]")
+
         last_error = None
-        for model_id in model_ids:
+        for model_id in effective_ids:
             try:
                 if self.streaming:
                     response_text = self._stream_response(model_id, messages)
@@ -1239,7 +1262,8 @@ class REPL:
                 return
             except Exception as e:
                 last_error = e
-                console.print(f"[yellow]模型 {model_id} 失败: {e}，尝试下一个...[/yellow]")
+                self._failed_models.add(model_id)
+                console.print(f"[yellow]模型 {model_id} 失败: {e}，已标记不可用，尝试下一个...[/yellow]")
 
         console.print(f"[error]❌ 所有模型均调用失败: {last_error}[/error]")
 

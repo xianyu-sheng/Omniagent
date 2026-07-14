@@ -250,6 +250,11 @@ def _cmd_remove_model(*, args: str, registry: ModelRegistry, **kwargs: Any) -> s
         return "用法: /remove_model <alias>"
     if registry.remove_model(alias):
         return f"✅ 模型 '{alias}' 已移除"
+    # v0.5.2: 也支持按 model_id 查找（如 custom/glm-5-2-260617）
+    for a, m in list(registry.models.items()):
+        if m.model_id == alias:
+            registry.remove_model(a)
+            return f"✅ 模型 '{alias}' 已移除"
     return f"❌ 模型 '{alias}' 不存在"
 
 
@@ -1094,16 +1099,20 @@ def _cmd_model(*, session_state: dict, registry: ModelRegistry, **kwargs: Any) -
     console.print()
 
     try:
-        choice = _IntPrompt.ask(
+        choice = int(_IntPrompt.ask(
             "输入编号切换模型",
             choices=[str(i) for i in range(1, len(models) + 1)],
             default="1",
-        )
+        ))
     except (KeyboardInterrupt, EOFError, OSError):
         return "已取消"
 
     selected = models[choice - 1]
     registry.role_priority["planner"] = [selected.alias]
+    # v0.5.2: 清除该模型的失败标记，允许重新调用
+    repl = session_state.get("_repl")
+    if repl and hasattr(repl, "_failed_models"):
+        repl._failed_models.discard(selected.model_id)
     return f"✅ 已切换到: {selected.alias} ({selected.model_id})"
 
 
