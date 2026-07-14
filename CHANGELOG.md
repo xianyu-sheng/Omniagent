@@ -3,6 +3,20 @@
 本文件记录 OmniAgent-CLI 各版本变更。版本号遵循语义化版本（预 1.0 阶段：
 `0.MINOR.PATCH`，每个修复批次递增 MINOR）。
 
+## [0.5.3] — 2026-07-14
+
+### Bug 修复
+
+- **git 工具字段名不一致**：`git` 返回 `output` 字段，而 `command` 使用 `stdout`，导致 LLM 解析工具结果时需适配两种字段名。现已统一在结果中同时提供 `stdout` 和 `output`（向后兼容）。
+- **search_files 缺少文本表示**：`search_files` 仅返回结构化 `matches` 列表，缺少 LLM 可直接读取的文本格式。现新增 `stdout` 字段，提供 `file:line: content` 格式的文本表示。
+- **参数校验拦截后无恢复提示**：当 LLM 使用 `command` 执行超长/复杂 shell 命令被参数校验拦截后，错误消息不提示替代方案，导致 LLM 难以自动恢复。现新增 `_tool_alternative_hint()` 函数，拦截时自动建议对应工具（如 `command → search_files / read_file / list_files`）。
+
+### 质量验证
+
+- **L1 工具层压力测试**: 10/10 全绿（76 次工具调用，92 步骤，0 异常）
+- **L2 端到端 LLM 测试**: 4/4 全绿（14s–43s，多轮 ReAct 推理 + 工具链）
+- **回归测试**: 1110/1110 全绿，无破坏性变更
+
 ## [0.5.2] — 2026-07-14
 
 ### UI 重构（prompt_toolkit 集成）
