@@ -393,7 +393,11 @@ def parse_model_id(model_id: str) -> tuple[str, str]:
 
 
 def _load_custom_provider_config(provider_key: str) -> dict | None:
-    """v0.4.0: 从 credentials.yaml 加载自定义模型商配置。"""
+    """v0.4.0: 从 credentials.yaml 加载自定义模型商配置。
+
+    v0.5.3: 兼容旧版本产生的空 key（纯中文名称注册时 key 被清空）。
+    查找顺序：exact key → "custom"（修补后的默认 key）→ 空字符串（旧版本遗留）。
+    """
     try:
         import yaml as _yaml
         path = Path.home() / ".omniagent" / "credentials.yaml"
@@ -401,7 +405,17 @@ def _load_custom_provider_config(provider_key: str) -> dict | None:
             return None
         with open(path, encoding="utf-8") as f:
             data = _yaml.safe_load(f) or {}
-        return data.get("_custom_providers", {}).get(provider_key)
+        custom_providers = data.get("_custom_providers", {})
+        # v0.5.3: 兼容空 key 和修补后的 "custom" key
+        cfg = (
+            custom_providers.get(provider_key)
+            or custom_providers.get("custom")
+            or custom_providers.get("")
+        )
+        # 如果通过空 key 找到，自动修复为 "custom"（下次保存时生效）
+        if cfg is not None and not custom_providers.get(provider_key):
+            custom_providers["custom"] = cfg
+        return cfg
     except Exception:
         return None
 
@@ -416,11 +430,12 @@ def build_endpoint(model_id: str, credentials: dict[str, str] | None = None, bas
 
     # v0.4.0: 先查内置 + 动态注册的 defaults
     defaults = _PROVIDER_DEFAULTS.get(provider)
+    custom_config = None
     if defaults is None:
         # 尝试从自定义模型商加载
-        custom = _load_custom_provider_config(provider)
-        if custom:
-            defaults = {"base_url": custom["base_url"],
+        custom_config = _load_custom_provider_config(provider)
+        if custom_config:
+            defaults = {"base_url": custom_config["base_url"],
                         "env_key": "", "max_output_tokens": 8192}
         else:
             raise ValueError(
@@ -429,6 +444,9 @@ def build_endpoint(model_id: str, credentials: dict[str, str] | None = None, bas
             )
 
     api_key = creds.get(provider, "")
+    # v0.5.3: 自定义模型商的 API Key 优先从 custom_config 取
+    if not api_key and custom_config:
+        api_key = custom_config.get("api_key", "")
     if not api_key:
         raise ValueError(
             f"未找到 {provider} 的 API Key。"
