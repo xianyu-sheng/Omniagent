@@ -21,6 +21,7 @@ import httpx
 
 from omniagent.engine.callbacks import EngineCallback
 from omniagent.engine.context import AgentContext
+from omniagent.repl.model_pool import FAILURE_THRESHOLD  # v0.5.3
 from omniagent.utils.llm_client import (
     ResponseTruncatedError,
     chat_completion,
@@ -260,19 +261,45 @@ class BaseEngine(ABC):
                         f"模型 {model_id} 请求被拒 (400)，请检查参数/模型名") from e
                 # 429/5xx/其他 HTTP：瞬时，切下一个模型
                 if self.model_pool:
-                    self.model_pool.record_failure(model_id)
+                    entry = self.model_pool._find_entry(model_id)
+                    was_open = (
+                        entry is not None
+                        and entry.health.consecutive_failures >= FAILURE_THRESHOLD
+                    )
+                    self.model_pool.record_failure(model_id, is_retry=was_open)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} HTTP {status} 失败: {e}，尝试下一个..."))
             except (
                 httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout,
                 httpx.RemoteProtocolError, httpx.WriteError, httpx.PoolTimeout,
             ) as e:
+                if self.model_pool:
+                    entry = self.model_pool._find_entry(model_id)
+                    was_open = (
+                        entry is not None
+                        and entry.health.consecutive_failures >= FAILURE_THRESHOLD
+                    )
+                    self.model_pool.record_failure(model_id, is_retry=was_open)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} 网络错误 ({type(e).__name__}): {e}，尝试下一个..."))
             except ResponseTruncatedError as e:
+                if self.model_pool:
+                    entry = self.model_pool._find_entry(model_id)
+                    was_open = (
+                        entry is not None
+                        and entry.health.consecutive_failures >= FAILURE_THRESHOLD
+                    )
+                    self.model_pool.record_failure(model_id, is_retry=was_open)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} 响应截断: {e}，尝试下一个..."))
             except Exception as e:
+                if self.model_pool:
+                    entry = self.model_pool._find_entry(model_id)
+                    was_open = (
+                        entry is not None
+                        and entry.health.consecutive_failures >= FAILURE_THRESHOLD
+                    )
+                    self.model_pool.record_failure(model_id, is_retry=was_open)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} 失败: {e}，尝试下一个..."))
         self.callback.on_error(f"所有模型均调用失败: {last_error}")

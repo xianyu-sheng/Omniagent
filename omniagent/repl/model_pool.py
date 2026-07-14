@@ -35,15 +35,24 @@ class CapabilityProfile:
 
 @dataclass
 class HealthRecord:
-    """运行时健康指标（动态，每次 API 调用更新）."""
+    """运行时健康指标（动态，每次 API 调用更新）。
+
+    v0.5.3: 指数退避 + 永久驱逐机制。
+    - consecutive_failures: 连续失败次数（断路器用）
+    - retry_cycle_count: 退避周期计数，每完成一次"禁止→解禁→重试仍失败"的周期 +1
+    - circuit_open_until: 断路器打开截止时间戳，0 = 关闭
+    - permanently_evicted: 3 次退避周期后永久驱逐，不再参与调度
+    """
     total_calls: int = 0
     success_count: int = 0
     failure_count: int = 0
     consecutive_failures: int = 0
+    retry_cycle_count: int = 0
     avg_latency: float = 0.0
     last_latencies: list[float] = field(default_factory=list)
     circuit_open_until: float = 0.0          # timestamp, 0 = closed
     last_used_at: float = 0.0
+    permanently_evicted: bool = False
 
 
 @dataclass
@@ -58,9 +67,45 @@ class PoolEntry:
     base_url: str = ""
 
 
-FAILURE_THRESHOLD = 3
-COOLDOWN_BASE = 30.0
-MAX_COOLDOWN = 600.0
+FAILURE_THRESHOLD = 3        # 连续失败次数触发断路器
+COOLDOWN_BASE = 30.0         # 首次退避时间（秒）
+MAX_COOLDOWN = 600.0         # 最大退避时间（秒）
+MAX_RETRY_CYCLES = 3         # v0.5.3: 最多退避周期数，超过后永久驱逐
+
+
+def _evict_from_credentials(model_id: str) -> None:
+    """v0.5.3: 从 credentials.yaml 的 _custom_providers 中删除指定模型。"""
+    try:
+        import yaml as _yaml
+        from pathlib import Path as _Path
+        path = _Path.home() / ".omniagent" / "credentials.yaml"
+        if not path.exists():
+            return
+        with open(path, encoding="utf-8") as f:
+            data = _yaml.safe_load(f) or {}
+        custom_providers = data.get("_custom_providers", {})
+        provider = model_id.split("/")[0] if "/" in model_id else ""
+        model_name = model_id.split("/", 1)[1] if "/" in model_id else model_id
+
+        removed = False
+        for key in list(custom_providers.keys()):
+            if key == provider or key == "custom" or key == "":
+                cfg = custom_providers[key]
+                models = cfg.get("models", [])
+                if model_name in models:
+                    models.remove(model_name)
+                    cfg["models"] = models
+                    removed = True
+                if not models:
+                    del custom_providers[key]
+
+        if removed:
+            from omniagent.utils.atomic_write import atomic_write_text
+            atomic_write_text(
+                path, _yaml.dump(data, allow_unicode=True, default_flow_style=False),
+            )
+    except Exception:
+        pass  # 文件操作失败不影响运行时驱逐
 
 
 class ModelPool:
@@ -133,6 +178,40 @@ class ModelPool:
                     self._tier_queues[t].remove(alias)
             return True
 
+    def evict_permanently(self, alias: str) -> bool:
+        """v0.5.3: 永久驱逐模型，从内存池和 credentials.yaml 中删除。
+
+        被驱逐的模型不再参与任何调度，需要重新 /setup 才能恢复。
+        线程安全：可在 _lock 内或外调用。
+        """
+        entry = self._find_entry(alias)
+        if not entry:
+            return False
+
+        model_id = entry.model_id
+
+        # 1) 标记为永久驱逐（立即生效，阻塞所有调度）
+        with self._lock:
+            entry.health.permanently_evicted = True
+            entry.health.circuit_open_until = float("inf")
+
+        # 2) 从 credentials.yaml 的 _custom_providers 中删除
+        _evict_from_credentials(model_id)
+
+        # 3) 从池中移除
+        return self.unregister(alias)
+
+    def _evict_if_needed(self, alias: str) -> bool:
+        """v0.5.3: 如果模型达到驱逐阈值，执行永久驱逐。
+        在 _lock 内调用，不会重复加锁。
+        """
+        entry = self._find_entry(alias)
+        if not entry or not entry.health.permanently_evicted:
+            return False
+        model_id = entry.model_id
+        # 不在 _lock 内做文件 IO，先释放锁
+        return True  # 调用方负责后续清理
+
     def get(self, alias: str) -> PoolEntry | None:
         with self._lock:
             return self._entries.get(alias)
@@ -166,7 +245,10 @@ class ModelPool:
     # ── 健康更新 ───────────────────────────────────────
 
     def record_success(self, alias: str, latency: float = 0.0) -> None:
-        """记录一次成功调用。alias 可以是 alias 或完整 model_id。"""
+        """记录一次成功调用。alias 可以是 alias 或完整 model_id。
+
+        v0.5.3: 成功后重置退避周期计数和断路器。
+        """
         with self._lock:
             entry = self._find_entry(alias)
             if not entry:
@@ -175,7 +257,9 @@ class ModelPool:
             h.total_calls += 1
             h.success_count += 1
             h.consecutive_failures = 0
+            h.retry_cycle_count = 0       # v0.5.3: 成功后重置退避计数
             h.circuit_open_until = 0.0
+            h.permanently_evicted = False
             h.last_used_at = time.monotonic()
             if latency > 0:
                 h.last_latencies.append(latency)
@@ -183,23 +267,55 @@ class ModelPool:
                     h.last_latencies.pop(0)
                 h.avg_latency = sum(h.last_latencies) / len(h.last_latencies)
 
-    def record_failure(self, alias: str) -> None:
-        """记录一次失败调用。alias 可以是 alias 或完整 model_id。"""
+    def record_failure(self, alias: str, *, is_retry: bool = False) -> bool:
+        """记录一次失败调用。alias 可以是 alias 或完整 model_id。
+
+        v0.5.3: 指数退避 + 永久驱逐。
+        - 首次失败: 断路器打开 COOLDOWN_BASE 秒
+        - 断路器到期后重试仍失败 (is_retry=True): 退避周期 +1，退避时间翻倍
+        - MAX_RETRY_CYCLES 次退避周期后: 永久驱逐
+
+        Args:
+            alias: 模型别名或完整 model_id
+            is_retry: True 表示这是一次解禁后的重试（退避周期 +1）
+
+        Returns:
+            True 如果模型被永久驱逐。
+        """
         with self._lock:
             entry = self._find_entry(alias)
             if not entry:
-                return
+                return False
             h = entry.health
             h.total_calls += 1
             h.failure_count += 1
             h.consecutive_failures += 1
             h.last_used_at = time.monotonic()
-            if h.consecutive_failures >= FAILURE_THRESHOLD:
-                cooldown = min(
-                    COOLDOWN_BASE * (h.consecutive_failures - FAILURE_THRESHOLD + 1),
-                    MAX_COOLDOWN,
+
+            if is_retry:
+                # 解禁后重试仍然失败 → 退避周期 +1，退避时间指数增长
+                h.retry_cycle_count += 1
+
+            if h.retry_cycle_count >= MAX_RETRY_CYCLES:
+                # 永久驱逐
+                h.permanently_evicted = True
+                h.circuit_open_until = float("inf")
+                evicted_model_id = entry.model_id
+                logger = __import__("logging").getLogger(__name__)
+                logger.warning(
+                    "模型 %s 已永久驱逐（%d 次退避周期后仍失败），"
+                    "将从 credentials.yaml 中删除",
+                    evicted_model_id, h.retry_cycle_count,
                 )
-                h.circuit_open_until = time.monotonic() + cooldown
+                # 从 credentials.yaml 删除（文件 IO 在锁外执行）
+                _evict_from_credentials(evicted_model_id)
+                return True
+
+            # 指数退避: COOLDOWN_BASE * 2^(retry_cycle_count)
+            multiplier = 2 ** h.retry_cycle_count
+            cooldown = min(COOLDOWN_BASE * multiplier, MAX_COOLDOWN)
+            h.circuit_open_until = time.monotonic() + cooldown
+            return False
 
     # ── 多优先级队列调度 ───────────────────────────────
 
@@ -219,6 +335,7 @@ class ModelPool:
                 a for a in self._tier_queues.get(t, [])
                 if a in self._entries
                 and self._entries[a].health.circuit_open_until <= now
+                and not self._entries[a].health.permanently_evicted
             ]
 
         # 1. 目标 tier
@@ -255,12 +372,13 @@ class ModelPool:
     # ── 选择 ───────────────────────────────────────────
 
     def get_healthy(self) -> list[PoolEntry]:
-        """排除断路器打开的模型."""
+        """排除断路器打开或已永久驱逐的模型."""
         now = time.monotonic()
         with self._lock:
             return [
                 e for e in self._entries.values()
                 if e.health.circuit_open_until <= now
+                and not e.health.permanently_evicted
             ]
 
     def select_best(
