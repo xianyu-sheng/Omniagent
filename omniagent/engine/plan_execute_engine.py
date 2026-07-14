@@ -141,12 +141,14 @@ class PlanExecuteEngine(BaseEngine):
         max_mini_react_rounds: int = 3,
         model_pool: Any = None,          # v0.4.0
         auto_router: Any = None,         # v0.4.0 Step 13
+        permission_gate: Any = None,     # v0.5.0
     ) -> None:
         # R2: 公共属性与 _call_llm 由 BaseEngine 提供。
         super().__init__(
             model_priority, callback=callback,
             model_configs=model_configs, temperature=0.3,
             model_pool=model_pool, auto_router=auto_router,
+            permission_gate=permission_gate,
         )
         self.max_steps = max_steps
         # P2-E2 双模型：规划用 model_priority（默认），执行/总结用 executor_model_priority
@@ -165,7 +167,7 @@ class PlanExecuteEngine(BaseEngine):
         else:
             self.system_prompt = self._build_plan_prompt()
         # F1: 工具执行门面（7 阶段流水线）
-        self._tool_executor = ToolExecutor()
+        self._tool_executor = ToolExecutor(permission_gate=permission_gate)
 
     @staticmethod
     def _build_plan_prompt() -> str:

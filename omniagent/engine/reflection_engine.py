@@ -80,12 +80,14 @@ class ReflectionEngine(BaseEngine):
         model_configs: dict[str, Any] | None = None,
         model_pool: Any = None,          # v0.4.0
         auto_router: Any = None,         # v0.4.0 Step 13
+        permission_gate: Any = None,     # v0.5.0
     ) -> None:
         # R2: 公共属性与 _call_llm 由 BaseEngine 提供。
         super().__init__(
             model_priority, callback=callback,
             model_configs=model_configs, temperature=0.3,
             model_pool=model_pool, auto_router=auto_router,
+            permission_gate=permission_gate,
         )
         self.max_rounds = max_rounds
         self.pass_threshold = pass_threshold

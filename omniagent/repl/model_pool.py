@@ -150,12 +150,25 @@ class ModelPool:
         with self._lock:
             return {t: list(aliases) for t, aliases in self._tier_queues.items()}
 
+    # ── 查找辅助 ───────────────────────────────────────
+
+    def _find_entry(self, alias_or_model_id: str) -> PoolEntry | None:
+        """按 alias 或 model_id 查找条目。"""
+        entry = self._entries.get(alias_or_model_id)
+        if entry is not None:
+            return entry
+        # Fallback: 按 model_id 查找（engine 层传的是完整 model_id）
+        for e in self._entries.values():
+            if e.model_id == alias_or_model_id:
+                return e
+        return None
+
     # ── 健康更新 ───────────────────────────────────────
 
     def record_success(self, alias: str, latency: float = 0.0) -> None:
-        """记录一次成功调用."""
+        """记录一次成功调用。alias 可以是 alias 或完整 model_id。"""
         with self._lock:
-            entry = self._entries.get(alias)
+            entry = self._find_entry(alias)
             if not entry:
                 return
             h = entry.health
@@ -171,9 +184,9 @@ class ModelPool:
                 h.avg_latency = sum(h.last_latencies) / len(h.last_latencies)
 
     def record_failure(self, alias: str) -> None:
-        """记录一次失败调用."""
+        """记录一次失败调用。alias 可以是 alias 或完整 model_id。"""
         with self._lock:
-            entry = self._entries.get(alias)
+            entry = self._find_entry(alias)
             if not entry:
                 return
             h = entry.health

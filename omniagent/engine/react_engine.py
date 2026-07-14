@@ -70,7 +70,10 @@ REACT_SYSTEM_PROMPT = """你是一个 ReAct 模式的 AI 编程助手。你通�
 ## 工具调用规则
 
 1. **参数名必须使用标准名称**（见下方工具列表），不要用别名
-2. **一个 JSON 只调用一个工具**，不要同时调用多个
+2. **并行调用规则**：
+   - 只读工具（read_file、search_files、list_files、code_index、ast_analyze、web_fetch、github_fetch、weather、datetime）可以**同时调用多个**，一次性返回 JSON 数组：`[{{"action":...}}, {{"action":...}}]`
+   - 写入/变更工具（write_file、edit_file、command、git、refactor、batch_write、batch_edit、create_directory）**必须单独调用**，每次只一个工具
+   - 不要将只读和写入工具混合在一次并行调用中
 3. **工具失败时**：分析错误原因，调整参数后重试，或换一种方法
 4. **不要编造结果**：如果不确定文件是否创建成功，用 read_file 验证
 5. **何时使用 final_answer**：只有当所有操作都通过工具实际执行完毕后，才能使用 final_answer
@@ -232,6 +235,7 @@ class ReActEngine(BaseEngine):
         max_subagent_depth: int = 1,
         model_pool: Any = None,          # v0.4.0
         auto_router: Any = None,         # v0.4.0 Step 13
+        permission_gate: Any = None,     # v0.5.0: PermissionGate
     ) -> None:
         # R2: 公共属性（model_priority/callback/model_configs/temperature）与
         # _call_llm 由 BaseEngine 提供，消除四份复制与参数漂移。
@@ -239,12 +243,13 @@ class ReActEngine(BaseEngine):
             model_priority, callback=callback,
             model_configs=model_configs, temperature=0.3,
             model_pool=model_pool, auto_router=auto_router,
+            permission_gate=permission_gate,
         )
         self.max_iterations = max_iterations
         self.tools = tools or BUILTIN_TOOLS
         self.system_prompt = system_prompt or self._build_system_prompt()
         # F1: 工具执行门面（7 阶段流水线：校验/断路器/重试/封装）
-        self._tool_executor = ToolExecutor()
+        self._tool_executor = ToolExecutor(permission_gate=permission_gate)
         # F2: 空洞回答检测器（无状态，实例共享）
         self._hollow = HollowDetector()
         # F5: 原生 function-calling 三层降级开关（默认关——需逐模型验证 FC 兼容性，
@@ -397,11 +402,16 @@ class ReActEngine(BaseEngine):
             # 解析 LLM 输出
             parsed = self._parse_response(response)
 
-            thought = parsed.get("thought", "")
+            # v0.5.0: 兼容并行工具调用 — list 是多个 action
+            if isinstance(parsed, list):
+                thought = ""
+            else:
+                thought = parsed.get("thought", "")
             if thought:
                 self.callback.on_think(thought)
 
-            final_answer = parsed.get("final_answer", "")
+            # v0.5.0: 并行工具调用时跳过 final_answer 检查
+            final_answer = "" if isinstance(parsed, list) else parsed.get("final_answer", "")
             if final_answer and final_answer.strip():
                 # ── F2: 空洞回答检测 ──
                 # 仅当"做过工或已进入收束阶段"且仍有预算且未超拒绝上限时拦截；
@@ -467,23 +477,54 @@ class ReActEngine(BaseEngine):
                 return answer
 
             if "action" in parsed:
-                # 执行工具
-                action = parsed["action"]
-                action_input = parsed.get("action_input", {})
+                # v0.5.0: 支持并行工具调用 — 单 dict 或 list[dict]
+                raw_actions = parsed if isinstance(parsed, list) else [parsed]
+                if len(raw_actions) == 1:
+                    # ── 单工具路径（原有逻辑） ──
+                    action = raw_actions[0]["action"]
+                    action_input = raw_actions[0].get("action_input", {})
 
-                logger.debug(f"ReAct 思考: {thought}")
-                logger.debug(f"ReAct 行动: {action}({mask_sensitive_params(action_input)})")
-                self.callback.on_act(action, action_input)
+                    logger.debug(f"ReAct 思考: {thought}")
+                    logger.debug(f"ReAct 行动: {action}({mask_sensitive_params(action_input)})")
+                    self.callback.on_act(action, action_input)
 
-                # F2: 收束阶段工具门控（禁用纯探索型工具）
-                allow, gate_reason = budget.allow_tool(action)
-                if not allow:
-                    observation = f"⚠️ {gate_reason}"
-                    self.callback.on_warning(gate_reason)
-                    logger.info(f"ReAct: 收束阶段拦截工具 {action}")
+                    allow, gate_reason = budget.allow_tool(action)
+                    if not allow:
+                        observation = f"⚠️ {gate_reason}"
+                        self.callback.on_warning(gate_reason)
+                        logger.info(f"ReAct: 收束阶段拦截工具 {action}")
+                    else:
+                        observation = self._execute_tool(action, action_input, ctx, tracker)
+                    self.callback.on_observe(observation)
                 else:
-                    observation = self._execute_tool(action, action_input, ctx, tracker)
-                self.callback.on_observe(observation)
+                    # ── v0.5.0: 多工具并行路径 ──
+                    logger.debug(f"ReAct 思考: {thought}")
+                    logger.debug(f"ReAct 并行工具: {[a['action'] for a in raw_actions]}")
+                    for a in raw_actions:
+                        self.callback.on_act(a["action"], a.get("action_input", {}))
+
+                    # 过滤收束阶段禁用的工具
+                    executable: list[dict] = []
+                    blocked: list[str] = []
+                    for a in raw_actions:
+                        allow, reason = budget.allow_tool(a["action"])
+                        if allow:
+                            executable.append(a)
+                        else:
+                            blocked.append(f"{a['action']}: {reason}")
+
+                    # 并行执行
+                    parallel_results = self._execute_tools_parallel(
+                        executable, ctx, tracker,
+                    )
+                    observations: list[str] = []
+                    for a, obs in parallel_results:
+                        observations.append(f"[{a['action']}] {obs}")
+                    for b in blocked:
+                        observations.append(f"⚠️ [{b}]")
+                    observation = "\n\n".join(observations)
+                    for a, obs in parallel_results:
+                        self.callback.on_observe(f"[{a['action']}] {obs[:200]}...")
 
                 # F6: 接近上下文窗口时拒绝大 observation（截断），防止下一轮超限
                 if self._near_context_window(messages):

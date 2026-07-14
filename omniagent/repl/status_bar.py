@@ -56,7 +56,7 @@ class StatusBar:
 
     def set_mode_notification(self, mode_name: str) -> None:
         """设置一次性模式切换通知（3 秒后自动清除）。"""
-        self._notification = f"🔄 切换至: {mode_name}"
+        self._notification = f"🔄{mode_name}"
         self._notification_expires = _time.monotonic() + 3.0
 
     def _clear_expired_notification(self) -> None:
@@ -169,6 +169,58 @@ class StatusBar:
             except Exception:
                 pass
 
+    def get_toolbar_text(self) -> str:
+        """返回 prompt_toolkit 底部状态栏文本（纯 ANSI，不含 Rich markup）。
+
+        用于 prompt_toolkit 的 bottom_toolbar 参数，
+        提供固定于终端底部的实时状态信息。
+        """
+        try:
+            return self._toolbar_impl()
+        except Exception:
+            return "状态不可用"
+
+    def _toolbar_impl(self) -> str:
+        import shutil
+        stats = self.ctx_mgr.stats()
+        mode = self.registry.get_current_mode()
+
+        used = stats["estimated_tokens"]
+        max_tok = stats["max_tokens"]
+        ratio = stats["usage_ratio"]
+
+        if self._auto_router and not self._auto_router.is_empty():
+            active = self._auto_router.get_active_model_id() or self._last_model
+            model_display = f"auto {active or '—'}"
+        else:
+            model_display = self._last_model or "—"
+        # v0.5.1: 更短的模型名显示（22 字符截断）
+        if len(model_display) > 22:
+            model_display = "…" + model_display[-21:]
+
+        stream = "⚡" if self._streaming else "⏸"
+
+        pct_val = self._parse_pct(ratio)
+
+        # 简单的文本进度条（8 格更紧凑）
+        bar_width = 8
+        filled = min(int(pct_val / 100 * bar_width), bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        # 通知
+        self._clear_expired_notification()
+        notify = f"{self._notification} · " if self._notification else ""
+
+        # 压缩警告
+        warn = "⚠ /compact · " if stats["needs_compact"] else ""
+
+        # v0.5.1: · 分隔符避免与框线 │ 视觉冲突；消息 → msg 更紧凑
+        term_width = shutil.get_terminal_size().columns
+        line = f" {warn}{notify}{model_display} · {mode.name} · Token [{bar}] {ratio} · {stats['total_messages']} msg · {stream} "
+        if len(line) > term_width:
+            line = line[:term_width - 1]
+        return line
+
     def _print_status_impl(self) -> None:
         stats = self.ctx_mgr.stats()
         mode = self.registry.get_current_mode()
@@ -200,15 +252,16 @@ class StatusBar:
         self._clear_expired_notification()
         notify = ""
         if self._notification:
-            notify = f"[bold yellow]{self._notification}[/bold yellow] │ "
+            notify = f"[bold yellow]{self._notification}[/bold yellow] · "
 
         # ⚠建议 /compact 置首，保证可见（§8.18.2）
-        warn = "[bold red]⚠ 建议 /compact[/bold red] │ " if stats["needs_compact"] else ""
+        warn = "[bold red]⚠ 建议 /compact[/bold red] · " if stats["needs_compact"] else ""
 
+        # v0.5.2: 移除孤立的 ┌─ 前缀，改用简洁的 · 分隔符
         line = (notify +
-            f"[dim]┌─ {warn}{model_display} │ {mode.name} │ "
-            f"[{token_color}]Token {used:,}/{max_tok:,} ({ratio})[/{token_color}] │ "
-            f"消息 {stats['total_messages']} │ {stream}"
+            f"[dim]  {warn}{model_display} · {mode.name} · "
+            f"[{token_color}]Token {used:,}/{max_tok:,} ({ratio})[/{token_color}] · "
+            f"消息 {stats['total_messages']} · {stream}"
         )
         line += "[/dim]"
 

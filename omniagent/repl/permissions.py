@@ -1,0 +1,153 @@
+"""
+v0.5.0: 权限门控系统 — 危险工具操作确认。
+
+提供类似 Claude Code permissionMode 的工具执行确认机制：
+- DEFAULT: 危险操作弹框确认
+- ACCEPT_EDITS: 自动批准编辑类操作，shell 仍需确认
+- BYPASS: 跳过所有确认（CI/自动化场景）
+- PLAN: 只读模式，拒绝所有写入操作
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Callable
+
+
+class PermissionMode(Enum):
+    """权限模式。"""
+    DEFAULT = "default"           # 危险操作确认
+    ACCEPT_EDITS = "accept_edits" # 自动批准编辑
+    BYPASS = "bypass"            # 跳过确认
+    PLAN = "plan"                # 只读模式
+
+
+# ── 工具分类 ────────────────────────────────────────────
+
+_CRITICAL_TOOLS: frozenset[str] = frozenset({"command"})
+
+_WRITE_TOOLS: frozenset[str] = frozenset({
+    "write_file", "edit_file", "create_directory",
+    "batch_write", "batch_edit", "edit_with_llm", "append_file",
+})
+
+# git 命令中的危险子命令
+_DANGEROUS_GIT_COMMANDS: frozenset[str] = frozenset({
+    "push", "push --force", "force-push", "hard reset",
+    "reset --hard", "clean", "clean -fd",
+})
+
+
+class PermissionGate:
+    """工具执行权限门控。
+
+    在工具执行前检查是否需要用户确认，
+    支持会话级别的"总是允许"记忆。
+    """
+
+    def __init__(self, mode: PermissionMode = PermissionMode.DEFAULT) -> None:
+        self.mode = mode
+        # 会话级别记忆：用户选择"总是允许"的工具名集合
+        self._session_allow: set[str] = set()
+        # 外部确认回调：签名 (tool_name, params, risk_level) -> bool
+        self._confirm_callback: Callable[[str, dict, str], bool] | None = None
+
+    def set_confirm_callback(self, cb: Callable[[str, dict, str], bool]) -> None:
+        """设置确认回调（由 REPL 层注入）。"""
+        self._confirm_callback = cb
+
+    def set_mode(self, mode: PermissionMode) -> None:
+        """切换权限模式。"""
+        self.mode = mode
+
+    def _classify(self, tool_name: str, params: dict | None = None) -> str:
+        """分类工具风险级别。"""
+        if tool_name in _CRITICAL_TOOLS:
+            return "CRITICAL"
+        if tool_name in _WRITE_TOOLS:
+            return "WRITE"
+        if tool_name == "git":
+            # git 工具的子命令决定风险
+            action = (params or {}).get("action", "")
+            if any(d in str(action) for d in _DANGEROUS_GIT_COMMANDS):
+                return "CRITICAL"
+            return "WRITE"
+        return "READ"
+
+    def check(self, tool_name: str, params: dict | None = None) -> tuple[bool, str]:
+        """检查工具是否可以执行。
+
+        Returns:
+            (allowed, reason) — allowed=True 表示可以执行；
+            allowed=False 时 reason 是拒绝原因。
+        """
+        risk = self._classify(tool_name, params)
+
+        # PLAN 模式：只允许 READ
+        if self.mode == PermissionMode.PLAN:
+            if risk != "READ":
+                return False, f"PLAN 模式禁止 {risk} 操作: {tool_name}"
+            return True, ""
+
+        # BYPASS 模式：全部允许
+        if self.mode == PermissionMode.BYPASS:
+            return True, ""
+
+        # 会话级别记忆
+        if tool_name in self._session_allow:
+            return True, ""
+
+        # ACCEPT_EDITS 模式：仅 CRITICAL 需要确认
+        if self.mode == PermissionMode.ACCEPT_EDITS:
+            if risk == "CRITICAL":
+                return self._ask(tool_name, params or {}, risk)
+            return True, ""
+
+        # DEFAULT 模式：CRITICAL + WRITE 需要确认
+        if self.mode == PermissionMode.DEFAULT:
+            if risk in ("CRITICAL", "WRITE"):
+                return self._ask(tool_name, params or {}, risk)
+            return True, ""
+
+        return True, ""
+
+    def _ask(self, tool_name: str, params: dict, risk: str) -> tuple[bool, str]:
+        """向用户确认。返回 (allowed, reason)。"""
+        if self._confirm_callback is not None:
+            return self._confirm_callback(tool_name, params, risk)
+
+        # 无回调（非交互模式）：默认允许
+        return True, ""
+
+    def allow_always(self, tool_name: str) -> None:
+        """会话级别：总是允许此工具。"""
+        self._session_allow.add(tool_name)
+
+    def reset_session(self) -> None:
+        """清除会话级别记忆。"""
+        self._session_allow.clear()
+
+    @staticmethod
+    def format_confirm_message(tool_name: str, params: dict, risk: str) -> str:
+        """格式化确认提示消息。"""
+        lines = [f"⚠️  {risk} 操作: [bold yellow]{tool_name}[/bold yellow]"]
+
+        if tool_name == "command":
+            cmd = params.get("command", params.get("cmd", "?"))
+            lines.append(f"   命令: [bold white]{cmd}[/bold white]")
+        elif tool_name == "write_file":
+            path = params.get("file_path", params.get("path", "?"))
+            lines.append(f"   写入: [bold white]{path}[/bold white]")
+        elif tool_name == "edit_file":
+            path = params.get("file_path", params.get("path", "?"))
+            lines.append(f"   编辑: [bold white]{path}[/bold white]")
+        elif tool_name == "git":
+            action = params.get("action", "?")
+            lines.append(f"   操作: [bold white]{action}[/bold white]")
+        elif tool_name == "create_directory":
+            path = params.get("path", "?")
+            lines.append(f"   创建: [bold white]{path}[/bold white]")
+
+        lines.append("")
+        lines.append("   [y] 确认  [n] 拒绝  [a] 本次会话总是允许  [q] 取消任务")
+        return "\n".join(lines)

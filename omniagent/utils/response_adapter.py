@@ -237,8 +237,11 @@ def _repair_json(text: str) -> str | None:
     return text
 
 
-def _extract_json(text: str) -> dict | None:
-    """从 LLM 输出中提取 JSON 对象，处理 markdown 代码块和多余文字。"""
+def _extract_json(text: str) -> dict | list | None:
+    """从 LLM 输出中提取 JSON 对象或数组，处理 markdown 代码块和多余文字。
+
+    v0.5.0: 支持 JSON 数组（并行工具调用场景）。
+    """
     text = text.strip()
 
     # 尝试 ```json ... ``` 代码块
@@ -247,7 +250,6 @@ def _extract_json(text: str) -> dict | None:
         try:
             return json.loads(m.group(1), strict=False)
         except json.JSONDecodeError:
-            # 尝试修复截断的 JSON
             repaired = _repair_json(m.group(1))
             if repaired:
                 try:
@@ -273,6 +275,17 @@ def _extract_json(text: str) -> dict | None:
         return json.loads(text, strict=False)
     except json.JSONDecodeError:
         pass
+
+    # v0.5.0: 尝试 JSON 数组（并行工具调用）
+    bracket_start = text.find("[")
+    bracket_end = text.rfind("]")
+    if bracket_start != -1 and bracket_end > bracket_start:
+        try:
+            result = json.loads(text[bracket_start:bracket_end + 1], strict=False)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
 
     # 找到第一个 { 和最后一个 }
     brace_start = text.find("{")
@@ -335,21 +348,31 @@ def parse_plan(raw: str) -> dict[str, Any]:
     return result
 
 
-def parse_react(raw: str) -> dict[str, Any]:
+def parse_react(raw: str) -> dict[str, Any] | list[dict[str, Any]]:
     """解析 LLM 输出为标准 ReAct 结构。
 
+    v0.5.0: 支持并行工具调用——当 LLM 返回 JSON 数组时，
+    返回 list[dict] 供引擎并行执行。
+
     Returns:
-        {
-            "thought": str,        # 思考过程
-            "action": str,         # 工具名（空字符串=最终回答）
-            "action_input": dict,  # 工具参数
-            "final_answer": str,   # 最终回答
-            "question": str,
-            "options": list,
-        }
+        dict: 单工具调用或最终回答
+        list[dict]: 并行工具调用列表
     """
     data = _extract_json(raw)
     if data is None:
+        return {**_react_template(), "thought": raw, "final_answer": raw}
+
+    # v0.5.0: JSON 数组 → 并行工具调用
+    if isinstance(data, list):
+        actions = []
+        for item in data:
+            if isinstance(item, dict):
+                act = _pick(item, _REACT_FIELD_ALIASES)
+                if "action_input" in act and not isinstance(act["action_input"], dict):
+                    act["action_input"] = {}
+                actions.append(act)
+        if actions:
+            return actions
         return {**_react_template(), "thought": raw, "final_answer": raw}
 
     result = _pick(data, _REACT_FIELD_ALIASES)

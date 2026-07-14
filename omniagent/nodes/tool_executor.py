@@ -199,10 +199,12 @@ class ToolExecutor:
         *,
         retry_attempts: int = 2,
         breakers: BreakerRegistry | None = None,
+        permission_gate: Any = None,  # v0.5.0: PermissionGate
     ) -> None:
         self.retry_attempts = max(1, retry_attempts)
         # 默认每引擎独立注册表（同引擎内跨 run 累积断路状态，且保证测试隔离）
         self.breakers = breakers or BreakerRegistry()
+        self.permission_gate = permission_gate  # v0.5.0: 工具确认门控
 
     def execute(
         self,
@@ -240,8 +242,21 @@ class ToolExecutor:
                 tracker.record(tool_name, params, False, reason, error=reason)
             return ToolExecuteResult(tool_name, False, f"参数校验失败: {reason}", error=reason, tool_class=tool_class)
 
-        # ── Stage 3: 权限闸门（SENSITIVE 暂不拦截，仅记录；可接 PermissionManager） ──
-        if tool_class == "SENSITIVE":
+        # ── Stage 3: 权限闸门（v0.5.0: 接入 PermissionGate） ──
+        if self.permission_gate is not None:
+            allowed, reason = self.permission_gate.check(tool_name, params)
+            if not allowed:
+                logger.info(f"权限拒绝: {tool_name} — {reason}")
+                if tracker:
+                    tracker.record(tool_name, params, False, reason, error=reason)
+                return ToolExecuteResult(
+                    tool_name, False,
+                    f"⛔ 操作被拒绝: {reason}",
+                    error=reason,
+                    tool_class=tool_class,
+                )
+        elif tool_class == "SENSITIVE":
+            # 无 PermissionGate 时保持旧行为：仅记录
             logger.debug(f"SENSITIVE 工具调用: {tool_name}")
 
         # ── Stage 4: 断路器 ──

@@ -33,6 +33,20 @@ from omniagent.repl.project_context import ProjectContext
 from omniagent.repl.prompt_optimizer import get_intent_display, optimize_prompt
 from omniagent.repl.status_bar import StatusBar
 
+# ── prompt_toolkit（可选依赖，不可用时回退自建输入）────────────
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.styles import Style
+    from prompt_toolkit.formatted_text import HTML
+    from pathlib import Path as _Path
+    _HISTORY_DIR = _Path.home() / ".omniagent"
+    _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    _HAS_PROMPT_TOOLKIT = True
+except ImportError:
+    _HAS_PROMPT_TOOLKIT = False
+
 # ── 自定义主题 ────────────────────────────────────────────
 _theme = Theme({
     "user": "bold cyan",
@@ -110,6 +124,105 @@ class REPL:
         # 5/9 终端类型（xterm256color/alacritty/gnome-256color/screen-256color/vt100）
         # 在空行 Ctrl+C 时丢失输入机会。
         self._pending_exit: bool = False
+
+        # v0.5.0: prompt_toolkit 会话（命令历史 + Tab 补全 + 固定状态栏）
+        self._pt_session: Any = None
+        self._init_prompt_toolkit()
+
+        # v0.5.0: 工具权限门控
+        from omniagent.repl.permissions import PermissionGate, PermissionMode
+        self._permission_gate = PermissionGate(mode=PermissionMode.DEFAULT)
+        self._permission_gate.set_confirm_callback(self._confirm_tool)
+
+    def _init_prompt_toolkit(self) -> None:
+        if not _HAS_PROMPT_TOOLKIT:
+            return
+
+        from omniagent.repl.completer import OmniCompleter
+        cmd_names = list(COMMANDS.keys())
+        self._completer = OmniCompleter(cmd_names)
+
+        kb = KeyBindings()
+
+        @kb.add("s-tab")
+        def _(event):
+            self._handle_shift_tab()
+            if hasattr(event, 'app'):
+                event.app.invalidate()
+
+        @kb.add("escape", "enter", eager=True)
+        def _(event):
+            event.current_buffer.insert_text("\n")
+
+        style = Style.from_dict({
+            "prompt": "bold #00e5a0",
+            "status": "#888888",
+            "bottom-toolbar": "bg:#1e1e1e #9e9e9e",
+            "bottom-toolbar.status": "#9e9e9e",
+            "bottom-toolbar.separator": "#555555",
+        })
+
+        history_path = _HISTORY_DIR / "input_history.txt"
+
+        try:
+            self._pt_session = PromptSession(
+                history=FileHistory(str(history_path)),
+                completer=self._completer,
+                key_bindings=kb,
+                style=style,
+                bottom_toolbar=self._get_pt_bottom_toolbar,
+            )
+        except Exception:
+            logger.debug("prompt_toolkit 初始化失败，回退自建输入", exc_info=True)
+            self._pt_session = None
+
+    def _get_pt_toolbar(self) -> str:
+        try:
+            if hasattr(self, 'status_bar') and self.status_bar:
+                return self.status_bar.get_toolbar_text()
+        except Exception:
+            pass
+        return ""
+
+    def _get_pt_bottom_toolbar(self):
+        import shutil
+        status = self._get_pt_toolbar().strip()
+        tw = shutil.get_terminal_size().columns
+        result = [("class:bottom-toolbar.separator", "─" * tw)]
+        if status:
+            result.append(("\n", ""))
+            result.append(("class:bottom-toolbar.status", "  " + status))
+        return result
+
+    def _confirm_tool(self, tool_name: str, params: dict, risk: str) -> tuple[bool, str]:
+        import os
+        from rich.prompt import Confirm, Prompt
+        from omniagent.repl.permissions import PermissionGate
+
+        if not sys.stdin.isatty() or os.environ.get("OMNIAGENT_ASSUME_YES") == "1":
+            return True, ""
+
+        msg = PermissionGate.format_confirm_message(tool_name, params, risk)
+        console.print()
+        console.print(Panel(msg, border_style="yellow", padding=(0, 1)))
+
+        try:
+            choice = Prompt.ask(
+                "选择", choices=["y", "n", "a", "q"], default="n",
+                show_choices=False,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return False, "用户取消"
+
+        if choice == "y":
+            return True, ""
+        elif choice == "a":
+            self._permission_gate.allow_always(tool_name)
+            return True, ""
+        elif choice == "q":
+            return False, "用户取消任务"
+        else:
+            return False, "用户拒绝"
 
     def _make_callback(self):
         """根据 verbose 状态创建引擎回调。"""
@@ -231,8 +344,9 @@ class REPL:
             self.ctx_mgr.add_system_message(self.system_prompt)
 
         while True:
-            # 显示状态栏
-            self.status_bar.print_status()
+            # 显示状态栏（PT 模式由 bottom_toolbar 渲染，非 PT 模式才需单独打印）
+            if self._pt_session is None:
+                self.status_bar.print_status()
 
             try:
                 user_input = self._read_input()
@@ -284,6 +398,9 @@ class REPL:
             pool_count = 0
             for p in configured:
                 if not p.models or "(auto-fetch" in str(p.models[0]):
+                    continue
+                if not p.key or not p.key.strip():
+                    logger.warning(f"跳过空 key 的 provider（name={p.name!r}），model_id 会变成 /model_name 导致路由失败")
                     continue
                 for model_name in p.models[:3]:  # top 3 per provider
                     model_id = f"{p.key}/{model_name}"
@@ -373,15 +490,15 @@ class REPL:
         console.print()
 
     def _read_input(self) -> str:
-        """读取用户输入。Shift+Enter / Alt+Enter 换行，Enter 发送。
+        """读取用户输入。优先使用 prompt_toolkit，不可用时回退自建输入。"""
+        if self._pt_session is not None:
+            try:
+                return self._read_input_pt()
+            except _ShiftTabSignal:
+                self._handle_shift_tab()
+                return ""
 
-        Windows: msvcrt.getwch() + GetAsyncKeyState 检测 Shift，
-                 Console API 操作光标（兼容所有 Windows 终端）。
-        Linux/macOS: termios 原始模式，支持 Alt+Enter 换行、
-                 方向键、Home/End、粘贴多行内容。
-        """
         import sys
-
         if sys.platform != "win32":
             try:
                 return self._read_input_unix()
@@ -389,7 +506,33 @@ class REPL:
                 self._handle_shift_tab()
                 return ""
 
-        # ── Windows: 逐字符读取 ──
+        return self._read_input_windows()
+
+    def _read_input_pt(self) -> str:
+        """prompt_toolkit 输入 — > 提示符 + 状态行 + bottom_toolbar。"""
+        if hasattr(self, '_completer'):
+            self._completer.update_commands(list(COMMANDS.keys()))
+            if hasattr(self, 'model_pool') and self.model_pool:
+                self._completer.update_models(
+                    [e.alias for e in self.model_pool.list_all()]
+                )
+
+        status_text = self._get_pt_toolbar().strip()
+        message: list[tuple[str, str]] = []
+        if status_text:
+            message.append(("class:status", f"  {status_text}\n"))
+        message.append(("class:prompt", "> "))
+
+        try:
+            text = self._pt_session.prompt(message)
+        except KeyboardInterrupt:
+            raise KeyboardInterrupt
+        except EOFError:
+            raise KeyboardInterrupt
+
+        return text.strip()
+
+    def _read_input_windows(self) -> str:
         import ctypes
         import ctypes.wintypes as wt
         import msvcrt

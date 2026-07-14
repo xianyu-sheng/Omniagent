@@ -49,6 +49,7 @@ class BaseEngine(ABC):
         temperature: float = 0.3,
         model_pool: Any = None,  # v0.4.0: ModelPool for health tracking
         auto_router: Any = None,  # v0.4.0 Step 13: AutoRouter for per-step routing
+        permission_gate: Any = None,  # v0.5.0: PermissionGate for tool confirmation
     ) -> None:
         self.model_priority = list(model_priority)
         self.callback = callback or EngineCallback()
@@ -57,6 +58,7 @@ class BaseEngine(ABC):
         self.temperature = temperature
         self.model_pool = model_pool  # v0.4.0
         self.auto_router = auto_router  # v0.4.0 Step 13
+        self.permission_gate = permission_gate  # v0.5.0
         # F6: 协作式中断标志，外部调 interrupt() 后 run() 在下一轮退出
         self._interrupted: bool = False
         # F4: 本次 run 注入的 ContextManager（run 起点设置，供 _history_messages 消费）
@@ -339,18 +341,96 @@ class BaseEngine(ABC):
     def _tool_calls_to_react_json(tool_calls: list[dict[str, Any]]) -> str:
         """把原生 tool_calls 合成 ReAct JSON 串，供 ``parse_react`` 统一解析。
 
-        ReAct 一轮一工具，取首个 tool_call。形如
-        ``{"thought":"","action":name,"action_input":args}``。
+        v0.5.0: 多工具调用 → 返回 JSON 数组；单工具 → 返回单个 JSON 对象。
+        parse_react 会按类型自动分流：dict 单工具，list 并行工具。
         """
         import json
 
-        tc = tool_calls[0] if tool_calls else {}
-        name = tc.get("name", "")
-        args = tc.get("arguments", {}) or {}
-        return json.dumps(
-            {"thought": "", "action": name, "action_input": args},
-            ensure_ascii=False,
-        )
+        actions = []
+        for tc in tool_calls:
+            name = tc.get("name", "")
+            args = tc.get("arguments", {}) or {}
+            if not name:
+                continue
+            actions.append({"thought": "", "action": name, "action_input": args})
+
+        if not actions:
+            return json.dumps(
+                {"thought": "", "action": "", "action_input": {}},
+                ensure_ascii=False,
+            )
+        if len(actions) == 1:
+            return json.dumps(actions[0], ensure_ascii=False)
+        return json.dumps(actions, ensure_ascii=False)
+
+    # ── v0.5.0: 并行工具执行 ───────────────────────────────
+
+    # 无副作用、可安全并行的工具类型
+    _PARALLEL_SAFE_TOOLS: frozenset[str] = frozenset({
+        "read_file", "search_files", "list_files",
+        "code_index", "ast_analyze", "web_fetch",
+        "github_fetch", "weather", "datetime",
+    })
+
+    def _execute_tools_parallel(
+        self,
+        actions: list[dict[str, Any]],
+        context: Any,
+        tracker: Any,
+        max_workers: int = 5,
+    ) -> list[tuple[dict[str, Any], str]]:
+        """并行执行多个工具调用。
+
+        使用 ThreadPoolExecutor（与 plan_dag.py 一致），
+        单个工具失败不影响其他并行工具。
+
+        Returns:
+            [(action_dict, observation_str), ...] — 保持原始顺序
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results: dict[int, str] = {}
+
+        def _exec_one(idx: int, action: dict) -> tuple[int, str]:
+            tool_name = action.get("action", "")
+            params = action.get("action_input", {})
+
+            # 有副作用的工具强制串行（标记但由调用方决定是否真正并行）
+            try:
+                obs = self._execute_tool(tool_name, params, context, tracker)
+            except Exception as e:
+                obs = f"⛔ 工具 {tool_name} 执行异常: {e}"
+            return idx, obs
+
+        if len(actions) <= 1:
+            # 单工具：直接执行
+            for i, a in enumerate(actions):
+                _, obs = _exec_one(i, a)
+                results[i] = obs
+        else:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(actions))) as pool:
+                futures = {pool.submit(_exec_one, i, a): i for i, a in enumerate(actions)}
+                for future in as_completed(futures):
+                    try:
+                        idx, obs = future.result()
+                        results[idx] = obs
+                    except Exception as e:
+                        idx = futures[future]
+                        results[idx] = f"⛔ 工具执行异常: {e}"
+
+        # 保持原始顺序
+        return [(actions[i], results.get(i, "⛔ 未执行")) for i in range(len(actions))]
+
+    def _execute_tool(
+        self, tool_name: str, params: dict[str, Any],
+        context: Any, tracker: Any,
+    ) -> str:
+        """执行单个工具并返回观察文本。
+
+        子类（如 ReActEngine）应重写此方法以使用 ToolExecutor 流水线。
+        默认实现返回占位文本。
+        """
+        return f"[工具 {tool_name} 未实现]"
 
     def _call_llm_native(
         self,

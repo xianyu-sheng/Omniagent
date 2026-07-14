@@ -228,6 +228,7 @@ class NovelEngine(BaseEngine):
         model_configs: dict[str, Any] | None = None,
         model_pool: Any = None,          # v0.4.0
         auto_router: Any = None,         # v0.4.0 Step 13
+        permission_gate: Any = None,     # v0.5.0
     ) -> None:
         # R2: 继承 BaseEngine；创意写作用较高 temperature（0.8）。
         # 此前 novel 的 _call_llm 未读 ModelConfig（B7 漂移），现统一由基类接入。
@@ -235,13 +236,14 @@ class NovelEngine(BaseEngine):
             model_priority, callback=callback,
             model_configs=model_configs, temperature=0.8,
             model_pool=model_pool, auto_router=auto_router,
+            permission_gate=permission_gate,
         )
         self.max_iterations = max_iterations
         self.tools = NOVEL_TOOLS
         self.manager = novel_manager or NovelManager()
         self.system_prompt = system_prompt or self._build_system_prompt()
         # F1: 工具执行门面（7 阶段流水线）
-        self._tool_executor = ToolExecutor()
+        self._tool_executor = ToolExecutor(permission_gate=permission_gate)
 
     def _build_system_prompt(self) -> str:
         import sys

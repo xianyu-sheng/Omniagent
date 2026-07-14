@@ -356,6 +356,9 @@ def get_configured_providers(*, refresh_models: bool = True) -> list[ProviderInf
         api_key = cfg.get("api_key", "")
         if not api_key:
             continue
+        # v0.5.2: 修补空 key（纯中文名称register时key为空 → model_id变成 /model）
+        if not key or not key.strip():
+            key = "custom"
         info_copy = ProviderInfo(
             name=cfg.get("name", key),
             key=key,
@@ -426,6 +429,9 @@ def register_custom_provider(name: str, base_url: str, api_key: str):
     """
     import re as _re
     key = _re.sub(r"[^a-z0-9]", "", name.lower())[:20]
+    # v0.5.2: 纯中文/Unicode 名称会导致 key 为空 → model_id 变 /model 格式
+    if not key:
+        key = "custom"
 
     info = ProviderInfo(
         name=name, key=key, base_url=base_url.rstrip("/"),
