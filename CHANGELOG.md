@@ -3,6 +3,80 @@
 本文件记录 OmniAgent-CLI 各版本变更。版本号遵循语义化版本（预 1.0 阶段：
 `0.MINOR.PATCH`，每个修复批次递增 MINOR）。
 
+## [0.5.2] — 2026-07-14
+
+### UI 重构（prompt_toolkit 集成）
+
+将终端输入从自建 Unix/Windows 双路径统一到 `prompt_toolkit`：
+
+- **输入体验**：`> ` 提示符 + 命令/路径/模型名三级补全（`OmniCompleter`）+ 历史持久化
+- **状态栏**：底部工具栏实时显示模型 · Token 用量 · 消息数 · 延迟，分隔符统一 `·`
+- **流式渲染修复**：移除 Rich `Live` 渲染，改为收集 chunks 后一次性 `Panel(Markdown(...))` 输出，消除双重/残留面板问题
+- **回退兼容**：prompt_toolkit 不可用时自动回退到自建输入（`_HAS_PROMPT_TOOLKIT` 标志）
+
+### Bug 修复
+
+- **模型路由空 key**（critical）：自定义模型商（如"豆包"）名称全为中文字符时，`re.sub(r"[^a-z0-9]", "", name)` 生成空字符串 key，导致模型 ID 格式错误（`/glm-5-2-260617`）。在 `register_custom_provider`、`get_configured_providers`、`_check_first_run` 三处加空 key 兜底 → `"custom"`。
+
+### 文档
+
+- **README 全面重构**（268 → ~570 行）：新增目录、功能特性表、38 条命令参考、安装详解、配置指南、FAQ、故障排查、贡献指南
+- 修正工具列表（删除不存在的 `edit_with_llm`，补全 `create_directory`/`weather`/`refactor`）
+- 所有 badge 更新到 v0.5.2，测试数 1110+
+
+### 工程
+
+- `__version__` 从 0.1.0 → 0.5.2（三处统一：`__init__.py` / `pyproject.toml` / 代码兜底值）
+- 新增 `omniagent --version` 参数
+- 创建 `LICENSE`（MIT）
+- SVG terminal demo 从 v0.1.0 重绘为 v0.5.2 风格
+- `ARCHITECTURE.md` 修正 provider 数量（6 → 12）
+
+### 约束
+
+- 1110/1110 测试全绿
+- PTY 端到端验证 5 类场景全部通过（边界/错误/命令/长对话/中断）
+- 不修改引擎层代码
+
+## [0.4.1] — 2026-07-13
+
+### 分层上下文压缩系统
+
+- 6 步压缩流水线：摘要 → 工具输出精简 → 去重 → 评分 → 裁剪 → 重组
+- Token 窗口达 80% 时自动触发
+- 三层策略（轻度/中度/深度），按消息重要度评分保留语义最密集内容
+
+## [0.4.0] — 2026-07-12
+
+### 多优先级队列调度 + 自动路由
+
+- **ModelPool**：5 级优先级队列（Q1-Q5），模型按能力自动分层
+- **AutoRouter**：根据任务难度（`DifficultyEstimator`）自动选择合适模型
+- **工作窃取调度**：高优先级任务可借用低优先级队列空闲模型
+- **BenchmarkFetcher**：新模型注册时自动查 HuggingFace Leaderboard 定级
+- **会话恢复**：`/resume` 命令，关闭终端后可恢复上次会话（7 天过期）
+
+### REPL 命令扩展
+
+- `/pool` — 查看五级优先级模型调用池
+- `/history` — 路由调度决策追溯
+- 动态模型商注册（`/setup` 菜单选项 6）+ `setup_wizard → ModelPool` 链路打通
+- 7 个引擎透传 `model_pool` + `auto_router` 参数
+
+### HumanEval 基准
+
+- 官方 `openai/human-eval` 评测适配器（`evals/humaneval_runner.py`）
+- pass@1: 88.4%（145/164，deepseek-v4-pro）
+
+### Bug 修复
+
+- `_load_credentials` YAML 优先于环境变量（对齐 `provider_registry`）
+- `extract_code` 重写，修复 HumanEval completion 提取鲁棒性
+- 粘贴模式 ESC 序列处理器吞掉 paste end → REPL 挂死（C-1）
+- bash 风格 Ctrl+C 二次确认退出（C-3）
+- anthropic 兼容 `ANTHROPIC_AUTH_TOKEN`（C-2）
+- B-1/B-3/B-4 子代理真实场景 bug 修复
+
 ## [0.3.0] — 2026-07-08
 
 ### 仓库清理（方向 B 起跑线）
