@@ -537,8 +537,48 @@ class ReActEngine(BaseEngine):
             if _has_action:
                 # v0.5.0: 支持并行工具调用 — 单 dict 或 list[dict]
                 raw_actions = parsed if isinstance(parsed, list) else [parsed]
+
+                # v0.5.4: 类型安全 — 防止 action 为非字符串值（如 list）导致
+                # classify_tool 中 "tool_name in _SENSITIVE_TOOLS" 崩溃。
+                # 对单工具 dict 中 action 为 list 的情况，展开为多工具并行处理。
                 if len(raw_actions) == 1:
-                    # ── 单工具路径（原有逻辑） ──
+                    action_val = raw_actions[0].get("action", "")
+                    if not isinstance(action_val, str):
+                        logger.warning(
+                            f"ReAct: 单工具路径收到非字符串 action "
+                            f"(type={type(action_val).__name__}, value={action_val!r})，"
+                            f"尝试展开为多工具并行"
+                        )
+                        if isinstance(action_val, (list, tuple)):
+                            expanded = []
+                            for item in action_val:
+                                if isinstance(item, str):
+                                    expanded.append({"action": item, "action_input": {}})
+                                elif isinstance(item, dict) and "action" in item:
+                                    expanded.append(item)
+                            if expanded:
+                                raw_actions = expanded
+                            else:
+                                observation = (
+                                    f"⚠️ LLM 返回了无效的工具调用格式。"
+                                    f"请使用标准 JSON："
+                                    f'{{"action": "工具名", "action_input": {{...}}}}'
+                                )
+                                self.callback.on_warning(f"无效 action 类型: {type(action_val).__name__}")
+                                messages.append({"role": "user", "content": f"Observation: {observation}"})
+                                continue
+                        else:
+                            observation = (
+                                f"⚠️ LLM 返回了无法识别的 action 类型 "
+                                f"({type(action_val).__name__})。请使用标准 JSON 格式。"
+                            )
+                            self.callback.on_warning(f"无效 action: {action_val!r}")
+                            messages.append({"role": "user", "content": f"Observation: {observation}"})
+                            continue
+
+                # ── 单工具 vs 多工具分发 ──
+                if len(raw_actions) == 1:
+                    # ── 单工具路径 ──
                     action = raw_actions[0]["action"]
                     action_input = raw_actions[0].get("action_input", {})
 
@@ -705,6 +745,18 @@ class ReActEngine(BaseEngine):
         P2-E5: ``spawn_agent`` 是元工具——需创建子 ReActEngine 委派子任务（带隔离
         上下文与引擎实例），不走无状态 ToolNode，在此拦截走专用路径。
         """
+        # v0.5.4: 防御 —— action 必须为字符串；非字符串已在调用方展开，
+        # 此处兜底避免 classify_tool 的 "tool_name in set" 崩溃。
+        if not isinstance(action, str):
+            logger.error(
+                f"_execute_tool: 收到非字符串 action "
+                f"(type={type(action).__name__}, value={action!r})"
+            )
+            return (
+                f"⚠️ 内部错误：工具名必须是字符串，收到 {type(action).__name__}。"
+                f"请使用标准格式：{{\"action\": \"工具名\", \"action_input\": {{...}}}}"
+            )
+
         if action == "spawn_agent":
             return self._spawn_subagent(action_input, context, tracker)
         # v0.5.4: skill 管理工具 — 直接在引擎内处理，不走 ToolNode
