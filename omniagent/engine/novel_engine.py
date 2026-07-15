@@ -379,9 +379,22 @@ class NovelEngine(BaseEngine):
                 self.callback.on_finish(answer)
                 return answer
 
-            if "action" in parsed:
-                action = parsed["action"]
-                action_input = parsed.get("action_input", {})
+            # v0.5.3: Python 的 "key" in list 检查的是值成员而非键存在，
+            # 所以 list[dict] 永远返回 False，导致并行工具调用被静默跳过。
+            _has_action = (
+                (isinstance(parsed, dict) and "action" in parsed) or
+                (isinstance(parsed, list) and any(
+                    isinstance(a, dict) and "action" in a for a in parsed
+                ))
+            )
+            if _has_action:
+                if isinstance(parsed, list):
+                    # v0.5.3: 并行工具调用 — 取第一个 action
+                    action = parsed[0]["action"]
+                    action_input = parsed[0].get("action_input", {})
+                else:
+                    action = parsed["action"]
+                    action_input = parsed.get("action_input", {})
 
                 logger.debug(f"Novel 思考: {thought}")
                 logger.debug(f"Novel 行动: {action}({mask_sensitive_params(action_input)})")
@@ -401,7 +414,11 @@ class NovelEngine(BaseEngine):
                 # F4: 每 5 轮压缩 in-run messages，抑制 O(n²) 增长
                 messages = self._maybe_compact_messages(messages, i + 1)
             else:
-                result = parsed.get("thought", response)
+                # v0.5.3: parsed 可能是 list，需安全处理
+                if isinstance(parsed, list):
+                    result = response.strip() if response else ""
+                else:
+                    result = parsed.get("thought", response)
                 self._auto_update_context(slug, user_input, result, tracker)
                 self.callback.on_finish(result)
                 return result

@@ -505,7 +505,16 @@ class ReActEngine(BaseEngine):
                 self.callback.on_finish(answer)
                 return answer
 
-            if "action" in parsed:
+            # v0.5.3: Python 的 "key" in list 检查的是值成员而非键存在，
+            # 所以 list[dict] 永远返回 False，导致并行工具调用被静默跳过。
+            # 正确做法：对 dict 检查键存在，对 list 检查任一元素含 action 键。
+            _has_action = (
+                (isinstance(parsed, dict) and "action" in parsed) or
+                (isinstance(parsed, list) and any(
+                    isinstance(a, dict) and "action" in a for a in parsed
+                ))
+            )
+            if _has_action:
                 # v0.5.0: 支持并行工具调用 — 单 dict 或 list[dict]
                 raw_actions = parsed if isinstance(parsed, list) else [parsed]
                 if len(raw_actions) == 1:
@@ -585,7 +594,11 @@ class ReActEngine(BaseEngine):
                 if last_obs:
                     result = last_obs[:1000]
                 else:
-                    result = parsed.get("thought", "").strip() or response.strip()
+                    # v0.5.3: parsed 可能是 list（并行工具调用），需安全处理
+                    if isinstance(parsed, list):
+                        result = response.strip()
+                    else:
+                        result = parsed.get("thought", "").strip() or response.strip()
                 if not result:
                     result = "任务已执行，但未生成明确的回复内容。请尝试重新提问或使用更具体的指令。"
                 self.callback.on_finish(result)

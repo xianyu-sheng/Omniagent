@@ -270,10 +270,10 @@ class REPL:
             return False, "用户拒绝"
 
     def _start_log_capture(self) -> None:
-        """v0.5.3: 添加 StringIO handler 到相关 logger，拦截引擎执行期间的日志输出。
+        """v0.5.3: 拦截引擎执行期间的日志输出。
 
-        捕获的 logger：omniagent.engine、tool_tracker、react_engine、httpx。
-        日志不再输出到 stderr，而是写入内存缓冲区，供折叠/展开使用。
+        保存并移除目标 logger 的所有现有 handler，替换为写入内存缓冲区的
+        StringIO handler。这样日志不会输出到 stderr，而是被收集供折叠/展开使用。
         """
         import io as _io
         self._log_buffer = _io.StringIO()
@@ -285,23 +285,32 @@ class REPL:
             )
         )
         self._log_handler.setLevel(logging.INFO)
+        # 保存原有 handler 并清空，确保日志只进缓冲区
+        self._saved_handlers: dict[str, list[logging.Handler]] = {}
         for _name in [
             'omniagent.engine',
             'omniagent.engine.tool_tracker',
             'omniagent.engine.react_engine',
             'httpx',
         ]:
-            logging.getLogger(_name).addHandler(self._log_handler)
+            _lg = logging.getLogger(_name)
+            self._saved_handlers[_name] = list(_lg.handlers)
+            _lg.handlers.clear()
+            _lg.addHandler(self._log_handler)
 
     def _stop_log_capture(self) -> str:
-        """v0.5.3: 移除日志捕获 handler，返回捕获的日志文本。"""
+        """v0.5.3: 恢复原有 handler，返回捕获的日志文本。"""
         for _name in [
             'omniagent.engine',
             'omniagent.engine.tool_tracker',
             'omniagent.engine.react_engine',
             'httpx',
         ]:
-            logging.getLogger(_name).removeHandler(self._log_handler)
+            _lg = logging.getLogger(_name)
+            _lg.removeHandler(self._log_handler)
+            # 恢复原有 handler
+            for _h in self._saved_handlers.get(_name, []):
+                _lg.addHandler(_h)
         self._log_handler.close()
         return self._log_buffer.getvalue()
 
