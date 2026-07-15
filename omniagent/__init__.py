@@ -1,3 +1,3 @@
 """OmniAgent-CLI: A decoupled, config-driven multi-model AI Agent scheduling engine."""
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"

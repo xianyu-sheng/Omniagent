@@ -93,11 +93,16 @@ TEMPLATES: list[PromptTemplate] = [
     ),
 
     # 重构/优化（在解释之前）
+    # v0.5.4: "清理"/"整理"/"clean"/"enhance" 是歧义词——"清理项目"可能是删除文件
+    # 而非重构代码。拆分为两组：(1) 明确代码重构词 → 独立匹配；
+    # (2) 歧义词 → 必须伴随代码相关对象才触发 refactor。
     PromptTemplate(
         intent="refactor",
         trigger_patterns=[
-            r"(?:重构|优化|改进|改善|重写|整理|清理).*(?:代码|函数|模块|逻辑|性能)?",
-            r"(?:refactor|optimize|improve|rewrite|clean|enhance)",
+            # 明确表示代码重构的词 —— 无需代码对象即可触发
+            r"(?:重构|refactor|优化|改进|改善|重写|optimize|improve|rewrite)",
+            # 歧义词 —— 必须伴随代码相关对象（.{0,15} 允许中间有修饰词如"一下""这段"）
+            r"(?:清理|整理|clean\s*up|clean|enhance).{0,15}(?:代码|code|函数|function|模块|module|逻辑|logic|性能|结构|架构|类|class|接口|API|组件|component)",
             r"更好的(?:写法|实现|方式)",
             r"性能.*(?:优化|提升|改进)",
         ],

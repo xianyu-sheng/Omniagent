@@ -402,6 +402,8 @@ class REPL:
             self._last_thinking_panel = panel
             step_count = len(panel.steps)
             tool_count = panel.tool_call_count
+            # v0.5.4: 从成功的工具调用中提取文件路径，更新工作记忆
+            self._track_session_files(panel)
         else:
             step_count = 0
             tool_count = 0
@@ -441,6 +443,84 @@ class REPL:
             border_style=border_style,
             padding=(0, 1),
         ))
+
+    # v0.5.4: 从成功的工具调用中提取文件路径，更新工作记忆，
+    # 使后续对话能知道"刚刚创建/修改了哪些文件"。
+    _FILE_CREATE_TOOLS = {"write_file", "create_directory", "batch_write"}
+    _FILE_MODIFY_TOOLS = {"edit_file", "command"}
+
+    def _track_session_files(self, panel) -> None:
+        """从 ThinkingPanel 中提取文件路径，更新 ContextManager 工作记忆。"""
+        import os as _os
+
+        created: list[str] = []
+        modified: list[str] = []
+
+        for step in panel.steps:
+            if not step.action or step.is_error:
+                continue
+            action = step.action
+            ai = step.action_input if isinstance(step.action_input, dict) else {}
+
+            # 提取 file_path / file_paths / path / target_directory
+            paths: list[str] = []
+            for key in ("file_path", "file_paths", "path", "target_directory"):
+                val = ai.get(key)
+                if isinstance(val, str):
+                    paths.append(val)
+                elif isinstance(val, list):
+                    paths.extend([str(v) for v in val if isinstance(v, str)])
+
+            # 特殊处理 batch_write: files 是 [{path: ..., content: ...}, ...]
+            if action == "batch_write" and "files" in ai:
+                files = ai["files"]
+                if isinstance(files, list):
+                    for f in files:
+                        if isinstance(f, dict) and "path" in f:
+                            paths.append(str(f["path"]))
+
+            if not paths:
+                continue
+
+            for p in paths:
+                # 标准化为绝对路径
+                abs_path = p if _os.path.isabs(p) else _os.path.abspath(p)
+
+                if action in self._FILE_CREATE_TOOLS:
+                    if abs_path not in created:
+                        created.append(abs_path)
+                elif action in self._FILE_MODIFY_TOOLS:
+                    if abs_path not in modified:
+                        modified.append(abs_path)
+
+        if created or modified:
+            # 合并到工作记忆中（保留历史记录）
+            prev = self.ctx_mgr.get_working_memory()
+            all_created = list(prev.get("session_created_files", []))
+            all_modified = list(prev.get("session_modified_files", []))
+
+            for p in created:
+                if p not in all_created:
+                    all_created.append(p)
+            for p in modified:
+                if p not in all_modified:
+                    all_modified.append(p)
+
+            self.ctx_mgr.update_working_memory("session_created_files", all_created)
+            self.ctx_mgr.update_working_memory("session_modified_files", all_modified)
+
+            # 同时跟踪最近一次操作的关键目录
+            dirs = set()
+            for p in created:
+                d = _os.path.dirname(p)
+                if d:
+                    dirs.add(d)
+            if dirs:
+                prev_dirs = list(prev.get("session_active_dirs", []))
+                for d in dirs:
+                    if d not in prev_dirs:
+                        prev_dirs.insert(0, d)  # 最近的在前
+                self.ctx_mgr.update_working_memory("session_active_dirs", prev_dirs[:5])
 
     @staticmethod
     def _default_system_prompt() -> str:
