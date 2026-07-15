@@ -1364,11 +1364,18 @@ class REPL:
         所有引擎（ReAct/PlanExecute/Reflection 等）统一使用此方法，
         让 LLM 在 mcp_call 工具描述中看到具体可用的 MCP 工具名和描述。
         """
-        mcp_tools_list = self._build_mcp_tools_list()
+        try:
+            mcp_tools_list = self._build_mcp_tools_list()
+        except Exception as e:
+            logger.debug(f"构建 MCP 工具列表失败: {e}")
+            return
         if mcp_tools_list and hasattr(engine, '_mcp_tools_list'):
-            engine._mcp_tools_list = mcp_tools_list
-            if hasattr(engine, '_build_system_prompt'):
-                engine.system_prompt = engine._build_system_prompt()
+            try:
+                engine._mcp_tools_list = mcp_tools_list
+                if hasattr(engine, '_build_system_prompt'):
+                    engine.system_prompt = engine._build_system_prompt()
+            except Exception as e:
+                logger.warning(f"注入 MCP 工具列表到引擎失败: {e}")
 
     def _run_react_engine(self, user_input: str, model_ids: list[str]) -> None:
         """ReAct 引擎模式。"""

@@ -80,6 +80,24 @@ ReactReflection / Novel）在创建后都应调用 `_inject_mcp_tools_into_engin
 - `omniagent/repl/` — REPL 层（命令、模型池、路由、会话）
 - `omniagent/mcp/` — MCP 子系统（transport, client, registry）
 
+### 修复后必须真实验证
+
+**每次自认为修好 bug 后，必须真正启动 omniagent 复现原问题场景，
+确认修复生效，并跑同类型的其他任务验证无回归。**
+
+**方法**：
+1. 复现原 bug 的确切输入，确认不再报错且结果正确
+2. 跑 1-2 个同类型但不同参数/场景的变体任务
+3. 如果涉及 MCP/工具，确认端到端输出完整（不是"无文本输出"）
+
+**反例**（禁止）：
+- 改了代码 → 只跑单元测试 → 提交推送
+- 单元测试 1110 全绿 ≠ 真实场景可用
+
+**正例**（期望）：
+- 改完 MCP 输出 bug → 启动 omniagent → `/mcp add 12306` →
+  "查昆山到上海高铁" → 确认 LLM 收到完整车次数据
+
 ## 版本与发布
 
 - 版本号: `__init__.py` + `pyproject.toml` + `repl.py` 兜底值 三处统一
