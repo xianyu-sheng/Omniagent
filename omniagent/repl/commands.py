@@ -1625,10 +1625,26 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
         return f"✅ 已从磁盘重新加载 {len(skills)} 个技能"
 
     else:
-        # v0.5.4: 自然语言技能创建 —— subcommand 不匹配时，
-        # 将整个 args 视为"描述"，自动生成 skill
-        name = _extract_skill_name(sub, sub_args)
-        return _skill_auto_generate(name, args, manager, registry, interactive=False)
+        # v0.5.4: 自然语言技能创建 —— 仅当 args 包含实质性描述时才触发。
+        # 单个 typo 词（如 /skill xyz）显示帮助而非静默创建 skill。
+        # 阈值：args 总长度 > 15 字符或包含中文（说明用户在描述需求）。
+        full_args = args.strip()
+        has_chinese = any('一' <= c <= '鿿' for c in full_args)
+        if len(full_args) > 15 or has_chinese:
+            name = _extract_skill_name(sub, sub_args)
+            return _skill_auto_generate(name, args, manager, registry, interactive=False)
+        else:
+            # sub 可能是 typo — 显示帮助并给出模糊匹配建议
+            hint = ""
+            matched = _fuzzy_match_subcommand(sub)
+            if matched:
+                hint = f"\n\n💡 你是不是想用 [bold]/skill {matched}[/bold]？"
+            return (
+                f"无法识别的子命令: [bold]{sub}[/bold]{hint}\n\n"
+                f"用法: /skill create|list|run|delete|import [参数]\n\n"
+                f"💡 提示：你也可以用自然语言直接描述需求，如：\n"
+                f"   /skill 帮我创建一个设计前端页面的技能"
+            )
 
 
 def _skill_create_interactive(manager, registry=None) -> str:
@@ -1906,7 +1922,6 @@ def _register_skill_handler(skill, manager) -> None:
             return handler
         _HANDLERS[cmd_name] = make_handler(skill.name)
         register_command(cmd_name, f"[技能] {skill.description}", cmd_name)
-        console.print(f"[dim]· 已注册命令: {cmd_name}[/dim]")
 
 
 def _extract_skill_name(sub: str, sub_args: str) -> str:

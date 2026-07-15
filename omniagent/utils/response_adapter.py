@@ -276,9 +276,31 @@ def _extract_json(text: str) -> dict | list | None:
     except json.JSONDecodeError:
         pass
 
-    # v0.5.0: 尝试 JSON 数组（并行工具调用）
+    # v0.5.4: JSON 对象优先于数组（对象是更常见的 LLM 响应格式）。
+    # 比较首个 { 和 [ 的位置，取最外层结构，避免 final_answer 值中
+    # 的内嵌数组截断外层对象（BUG-3 审计发现）。
+    brace_start = text.find("{")
     bracket_start = text.find("[")
-    bracket_end = text.rfind("]")
+    brace_end = text.rfind("}") if brace_start != -1 else -1
+    bracket_end = text.rfind("]") if bracket_start != -1 else -1
+
+    # 对象优先：{ 在 [ 之前，或只有 {
+    if brace_start != -1 and (bracket_start == -1 or brace_start < bracket_start):
+        if brace_end > brace_start:
+            try:
+                return json.loads(text[brace_start:brace_end + 1], strict=False)
+            except json.JSONDecodeError:
+                pass
+            # 尝试修复截断的 JSON
+            candidate = text[brace_start:]
+            repaired = _repair_json(candidate)
+            if repaired:
+                try:
+                    return json.loads(repaired, strict=False)
+                except json.JSONDecodeError:
+                    pass
+
+    # 数组次之：[ 在 { 之前，或只有 [
     if bracket_start != -1 and bracket_end > bracket_start:
         try:
             result = json.loads(text[bracket_start:bracket_end + 1], strict=False)
@@ -286,25 +308,6 @@ def _extract_json(text: str) -> dict | list | None:
                 return result
         except json.JSONDecodeError:
             pass
-
-    # 找到第一个 { 和最后一个 }
-    brace_start = text.find("{")
-    brace_end = text.rfind("}")
-    if brace_start != -1 and brace_end != -1:
-        try:
-            return json.loads(text[brace_start:brace_end + 1], strict=False)
-        except json.JSONDecodeError:
-            pass
-
-    # 最后手段：从第一个 { 开始，尝试修复截断的 JSON
-    if brace_start != -1:
-        candidate = text[brace_start:]
-        repaired = _repair_json(candidate)
-        if repaired:
-            try:
-                return json.loads(repaired, strict=False)
-            except json.JSONDecodeError:
-                pass
 
     return None
 

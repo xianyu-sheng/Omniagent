@@ -491,6 +491,16 @@ class NovelEngine(BaseEngine):
         tracker: ToolExecutionTracker | None = None,
     ) -> str:
         """执行工具并返回观察字符串（F1: 委托 ToolExecutor 7 阶段流水线）。"""
+        # v0.5.4: 防御 —— action 必须为字符串，与 ReActEngine 保持一致
+        if not isinstance(action, str):
+            logger.error(
+                f"NovelEngine._execute_tool: 收到非字符串 action "
+                f"(type={type(action).__name__}, value={action!r})"
+            )
+            return (
+                f"⚠️ 内部错误：工具名必须是字符串，收到 {type(action).__name__}。"
+                f'请使用标准格式：{{"action": "工具名", "action_input": {{...}}}}'
+            )
         result = self._tool_executor.execute(
             action, action_input, context, tracker=tracker, tools=self.tools,
         )
