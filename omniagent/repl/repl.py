@@ -300,19 +300,35 @@ class REPL:
 
     def _stop_log_capture(self) -> str:
         """v0.5.3: 恢复原有 handler，返回捕获的日志文本。"""
-        for _name in [
-            'omniagent.engine',
-            'omniagent.engine.tool_tracker',
-            'omniagent.engine.react_engine',
-            'httpx',
-        ]:
-            _lg = logging.getLogger(_name)
-            _lg.removeHandler(self._log_handler)
-            # 恢复原有 handler
-            for _h in self._saved_handlers.get(_name, []):
-                _lg.addHandler(_h)
-        self._log_handler.close()
-        return self._log_buffer.getvalue()
+        _captured = ""
+        try:
+            for _name in [
+                'omniagent.engine',
+                'omniagent.engine.tool_tracker',
+                'omniagent.engine.react_engine',
+                'httpx',
+            ]:
+                _lg = logging.getLogger(_name)
+                try:
+                    _lg.removeHandler(self._log_handler)
+                except Exception:
+                    pass
+                # 恢复原有 handler
+                for _h in self._saved_handlers.get(_name, []):
+                    try:
+                        _lg.addHandler(_h)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                self._log_handler.close()
+            except Exception:
+                pass
+            try:
+                _captured = self._log_buffer.getvalue()
+            except Exception:
+                pass
+        return _captured
 
     def _make_callback(self):
         """根据 verbose 状态创建引擎回调。"""
@@ -389,6 +405,15 @@ class REPL:
         else:
             step_count = 0
             tool_count = 0
+
+        # v0.5.3: 诊断日志 — 记录结果长度，便于排查空结果问题
+        if not result or not result.strip():
+            logger.warning(
+                f"_render_engine_result: 引擎返回空结果 "
+                f"(result={result!r}, steps={step_count}, tools={tool_count}, "
+                f"title={title!r})"
+            )
+            result = "任务已执行，但未生成明确的回复内容。请尝试重新提问或使用更具体的指令。"
 
         if self._show_thinking:
             # ── 展开模式：重现完整执行过程 ──
