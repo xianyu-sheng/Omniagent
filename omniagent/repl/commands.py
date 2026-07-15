@@ -856,6 +856,27 @@ def _cmd_code(*, args: str, registry: ModelRegistry, ctx_mgr: ContextManager, se
     return "\n".join(result_lines)
 
 
+# /thinking ────────────────────────────────────────────────
+# v0.5.3: 折叠/展开工具调用推理过程
+
+register_command("/thinking", "切换推理过程显示（折叠/展开）", "/thinking [on|off]")
+
+@_handler("/thinking")
+def _cmd_thinking(*, args: str, session_state: dict, **kwargs: Any) -> str:
+    repl = session_state.get("_repl")
+    if repl:
+        if args.strip().lower() == "on":
+            repl._show_thinking = True
+            return "✅ 推理过程显示已开启（每次都会展示工具调用明细）"
+        elif args.strip().lower() == "off":
+            repl._show_thinking = False
+            return "✅ 推理过程显示已关闭（默认折叠，Ctrl+O 可随时展开）"
+        else:
+            status = "展开" if repl._show_thinking else "折叠（Ctrl+O 展开）"
+            return f"当前推理过程: {status}\n用法: /thinking on 或 /thinking off"
+    return "❌ 无法获取 REPL 状态"
+
+
 # /stream ──────────────────────────────────────────────────
 
 register_command("/stream", "切换流式输出模式", "/stream [on|off]")

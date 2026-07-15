@@ -133,6 +133,10 @@ class REPL:
         self._failed_models: set[str] = set()
         self._preferred_model_ids: list[str] = []  # v0.5.3: 用户 -m 指定的模型
 
+        # v0.5.3: 折叠思考过程 — 默认隐藏，Ctrl+O 展开
+        self._show_thinking: bool = False
+        self._last_thinking_panel: Any = None
+
         # v0.5.0: 工具权限门控
         from omniagent.repl.permissions import PermissionGate, PermissionMode
         self._permission_gate = PermissionGate(mode=PermissionMode.DEFAULT)
@@ -157,6 +161,16 @@ class REPL:
         @kb.add("escape", "enter", eager=True)
         def _(event):
             event.current_buffer.insert_text("\n")
+
+        @kb.add("c-o")
+        def _(event):
+            """v0.5.3: Ctrl+O 展开/折叠上次工具调用的推理过程。"""
+            if self._last_thinking_panel is not None:
+                console.print()
+                console.print(self._last_thinking_panel)
+                console.print()
+            if hasattr(event, 'app'):
+                event.app.invalidate()
 
         style = Style.from_dict({
             "prompt": "bold #00e5a0",
@@ -289,13 +303,23 @@ class REPL:
             pass
 
     def _render_engine_result(self, callback, result: str, title: str, border_style: str = "green") -> None:
-        """渲染引擎结果：先思考面板，再最终答案。"""
-        # 1. 渲染思考过程面板（如果有）
+        """渲染引擎结果：默认隐藏思考过程，Ctrl+O 展开。
+
+        v0.5.3: 思考面板默认折叠，仅当 _show_thinking 为 True 时直接展示。
+        用户可通过 /thinking 切换或 Ctrl+O 临时展开。
+        """
         panel = callback.get_thinking_panel()
         if panel is not None:
-            console.print(panel)
+            self._last_thinking_panel = panel
+            if self._show_thinking:
+                console.print(panel)
+            else:
+                # 思考过程已折叠的简洁提示
+                steps = callback.tracker.execution_summary() if hasattr(callback, 'tracker') else ""
+                hint = "[dim]· 推理过程已折叠[/dim]"
+                console.print(hint)
 
-        # 2. 渲染最终答案
+        # 渲染最终答案
         console.print(Panel(
             Markdown(result),
             title=f"[bold]{title}[/bold]",
