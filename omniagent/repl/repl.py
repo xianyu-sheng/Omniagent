@@ -164,10 +164,15 @@ class REPL:
 
         @kb.add("c-o")
         def _(event):
-            """v0.5.3: Ctrl+O 展开/折叠上次工具调用的推理过程。"""
+            """v0.5.3: Ctrl+O 切换显示/隐藏上次工具调用的推理过程。"""
             if self._last_thinking_panel is not None:
+                self._show_thinking = not self._show_thinking
                 console.print()
-                console.print(self._last_thinking_panel)
+                if self._show_thinking:
+                    console.print(self._last_thinking_panel)
+                    console.print("[dim]· 推理过程已展开（再按 Ctrl+O 折叠）[/dim]")
+                else:
+                    console.print("[dim]· 推理过程已折叠[/dim]")
                 console.print()
             if hasattr(event, 'app'):
                 event.app.invalidate()
