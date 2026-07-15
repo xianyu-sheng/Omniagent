@@ -1395,6 +1395,8 @@ class REPL:
             # P2-修复5: 引擎异常时清理 user 消息（repl.py:745 已 add 但无 assistant
             # 响应会留孤立），优先 add_assistant_message 占位错误消息，让 history 仍成对；
             # add_assistant_message 失败时回退 trim user 消息。
+            import traceback
+            logger.error(f"ReAct 引擎异常:\n{traceback.format_exc()}")
             console.print(f"[error]❌ ReAct 引擎执行失败: {e}[/error]")
             try:
                 # 用 "[错误] ..." 作为 assistant 回应占位，让 history 仍成对
