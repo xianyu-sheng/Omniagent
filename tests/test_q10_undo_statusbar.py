@@ -124,9 +124,9 @@ def test_render_needs_compact_warning_first():
     bar = _make_bar(ctx_mgr=cm)
     panel = bar.render()
     content = str(panel.renderable)
-    assert "⚠需压缩" in content
-    # 警告出现在 "模型:" 之前（首位，窄屏截断只丢末尾）
-    assert content.index("⚠需压缩") < content.index("模型:")
+    assert "⚠ /compact" in content
+    # 新格式无标签，警告在内容开头附近即可（窄屏截断不丢核心信号）
+    assert content.index("⚠ /compact") < 10
 
 
 def test_render_no_warning_when_not_needed():
@@ -134,7 +134,7 @@ def test_render_no_warning_when_not_needed():
     cm.add_user_message("hi")
     bar = _make_bar(ctx_mgr=cm)
     panel = bar.render()
-    assert "⚠需压缩" not in str(panel.renderable)
+    assert "⚠ /compact" not in str(panel.renderable)
 
 
 # --------------------------- _parse_pct ---------------------------

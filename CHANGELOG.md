@@ -3,6 +3,27 @@
 本文件记录 OmniAgent-CLI 各版本变更。版本号遵循语义化版本（预 1.0 阶段：
 `0.MINOR.PATCH`，每个修复批次递增 MINOR）。
 
+## [0.5.4] — 2026-07-16
+
+### TUI 优化
+
+- **双线输入框**：Claude Code 风格——两条平行横线框出输入区域，`console.print` 底部分隔线 + prompt message 上分隔线，历史输出与当前输入区隔清晰。
+
+### 仓库清理
+
+- 移除误入库的无关文件：`=3.0`、`晨光咖啡/`（商业计划书等非项目文件）
+- 移除构建产物目录：`.venv/`、`omniagent_cli.egg-info/`
+- 移除 `.claude/` 本地配置目录（已在 `.gitignore` 中）
+
+### 文档
+
+- **README 全面重构**：新增竞品对比表（OmniAgent vs Claude Code vs Cursor vs Copilot），精简冗余内容，更新 badge 至 v0.5.4 / 1116 测试
+
+### 约束
+
+- 1116/1116 测试全绿
+- 不修改引擎层代码
+
 ## [0.5.3] — 2026-07-14
 
 ### Bug 修复

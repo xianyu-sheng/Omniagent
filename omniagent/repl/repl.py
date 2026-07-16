@@ -139,6 +139,9 @@ class REPL:
         self._captured_log: str = ""       # 引擎执行期间捕获的日志文本
         self._last_mode_line: str = ""     # 上次引擎的模式行
 
+        # v0.6.0: 首轮对话标记 — 用于视觉分隔
+        self._first_turn: bool = True
+
         # v0.5.0: 工具权限门控
         from omniagent.repl.permissions import PermissionGate, PermissionMode
         self._permission_gate = PermissionGate(mode=PermissionMode.DEFAULT)
@@ -181,30 +184,30 @@ class REPL:
                     console.print(self._captured_log, end="")
                 if self._last_thinking_panel is not None:
                     console.print(self._last_thinking_panel)
-                console.print("[dim]· 推理过程已展开（再按 Ctrl+O 折叠）[/dim]")
+                console.print("[dim]  💭 已展开  [Ctrl+O 折叠][/dim]")
             else:
                 # ── 折叠：仅一条摘要行 ──
                 panel = self._last_thinking_panel
                 if panel is not None:
                     parts = []
                     if panel.steps:
-                        parts.append(f"{len(panel.steps)} 次迭代")
+                        parts.append(f"{len(panel.steps)} 步")
                     if panel.tool_call_count:
-                        parts.append(f"{panel.tool_call_count} 次工具调用")
-                    summary = "，".join(parts) if parts else "无推理步骤"
+                        parts.append(f"🔧{panel.tool_call_count}")
+                    summary = " · ".join(parts) if parts else "—"
                 else:
-                    summary = "无推理步骤"
-                console.print(f"[dim]· ⚡ 推理过程已折叠 — {summary} (Ctrl+O 展开)[/dim]")
+                    summary = "—"
+                console.print(f"[dim]  💭 {summary}  [Ctrl+O][/dim]")
             console.print()
             if hasattr(event, 'app'):
                 event.app.invalidate()
 
         style = Style.from_dict({
             "prompt": "bold #00e5a0",
-            "status": "#888888",
-            "bottom-toolbar": "bg:#1e1e1e #9e9e9e",
-            "bottom-toolbar.status": "#9e9e9e",
-            "bottom-toolbar.separator": "#555555",
+            "input-box.border": "#555555",
+            "input-box.status": "#888888",
+            "bottom-toolbar": "#888888",
+            "bottom-toolbar.status": "#888888",
         })
 
         history_path = _HISTORY_DIR / "input_history.txt"
@@ -222,22 +225,35 @@ class REPL:
             self._pt_session = None
 
     def _get_pt_toolbar(self) -> str:
+        """获取状态栏文本，带缓存避免每次按键都重算。
+
+        prompt_toolkit 的 bottom_toolbar 回调在每次渲染时触发
+        （包括每次按键），缓存上次结果避免不必要的字符串拼接。
+        """
         try:
             if hasattr(self, 'status_bar') and self.status_bar:
-                return self.status_bar.get_toolbar_text()
+                text = self.status_bar.get_toolbar_text()
+                if text != getattr(self, '_cached_toolbar_text', ''):
+                    self._cached_toolbar_text = text
+                return self._cached_toolbar_text
         except Exception:
             pass
         return ""
 
     def _get_pt_bottom_toolbar(self):
-        import shutil
+        """Claude Code 风格：状态行紧接在输入行下方。
+
+        与 _read_input_pt 的双分隔线 + ❯ 提示符配合：
+
+          ──────────────────────────────   ← 底部分隔线（console.print）
+          ──────────────────────────────   ← 上分隔线（prompt message）
+          ❯ user types here               ← 输入行
+            model · react · 12k/128k      ← 状态行（bottom_toolbar）
+        """
         status = self._get_pt_toolbar().strip()
-        tw = shutil.get_terminal_size().columns
-        result = [("class:bottom-toolbar.separator", "─" * tw)]
         if status:
-            result.append(("\n", ""))
-            result.append(("class:bottom-toolbar.status", "  " + status))
-        return result
+            return [("class:input-box.status", "  " + status)]
+        return []
 
     def _confirm_tool(self, tool_name: str, params: dict, risk: str) -> tuple[bool, str]:
         import os
@@ -402,6 +418,8 @@ class REPL:
             self._last_thinking_panel = panel
             step_count = len(panel.steps)
             tool_count = panel.tool_call_count
+            for _ in range(tool_count):
+                self.status_bar.add_tool_call()
             # v0.5.4: 从成功的工具调用中提取文件路径，更新工作记忆
             self._track_session_files(panel)
         else:
@@ -425,18 +443,19 @@ class REPL:
                 console.print(self._captured_log, end="")
             if panel is not None:
                 console.print(panel)
-            console.print("[dim]· 推理过程已展开（再按 Ctrl+O 折叠）[/dim]")
+            console.print("[dim]  💭 已展开  [Ctrl+O 折叠][/dim]")
         else:
             # ── 折叠模式（默认）：仅一条摘要行 ──
             parts = []
             if step_count:
-                parts.append(f"{step_count} 次迭代")
+                parts.append(f"{step_count} 步")
             if tool_count:
-                parts.append(f"{tool_count} 次工具调用")
-            summary = "，".join(parts) if parts else "无推理步骤"
-            console.print(f"[dim]· ⚡ 推理过程已折叠 — {summary} (Ctrl+O 展开)[/dim]")
+                parts.append(f"🔧{tool_count}")
+            summary = " · ".join(parts) if parts else "—"
+            console.print(f"[dim]  💭 {summary}  [Ctrl+O][/dim]")
 
         # 最终答案始终显示
+        console.print()
         console.print(Panel(
             Markdown(result),
             title=f"[bold]{title}[/bold]",
@@ -581,7 +600,7 @@ class REPL:
             self.ctx_mgr.add_system_message(self.system_prompt)
 
         while True:
-            # 显示状态栏（PT 模式由 bottom_toolbar 渲染，非 PT 模式才需单独打印）
+            # 状态栏：PT 模式由 bottom_toolbar 自动渲染，非 PT 模式仅在值变化时打印
             if self._pt_session is None:
                 self.status_bar.print_status()
 
@@ -670,10 +689,10 @@ class REPL:
         self._auto_connect_mcp_servers()
 
     def _print_welcome(self) -> None:
-        """打印简洁的欢迎界面。
+        """打印 Claude Code 风格欢迎界面。
 
-        设计原则：信息密度高、视觉噪音低。只展示关键状态——
-        版本、范式、模型、一个实用提示。用 Unicode 细线框替代 ASCII 艺术。
+        设计原则：极简。一条线展示版本和关键状态，无装饰框。
+        信息密度高、视觉噪音低。
         """
         import random
 
@@ -686,47 +705,29 @@ class REPL:
             if len(models) > 1:
                 model_display += f" [dim]+{len(models) - 1}[/dim]"
         else:
-            model_display = "[dim]未配置 — 输入 [bold cyan]/setup[/bold cyan] 开始[/dim]"
+            model_display = "[dim]未配置 — /setup 开始[/dim]"
 
         # ── 随机提示 ──
         tips = [
-            "[bold cyan]/help[/bold cyan] 查看命令  [dim]·[/dim]  [bold cyan]/mode[/bold cyan] 切换范式",
-            "Shift+Enter / Alt+Enter 多行输入  [dim]·[/dim]  Enter 发送  [dim]·[/dim]  Ctrl+C 退出",
-            "[bold cyan]/setup[/bold cyan] 配置向导  [dim]·[/dim]  [bold cyan]/tools[/bold cyan] 查看工具  [dim]·[/dim]  [bold cyan]/mcp[/bold cyan] 扩展",
+            "/help 命令  ·  /mode 范式  ·  Shift+Tab 切换",
+            "Shift+Enter 多行  ·  Enter 发送  ·  Ctrl+C 退出",
+            "/setup 配置  ·  /tools 工具  ·  /mcp 扩展",
         ]
         tip = random.choice(tips)
 
-        # ── 构建面板 ──
-        width = 62
-        top = f"[dim]╭{'─' * (width - 2)}╮[/dim]"
-        bottom = f"[dim]╰{'─' * (width - 2)}╯[/dim]"
-
-        # v0.3.0+ 修复（B-4）：版本号从 pyproject.toml 动态读，不再硬编码。
-        # 用 importlib.metadata 优先；失败兜底读本文件邻近的版本常量
+        # ── 版本号 ──
         try:
             from importlib.metadata import version as _pkg_version
             _ver = _pkg_version("omniagent-cli")
         except Exception:
-            _ver = "0.5.3"  # 兜底
-
-        lines = [
-            "",
-            f"  [bold white]OmniAgent-CLI[/bold white]  [dim]v{_ver}[/dim]",
-            f"  [dim]Multi-Model AI Coding Assistant[/dim]",
-            "",
-            f"  [dim]范式[/dim]  [bold]{mode.name}[/bold]  [dim]— {mode.description}[/dim]",
-            f"  [dim]模型[/dim]  {model_display}",
-            "",
-            f"  {tip}",
-            "",
-        ]
-
-        content = "\n".join(lines)
+            _ver = "0.6.0"
 
         console.print()
-        console.print(top)
-        console.print(content, end="")
-        console.print(bottom)
+        console.print(
+            f"  [bold white]OmniAgent[/bold white] [dim]v{_ver}[/dim]"
+            f"  [dim]—[/dim]  [dim]{mode.name}[/dim]  [dim]·[/dim]  {model_display}"
+        )
+        console.print(f"  [dim]{tip}[/dim]")
         console.print()
 
     def _read_input(self) -> str:
@@ -749,7 +750,18 @@ class REPL:
         return self._read_input_windows()
 
     def _read_input_pt(self) -> str:
-        """prompt_toolkit 输入 — > 提示符 + 状态行 + bottom_toolbar。"""
+        """prompt_toolkit 输入 — Claude Code 风格双线 + ❯ 提示符。
+
+        底部分隔线由 console.print 渲染（上一轮输出边界），
+        上分隔线由 prompt message 渲染，状态行由 bottom_toolbar 渲染：
+
+          ──────────────────────────────   ← 底部分隔线（console.print）
+          ──────────────────────────────   ← 上分隔线（prompt message）
+          ❯ user types here               ← 输入行
+            model · react · 12k/128k      ← 状态行（bottom_toolbar）
+        """
+        import shutil
+
         if hasattr(self, '_completer'):
             self._completer.update_commands(list(COMMANDS.keys()))
             if hasattr(self, 'model_pool') and self.model_pool:
@@ -757,11 +769,17 @@ class REPL:
                     [e.alias for e in self.model_pool.list_all()]
                 )
 
-        status_text = self._get_pt_toolbar().strip()
-        message: list[tuple[str, str]] = []
-        if status_text:
-            message.append(("class:status", f"  {status_text}\n"))
-        message.append(("class:prompt", "> "))
+        tw = shutil.get_terminal_size().columns
+        separator = "─" * tw
+
+        # 底部分隔线：上一轮输出与当前输入区域之间的视觉边界
+        console.print(f"[dim]{separator}[/dim]")
+
+        # prompt message：上分隔线 + ❯ 提示符
+        message: list[tuple[str, str]] = [
+            ("class:input-box.border", separator + "\n"),
+            ("class:prompt", "❯ "),
+        ]
 
         try:
             text = self._pt_session.prompt(message)
@@ -842,7 +860,7 @@ class REPL:
                 sys.stdout.write("\b \b")
                 sys.stdout.flush()
 
-        sys.stdout.write("\n\033[1;36mYou\033[0m: ")
+        sys.stdout.write("\n\033[1;92m>\033[0m ")
         sys.stdout.flush()
 
         lines: list[str] = []
@@ -961,8 +979,8 @@ class REPL:
         import unicodedata
         from select import select
 
-        PROMPT = "\033[1;36mYou\033[0m: "
-        CONTINUATION = "\033[90m...\033[0m "
+        PROMPT = "\033[1;92m>\033[0m "
+        CONTINUATION = "\033[90m·\033[0m "
 
         # ── 显示宽度计算（CJK 字符占 2 列）────────────────
         def _char_width(ch: str) -> int:
@@ -1364,6 +1382,7 @@ class REPL:
 
         if output:
             console.print(Panel(output, title=f"[bold]{cmd_name}[/bold]", border_style="dim", padding=(0, 1)))
+            console.print()
         return False
 
     def _sync_context_window(self, model_aliases: list[str]) -> None:
@@ -1391,6 +1410,12 @@ class REPL:
         if self.ctx_mgr.needs_compact():
             console.print("[dim]· 对话较长，建议 [bold cyan]/compact[/bold cyan] 压缩[/dim]")
 
+        # ── 视觉分隔：在每轮对话前打印一条细线 ──
+        if not self._first_turn:
+            console.print()
+            console.print("[dim]───[/dim]")
+        self._first_turn = False
+
         # 保存 undo 快照
         self.ctx_mgr.save_snapshot()
 
@@ -1410,13 +1435,11 @@ class REPL:
             console.print(f"[dim]🎯 意图: {get_intent_display(intent)}[/dim]")
 
             if was_optimized:
-                # 展示优化后的 prompt，帮助用户学习
-                console.print(Panel(
-                    optimized,
-                    title="[dim]📝 优化后的 Prompt（供学习参考）[/dim]",
-                    border_style="dim",
-                    padding=(0, 1),
-                ))
+                # 展示优化后的 prompt，帮助用户学习（折叠为一行提示）
+                console.print(
+                    f"[dim]📝 已优化 → "
+                    f"{optimized[:120]}{'…' if len(optimized) > 120 else ''}[/dim]"
+                )
                 if system_hint:
                     self.ctx_mgr.add_system_message(f"[指令上下文] {system_hint}")
             elif intent is not None:
