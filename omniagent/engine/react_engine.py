@@ -170,7 +170,7 @@ BUILTIN_TOOLS = {
     },
     "batch_write": {
         "name": "batch_write",
-        "description": "一次性写入多个文件（原子操作，全部成功或全部回滚）。适合创建多文件项目结构。",
+        "description": "批量写入多个文件。原子性：任一文件路径/大小校验失败则整体不写；写入阶段逐文件落盘，个别失败在 results 中标注（已写入的不回滚）。适合创建多文件项目结构。",
         "params": {"files": "文件列表，格式: [{path: a.py, content: 文件内容}, ...]"},
     },
     "batch_edit": {

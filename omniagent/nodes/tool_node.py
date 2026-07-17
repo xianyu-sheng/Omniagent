@@ -824,8 +824,28 @@ class ToolNode(BaseNode):
 
     # ── 文件编辑（精确替换） ──────────────────────────────
 
+    def _fuzzy_find_and_replace(
+        self, content: str, old_text: str, new_text: str
+    ) -> tuple[str | None, str | None]:
+        """空白容忍匹配兜底（A1）：把 old_text 中的空白运行视为 ``\\s+``，
+        容忍 tab/space/CRLF/缩进差异--LLM 常在 old_text 缩进与行尾上出错导致精确匹配失败。
+        仅当模糊匹配**唯一**时才替换，避免歧义误改。返回 (new_content, None) 或 (None, reason)。
+        """
+        core = old_text.strip()
+        if not core:
+            return None, "old_text 仅为空白，无法匹配"
+        parts = re.split(r"\s+", core)
+        pattern = r"\s+".join(re.escape(p) for p in parts)
+        matches = list(re.finditer(pattern, content))
+        if not matches:
+            return None, "未找到匹配文本（已尝试空白容忍匹配）"
+        if len(matches) > 1:
+            return None, f"找到 {len(matches)} 处模糊匹配，请提供更多上下文"
+        m = matches[0]
+        return content[: m.start()] + new_text + content[m.end():], None
+
     def _edit_file(self, context: AgentContext) -> dict[str, Any]:
-        """精确文本替换编辑文件。"""
+        """精确文本替换编辑文件；精确未命中时尝试空白容忍模糊匹配兜底。"""
         file_path = self._resolve_template(self.file_path or "", context)
         old_text = self._resolve_template(self.old_text, context)
         new_text = self._resolve_template(self.new_text, context)
@@ -840,15 +860,27 @@ class ToolNode(BaseNode):
         if not path.exists():
             return {"error": f"文件不存在: {path}", "success": False}
 
-        content = path.read_text(encoding=self.encoding)
+        try:
+            content = path.read_text(encoding=self.encoding)
+        except UnicodeDecodeError as e:
+            return {
+                "error": f"文件非文本（{self.encoding} 解码失败）: {e}",
+                "success": False,
+            }
+
         count = content.count(old_text)
-
-        if count == 0:
-            return {"error": "未找到匹配文本", "success": False}
-        if count > 1:
+        fuzzy = False
+        if count == 1:
+            new_content = content.replace(old_text, new_text, 1)
+        elif count > 1:
             return {"error": f"找到 {count} 处匹配，请提供更多上下文", "success": False}
+        else:
+            # A1: 精确未命中 -> 空白容忍模糊匹配兜底
+            new_content, fuzzy_err = self._fuzzy_find_and_replace(content, old_text, new_text)
+            if new_content is None:
+                return {"error": fuzzy_err, "success": False}
+            fuzzy = True
 
-        new_content = content.replace(old_text, new_text, 1)
         path.write_text(new_content, encoding=self.encoding)
 
         # ── 编辑后验证 ──
@@ -874,6 +906,8 @@ class ToolNode(BaseNode):
             "replacements": 1,
             "success": True,
         }
+        if fuzzy:
+            result["fuzzy_match"] = True
         self._write_output(context, str(path))
         return result
 
@@ -925,7 +959,12 @@ class ToolNode(BaseNode):
     # ── 批量操作 ──────────────────────────────────────────
 
     def _batch_write(self, context: AgentContext) -> dict[str, Any]:
-        """批量写入多个文件。原子性：全部成功才返回成功。"""
+        """批量写入多个文件。
+
+        原子性（§8.24.4 修复）：**校验阶段原子**--任一文件的路径/大小校验失败则
+        整体不写任何文件（避免"一个坏路径导致部分写入"）。写入阶段逐文件落盘，
+        个别写入/校验失败在 results 中标注；已写入的不回滚（无备份前提下无法安全还原）。
+        """
         if not self.files:
             return {
                 "action_type": "batch_write",
@@ -933,34 +972,48 @@ class ToolNode(BaseNode):
                 "error": "batch_write 需要 files 参数，格式: [{\"path\": \"...\", \"content\": \"...\"}]",
             }
 
-        results = []
-        written_paths = []
-
-        try:
-            for i, file_spec in enumerate(self.files):
-                path_str = file_spec.get("path") or file_spec.get("file_path", "")
-                file_content = file_spec.get("content", "")
-
-                if not path_str:
-                    results.append({"index": i, "success": False, "error": "缺少 path"})
-                    continue
-
-                # 安全验证
+        # ── Phase 1：全部校验（路径 jail + 大小），任一失败则整体不写 ──
+        specs: list[tuple[int, Path, str, int]] = []
+        results: list[dict[str, Any]] = []
+        for i, file_spec in enumerate(self.files):
+            path_str = file_spec.get("path") or file_spec.get("file_path", "")
+            file_content = file_spec.get("content", "")
+            if not path_str:
+                results.append({"index": i, "success": False, "error": "缺少 path"})
+                continue
+            try:
                 path = self._validate_path(path_str, for_write=True)
-                content_bytes = len(file_content.encode(self.encoding))
-                if content_bytes > MAX_WRITE_SIZE:
-                    results.append({
-                        "index": i, "path": str(path), "success": False,
-                        "error": f"内容过大: {content_bytes} 字节",
-                    })
-                    continue
+            except Exception as e:
+                # 路径越界/SecurityError 等逐项记录，不中断后续校验
+                results.append({
+                    "index": i, "path": path_str, "success": False,
+                    "error": f"路径校验失败: {e}",
+                })
+                continue
+            content_bytes = len(file_content.encode(self.encoding))
+            if content_bytes > MAX_WRITE_SIZE:
+                results.append({
+                    "index": i, "path": str(path), "success": False,
+                    "error": f"内容过大: {content_bytes} 字节",
+                })
+                continue
+            specs.append((i, path, file_content, content_bytes))
 
-                # 创建父目录并写入
+        if any(not r.get("success") for r in results):
+            # 原子性：校验阶段存在失败，整体不写入
+            first_err = next((r["error"] for r in results if not r.get("success")), "")
+            return {
+                "action_type": "batch_write", "total": len(self.files),
+                "success_count": 0, "success": False,
+                "error": f"校验失败，整体未写入（原子性）: {first_err}",
+                "results": results,
+            }
+
+        # ── Phase 2：全部校验通过，逐文件落盘 + 验证 ──
+        try:
+            for i, path, file_content, content_bytes in specs:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(file_content, encoding=self.encoding)
-                written_paths.append(path)
-
-                # 验证
                 verify_error = self._verify_write(path, file_content, False)
                 if verify_error:
                     results.append({
@@ -972,25 +1025,26 @@ class ToolNode(BaseNode):
                         "index": i, "path": str(path), "success": True,
                         "bytes": content_bytes,
                     })
-
-            all_ok = all(r.get("success") for r in results)
-            success_count = sum(1 for r in results if r.get("success"))
-
-            return {
-                "action_type": "batch_write",
-                "total": len(self.files),
-                "success_count": success_count,
-                "success": all_ok,
-                "results": results,
-            }
-
         except Exception as e:
             return {
-                "action_type": "batch_write",
-                "success": False,
-                "error": f"批量写入异常: {e}",
-                "results": results,
+                "action_type": "batch_write", "success": False,
+                "error": f"批量写入异常: {e}", "results": results,
             }
+
+        all_ok = all(r.get("success") for r in results)
+        success_count = sum(1 for r in results if r.get("success"))
+        out: dict[str, Any] = {
+            "action_type": "batch_write",
+            "total": len(self.files),
+            "success_count": success_count,
+            "success": all_ok,
+            "results": results,
+        }
+        if not all_ok:
+            # 补顶层 error：避免 ToolExecutor 对无 error 字段的结果做 dict 转储
+            first_err = next((r.get("error", "") for r in results if not r.get("success")), "")
+            out["error"] = f"批量写入部分失败（{len(results) - success_count}/{len(results)}）: {first_err}"
+        return out
 
     def _batch_edit(self, context: AgentContext) -> dict[str, Any]:
         """批量编辑多个文件。每个 edit 独立验证。"""
@@ -1027,10 +1081,12 @@ class ToolNode(BaseNode):
                 content = path.read_text(encoding=self.encoding)
                 count = content.count(old_text)
 
-                if count == 0:
+                if count == 1:
+                    new_content = content.replace(old_text, new_text, 1)
+                    path.write_text(new_content, encoding=self.encoding)
                     results.append({
-                        "index": i, "file": str(path), "success": False,
-                        "error": "未找到匹配文本",
+                        "index": i, "file": str(path), "success": True,
+                        "replacements": 1,
                     })
                 elif count > 1:
                     results.append({
@@ -1038,12 +1094,19 @@ class ToolNode(BaseNode):
                         "error": f"找到 {count} 处匹配，请提供更多上下文",
                     })
                 else:
-                    new_content = content.replace(old_text, new_text, 1)
-                    path.write_text(new_content, encoding=self.encoding)
-                    results.append({
-                        "index": i, "file": str(path), "success": True,
-                        "replacements": 1,
-                    })
+                    # A1: 精确未命中 -> 空白容忍模糊匹配兜底
+                    new_content, fuzzy_err = self._fuzzy_find_and_replace(content, old_text, new_text)
+                    if new_content is None:
+                        results.append({
+                            "index": i, "file": str(path), "success": False,
+                            "error": fuzzy_err,
+                        })
+                    else:
+                        path.write_text(new_content, encoding=self.encoding)
+                        results.append({
+                            "index": i, "file": str(path), "success": True,
+                            "replacements": 1, "fuzzy_match": True,
+                        })
 
             except Exception as e:
                 results.append({
@@ -1054,13 +1117,18 @@ class ToolNode(BaseNode):
         all_ok = all(r.get("success") for r in results)
         success_count = sum(1 for r in results if r.get("success"))
 
-        return {
+        out: dict[str, Any] = {
             "action_type": "batch_edit",
             "total": len(self.edits),
             "success_count": success_count,
             "success": all_ok,
             "results": results,
         }
+        if not all_ok:
+            # 补顶层 error：避免 ToolExecutor 对无 error 字段的结果做 dict 转储
+            first_err = next((r.get("error", "") for r in results if not r.get("success")), "")
+            out["error"] = f"批量编辑部分失败（{len(results) - success_count}/{len(results)}）: {first_err}"
+        return out
 
     # ── 代码索引 / AST / 重构 ──────────────────────────────
 
