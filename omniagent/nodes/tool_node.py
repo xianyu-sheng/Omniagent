@@ -2015,7 +2015,15 @@ class ToolNode(BaseNode):
         except ImportError:
             raise RuntimeError(f"[{self.id}] github_fetch 需要 httpx 库")
 
-        headers = {"User-Agent": "OmniAgent-CLI/0.2"}
+        headers = {
+            "User-Agent": "OmniAgent-CLI/0.2",
+            "Accept": "application/vnd.github+json",
+        }
+        # F5: 认证 token 提升限流配额（未认证 60/h -> 认证 5000/h）并解锁私有仓库。
+        # 从环境变量读取（与 config 采集的 token 解耦，避免明文进配置）。
+        gh_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("OMNIAGENT_GITHUB_TOKEN")
+        if gh_token:
+            headers["Authorization"] = f"Bearer {gh_token}"
 
         try:
             if action == "list_files":
@@ -2031,6 +2039,7 @@ class ToolNode(BaseNode):
                     data = resp.json()
 
                 tree = data.get("tree", [])
+                api_truncated = bool(data.get("truncated"))  # F6: GitHub 树过大时 API 会置截断标志
                 # 只返回文件（不包括 tree 类型），过滤掉 .git 相关
                 files = [
                     item["path"] for item in tree
@@ -2038,6 +2047,8 @@ class ToolNode(BaseNode):
                 ]
 
                 result_text = f"仓库 {repo} 共 {len(files)} 个文件:\n" + "\n".join(files)
+                if api_truncated:
+                    result_text += "\n\n⚠️ GitHub API 返回截断标志（仓库过大，文件列表可能不完整，建议按目录细化 github_path）"
                 if len(result_text) > 10000:
                     result_text = result_text[:10000] + f"\n\n... (共 {len(files)} 个文件，已截断)"
 
@@ -2045,7 +2056,7 @@ class ToolNode(BaseNode):
                 return {
                     "action_type": "github_fetch", "repo": repo,
                     "action": action, "files": files, "file_count": len(files),
-                    "content": result_text, "success": True,
+                    "truncated": api_truncated, "content": result_text, "success": True,
                 }
 
             elif action == "fetch_file":
