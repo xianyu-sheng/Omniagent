@@ -136,7 +136,7 @@ BUILTIN_TOOLS = {
     },
     "list_files": {
         "name": "list_files",
-        "description": "列出本机指定目录下的文件和子目录。仅限本地目录，不能列出 GitHub 仓库文件（请用 github_fetch）。",
+        "description": "列出本机指定目录下的文件和子目录。仅限本地目录，不能列出 GitHub 仓库文件（请用 github_fetch）。默认排除 node_modules/.git/venv 等大目录且结果有上限，大目录请用 pattern 或缩小 file_path。",
         "params": {"file_path": "本地目录路径", "pattern": "glob 过滤模式，如 *.py 或 src/**/*.ts（可选，默认 *）"},
     },
     "search_files": {

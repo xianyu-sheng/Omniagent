@@ -51,11 +51,16 @@ class DirectoryScout:
         *,
         max_depth: int = 2,
         max_entries_per_dir: int = 50,
+        max_total_entries: int = 300,
         exclude_dirs: frozenset[str] | set[str] | None = None,
     ) -> None:
         self.project_root = Path(project_root) if project_root else Path.cwd()
         self.max_depth = max_depth
         self.max_entries_per_dir = max_entries_per_dir
+        # 全局行数硬上限：每目录 max_entries_per_dir 只防单层爆炸，全为目录时
+        # 3 层可达 50+50^2+50^3≈12.7 万行。max_total_entries 兜底，避免把上万
+        # 行文件树经 inject() 灌入每次 ReAct run 的 user 消息（与 list_files 同类）。
+        self.max_total_entries = max_total_entries
         self.exclude_dirs = frozenset(exclude_dirs) if exclude_dirs is not None else DEFAULT_EXCLUDE
 
     def _excluded(self, name: str) -> bool:
@@ -74,6 +79,13 @@ class DirectoryScout:
         file_count = self._walk(root, 0, tree_lines)
         if file_count == 0 and not tree_lines:
             return None
+        # 全局上限兜底：_walk 在达到 max_total_entries 后停止追加；此处补截断标记。
+        if len(tree_lines) >= self.max_total_entries:
+            tree_lines = tree_lines[: self.max_total_entries]
+            tree_lines.append(
+                f"... (项目结构过大，已截断至 {self.max_total_entries} 项；"
+                "如需详查请用 list_files 指定子目录)"
+            )
         return {"root": str(root), "tree": "\n".join(tree_lines), "file_count": file_count}
 
     def _walk(self, dir_path: Path, depth: int, out: list[str]) -> int:
@@ -91,6 +103,9 @@ class DirectoryScout:
 
         shown = 0
         for entry in entries:
+            # 全局行数硬上限：达到即停止追加（含子目录递归，因 out 共享）。
+            if len(out) >= self.max_total_entries:
+                break
             if entry.is_symlink():
                 continue  # §8.21.2：不跟随符号链接
             name = entry.name

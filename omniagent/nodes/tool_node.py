@@ -33,6 +33,19 @@ from omniagent.nodes.base import BaseNode
 
 logger = logging.getLogger(__name__)
 
+# ── 目录遍历排除集 ──────────────────────────────────────
+# list_files / search_files 遍历时就地剪枝排除的大/无关目录（fnmatch 友好，
+# 支持 *.egg-info 等 glob 模式）。镜像 omniagent/engine/scout.py 的
+# DEFAULT_EXCLUDE 与 omniagent/repl/project_context.py 的排除集，避免把
+# node_modules/.git/venv 等成千上万文件灌回 LLM 上下文拖慢执行。
+_WALK_EXCLUDE_DIRS: frozenset[str] = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    "env", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist",
+    "build", ".eggs", "*.egg-info", "vendor", "third_party", ".next",
+    ".nuxt", "target", ".gradle", ".idea", ".vscode", "bower_components",
+    ".pnpm-store", "logs", "tmp", "temp", ".cache", "site-packages",
+})
+
 # ── 动态工具注册表 ──────────────────────────────────────────
 # 存储通过 register_tool 注册的自定义工具
 # key: 工具名, value: {"handler": callable, "description": str, "params": dict}
@@ -319,6 +332,7 @@ class ToolNode(BaseNode):
         # list_files 参数
         pattern: str = "*",
         max_depth: int = 5,
+        max_files: int = 500,
         # search_files 参数
         search_pattern: str = "",
         file_filter: str = "",
@@ -375,6 +389,7 @@ class ToolNode(BaseNode):
         self.append = append
         self.pattern = pattern
         self.max_depth = max_depth
+        self.max_files = max_files
         self.search_pattern = search_pattern
         self.file_filter = file_filter
         self.git_command = git_command
@@ -434,7 +449,7 @@ class ToolNode(BaseNode):
     _VALID_PARAMS: set[str] = {
         "action_type", "action", "file_path", "content", "output_slot",
         "cwd", "timeout", "default_next", "encoding", "append",
-        "pattern", "max_depth", "search_pattern", "file_filter",
+        "pattern", "max_depth", "max_files", "search_pattern", "file_filter",
         "git_command", "url", "old_text", "new_text",
         "files", "edits", "symbol", "query",
         "old_name", "new_name", "refactor_action",
@@ -1458,23 +1473,45 @@ class ToolNode(BaseNode):
             return result
 
         files = []
+        truncated = False
         if path.is_file():
             files.append(str(path))
         else:
-            for item in self._walk_with_depth(path, pattern, self.max_depth):
+            # max_files+1 让生成器多 yield 一个，供 peek 准确判断是否截断
+            gen = self._walk_with_depth(path, pattern, self.max_depth, max_files=self.max_files + 1)
+            for item in gen:
                 files.append(str(item))
+                if len(files) >= self.max_files:
+                    try:
+                        next(gen)
+                        truncated = True
+                    except StopIteration:
+                        truncated = False
+                    break
 
-        display = "\n".join(files) if files else "(空目录)"
+        if not files:
+            display = "(空目录)"
+        else:
+            display = "\n".join(files)
+            if truncated:
+                display += f"\n... (已截断,仅显示前 {len(files)} 个;如需更多请用 pattern 或缩小 file_path)"
+
         result = {
             "action_type": "list_files", "path": str(path),
-            "pattern": pattern, "files": files, "count": len(files), "success": True,
+            "pattern": pattern, "files": files, "count": len(files),
+            "truncated": truncated, "success": True,
         }
         self._write_output(context, display)
         logger.info(f"[{self.id}] 列出 {len(files)} 个文件: {path}")
         return result
 
-    def _walk_with_depth(self, base: Path, pattern: str, max_depth: int):
-        """递归遍历，受深度限制。支持 **/*.ext 递归 glob 模式。"""
+    def _walk_with_depth(self, base: Path, pattern: str, max_depth: int, *, max_files: int | None = None):
+        """递归遍历，受深度限制。支持 **/*.ext 递归 glob 模式。
+
+        就地剪枝排除垃圾目录（node_modules/.git/venv 等，见 _WALK_EXCLUDE_DIRS），
+        阻止 os.walk 下钻这些目录，避免遍历成千上万无关文件。max_files 给定时，
+        达到上限后停止 yield（return）。
+        """
         import os
 
         # 处理 **/*.ext 模式：拆分为前缀目录模式和文件名模式
@@ -1487,7 +1524,10 @@ class ToolNode(BaseNode):
             file_pattern = pattern
 
         base_depth = len(base.parts)
+        yielded = 0
         for root, dirs, files in os.walk(base):
+            # 就地剪枝：排除 node_modules/.git/venv 等大/无关目录，阻止下钻
+            dirs[:] = [d for d in dirs if not any(fnmatch.fnmatch(d, pat) for pat in _WALK_EXCLUDE_DIRS)]
             current_depth = len(Path(root).parts) - base_depth
             if not recursive_mode and current_depth > max_depth:
                 dirs.clear()
@@ -1498,6 +1538,9 @@ class ToolNode(BaseNode):
             for f in files:
                 if fnmatch.fnmatch(f, file_pattern):
                     yield Path(root) / f
+                    yielded += 1
+                    if max_files is not None and yielded >= max_files:
+                        return
 
     # ── 文件内容搜索 ──────────────────────────────────────
 
@@ -1529,7 +1572,7 @@ class ToolNode(BaseNode):
         except re.error:
             regex = re.compile(re.escape(search_pattern), re.IGNORECASE)
 
-        search_files = [path] if path.is_file() else self._walk_with_depth(path, file_filter or "*", self.max_depth)
+        search_files = [path] if path.is_file() else self._walk_with_depth(path, file_filter or "*", self.max_depth, max_files=2000)
 
         for file_path in search_files:
             try:
