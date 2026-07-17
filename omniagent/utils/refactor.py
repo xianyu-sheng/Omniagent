@@ -163,7 +163,12 @@ class RefactorEngine:
         if not analysis.unused_imports:
             return {"success": True, "removed": [], "message": "没有未使用的导入"}
 
-        content = path.read_text(encoding="utf-8")
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as e:
+            # analyze_file 用 latin-1 兜底能读，但此处 strict utf-8 重读会崩；
+            # 非文本文件不清理导入，返回结构化错误（"编码" 命中终端模式，不重试）
+            return {"success": False, "error": f"文件非 UTF-8 编码，无法清理导入: {e}"}
         lines = content.splitlines(keepends=True)
         removed = []
 

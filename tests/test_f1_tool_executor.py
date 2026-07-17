@@ -43,8 +43,15 @@ class TestIsTerminalError:
     def test_transient_timeout(self):
         assert is_terminal_error("connection timeout") is False
 
-    def test_transient_rate_limit(self):
-        assert is_terminal_error("429 rate limit") is False
+    def test_rate_limit_is_terminal(self):
+        # 429/限流立即重试只会烧配额、加剧限流 -> 归终端错误不重试
+        assert is_terminal_error("429 rate limit") is True
+        assert is_terminal_error("限流") is True
+
+    def test_transient_server_error(self):
+        # 503/502 是服务端临时不可用，重试可能成功
+        assert is_terminal_error("503 service unavailable") is False
+        assert is_terminal_error("502 bad gateway") is False
 
     def test_unknown_defaults_transient(self):
         assert is_terminal_error("一些未知错误") is False
@@ -177,7 +184,7 @@ class TestToolExecutorPipeline:
     def test_retry_on_transient_then_success(self, monkeypatch):
         _FakeNode.script = [
             {"success": False, "error": "connection timeout"},
-            {"success": False, "error": "429 rate limit"},
+            {"success": False, "error": "503 service unavailable"},
             {"success": True, "content": "ok"},
         ]
         ex = _executor(monkeypatch, retry_attempts=3)

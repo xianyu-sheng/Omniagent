@@ -143,8 +143,10 @@ def _get_clothing_items(temp_c: int) -> list[str]:
 
 def _parse_wttr_json(data: dict, city: str, resolved: str, lang: str) -> dict[str, Any]:
     """解析 wttr.in JSON 响应为统一的天气信息字典。"""
-    current = data.get("current_condition", [{}])[0]
-    forecast = data.get("weather", [{}])[0]
+    # F11: wttr.in 偶尔返回空列表（key 存在但值为 []），原 data.get(k, [{}])[0] 会 IndexError；
+    # 用 `or [{}]` 兜底为空 dict，使后续 .get() 走默认值而非崩溃
+    current = (data.get("current_condition") or [{}])[0]
+    forecast = (data.get("weather") or [{}])[0]
 
     # 天气描述（优先中文翻译）
     description = "N/A"

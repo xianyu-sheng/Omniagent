@@ -281,11 +281,12 @@ class TestToolNodeNewActions:
             assert any("hello" in m["content"] for m in result["matches"])
 
     def test_search_files_no_pattern(self):
-        """测试搜索缺少 pattern。"""
+        """测试搜索缺少 pattern：返回结构化错误而非抛异常（避免无谓重试）。"""
         ctx = AgentContext()
         node = ToolNode("searcher", action_type="search_files", file_path=".")
-        with pytest.raises(ValueError, match="search_pattern"):
-            node.execute(ctx)
+        result = node.execute(ctx)
+        assert result["success"] is False
+        assert "search_pattern" in result["error"]
 
     def test_git_status(self):
         """测试 git status 命令。"""

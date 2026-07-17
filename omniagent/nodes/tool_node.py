@@ -697,6 +697,13 @@ class ToolNode(BaseNode):
                 "stderr": proc.stderr,
                 "success": proc.returncode == 0,
             }
+            if proc.returncode != 0:
+                # 补 error 字段：让 ToolExecutor 拿到清晰错误而非整个 dict 转储；
+                # "命令退出码" 命中终端模式 -> 不重试（命令已执行完，重试无意义）
+                result["error"] = (
+                    f"命令退出码 {proc.returncode}: "
+                    f"{(proc.stderr or proc.stdout or '').strip()[:500]}"
+                )
             self._write_output(context, proc.stdout.strip())
             logger.info(f"[{self.id}] 命令完成，返回码: {proc.returncode}")
             return result
@@ -705,6 +712,19 @@ class ToolNode(BaseNode):
             error_msg = f"命令执行超时 ({self.timeout}s): {resolved_cmd}"
             logger.error(f"[{self.id}] {error_msg}")
             raise RuntimeError(error_msg)
+        except (FileNotFoundError, PermissionError) as e:
+            # shell 缺失/不可执行（"No such file"/"Permission denied"）属确定性失败
+            error_msg = f"命令执行失败: {type(e).__name__}: {e}"
+            logger.error(f"[{self.id}] {error_msg}")
+            return {
+                "action_type": "command",
+                "command": resolved_cmd,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": str(e),
+                "success": False,
+                "error": error_msg,
+            }
 
     # ── 文件写入 ──────────────────────────────────────────
 
@@ -1111,7 +1131,15 @@ class ToolNode(BaseNode):
                 "error": "需要 file_path 参数",
             }
 
-        path = self._validate_path(file_path, for_write=False)
+        try:
+            path = self._validate_path(file_path, for_write=False)
+        except Exception as e:
+            # 路径越界/SecurityError 等走结构化错误，避免裸抛（"路径越界"/"securityerror" 命中终端模式）
+            return {
+                "action_type": "ast_analyze",
+                "success": False,
+                "error": f"路径校验失败: {e}",
+            }
         if not path.exists():
             return {
                 "action_type": "ast_analyze",
@@ -1185,7 +1213,14 @@ class ToolNode(BaseNode):
             root = "."
 
         engine = RefactorEngine(root)
-        engine.build_index(max_files=200)
+        try:
+            engine.build_index(max_files=200)
+        except Exception as e:
+            return {
+                "action_type": "refactor",
+                "success": False,
+                "error": f"构建代码索引失败: {e}",
+            }
 
         if action == "rename":
             old_name = self._resolve_template(self.old_name, context)
@@ -1241,7 +1276,10 @@ class ToolNode(BaseNode):
                 for s in result["suggestions"]:
                     display += f"  [{s['type']}] {s['message']}\n"
             self._write_output(context, display)
-            return {"action_type": "refactor", "refactor_action": "analyze", **result}
+            # B1: analyze_for_refactor 返回 {file,summary,suggestions} 无 success 键，
+            # 若不补 success=True，ToolExecutor 的 result.get("success", False) 默认 False
+            # -> 每次 analyze 都被判为失败并打印"工具执行失败"。这是用户主诉的高频噪音源。
+            return {"action_type": "refactor", "refactor_action": "analyze", "success": True, **result}
 
         else:
             return {
@@ -1275,7 +1313,14 @@ class ToolNode(BaseNode):
                     "success": False,
                     "error": f"文件不存在: {path}",
                 }
-            content = path.read_text(encoding=self.encoding)
+            try:
+                content = path.read_text(encoding=self.encoding)
+            except UnicodeDecodeError as e:
+                return {
+                    "action_type": "diff_preview",
+                    "success": False,
+                    "error": f"文件非文本（{self.encoding} 解码失败）: {e}",
+                }
             if old_text not in content:
                 return {
                     "action_type": "diff_preview",
@@ -1286,7 +1331,10 @@ class ToolNode(BaseNode):
         elif new_text or self.content:
             # write 模式：展示新文件 diff
             target_content = new_text or self.content or ""
-            content = path.read_text(encoding=self.encoding) if path.exists() else ""
+            try:
+                content = path.read_text(encoding=self.encoding) if path.exists() else ""
+            except UnicodeDecodeError:
+                content = ""  # 二进制文件无法预览旧内容，仅展示新增
             new_content = target_content
         else:
             return {
@@ -1422,10 +1470,33 @@ class ToolNode(BaseNode):
 
         if start_line is not None or max_lines is not None:
             # 按行分段读取
-            all_lines = path.read_text(encoding=self.encoding).splitlines(keepends=True)
+            try:
+                all_lines = path.read_text(encoding=self.encoding).splitlines(keepends=True)
+            except UnicodeDecodeError as e:
+                return {
+                    "action_type": "read_file", "file_path": str(path),
+                    "content": "", "exists": True, "success": False,
+                    "error": f"文件非文本（{self.encoding} 解码失败）: {e}",
+                }
             total_lines = len(all_lines)
-            s = max(1, int(start_line)) - 1 if start_line else 0  # 转为 0-based
-            e = s + int(max_lines) if max_lines else total_lines
+            try:
+                s = max(1, int(start_line)) - 1 if start_line else 0  # 转为 0-based
+                e = s + int(max_lines) if max_lines else total_lines
+            except (ValueError, TypeError) as ex:
+                return {
+                    "action_type": "read_file", "file_path": str(path),
+                    "content": "", "exists": True, "success": False,
+                    "error": f"参数非法: start_line/max_lines 非整数: {ex}",
+                }
+            if s >= total_lines:
+                # 起始行超过文件总行数：明确标注，避免 from_line > to_line 的误导
+                return {
+                    "action_type": "read_file", "file_path": str(path),
+                    "content": "", "total_lines": total_lines,
+                    "from_line": s + 1, "to_line": total_lines,
+                    "size": 0, "exists": True, "success": True,
+                    "note": f"起始行 {s + 1} 超过文件总行数 {total_lines}，无内容可读",
+                }
             e = min(e, total_lines)
             content = "".join(all_lines[s:e])
             result = {
@@ -1440,7 +1511,14 @@ class ToolNode(BaseNode):
                 "success": True,
             }
         else:
-            content = path.read_text(encoding=self.encoding)
+            try:
+                content = path.read_text(encoding=self.encoding)
+            except UnicodeDecodeError as e:
+                return {
+                    "action_type": "read_file", "file_path": str(path),
+                    "content": "", "exists": True, "success": False,
+                    "error": f"文件非文本（{self.encoding} 解码失败）: {e}",
+                }
             result = {
                 "action_type": "read_file",
                 "file_path": str(path),
@@ -1551,10 +1629,22 @@ class ToolNode(BaseNode):
         file_filter = self._resolve_template(self.file_filter, context)
 
         if not search_pattern:
-            raise ValueError(f"[{self.id}] search_files 需要 search_pattern")
+            return {
+                "action_type": "search_files",
+                "success": False,
+                "error": "参数缺失: search_files 需要 search_pattern 参数",
+            }
 
         # 安全验证
-        path = self._validate_path(search_dir, for_write=False)
+        try:
+            path = self._validate_path(search_dir, for_write=False)
+        except Exception as e:
+            # 路径越界等走结构化错误，避免裸抛
+            return {
+                "action_type": "search_files",
+                "success": False,
+                "error": f"路径校验失败: {e}",
+            }
 
         if not path.exists():
             result = {
@@ -1630,10 +1720,20 @@ class ToolNode(BaseNode):
         if git_cmd in git_commands:
             cmd = git_commands[git_cmd]
         elif git_cmd.startswith("commit"):
-            msg = git_cmd.replace("commit", "").strip() or extra_args or "auto commit"
+            # 切片而非 replace：避免 "commit 修复 commit 逻辑" 被替成 " 修复  逻辑"
+            rest = git_cmd[len("commit"):].strip()
+            # 兼容 "commit -m <msg>" / "commit --message <msg>" 写法
+            for prefix in ("-m ", "--message ", "-m=", "--message="):
+                if rest.startswith(prefix):
+                    rest = rest[len(prefix):].strip()
+                    break
+            # 去掉成对引号
+            if len(rest) >= 2 and rest[0] in "\"'" and rest[-1] == rest[0]:
+                rest = rest[1:-1]
+            msg = rest or extra_args or "auto commit"
             cmd = ["git", "commit", "-m", msg]
         elif git_cmd.startswith("add"):
-            target = git_cmd.replace("add", "").strip() or extra_args or "."
+            target = git_cmd[len("add"):].strip() or extra_args or "."
             cmd = ["git", "add", target]
         else:
             cmd = ["git"] + git_cmd.split() + (extra_args.split() if extra_args else [])
@@ -1653,6 +1753,9 @@ class ToolNode(BaseNode):
                 "output": output,    # 保留兼容
                 "success": proc.returncode == 0,
             }
+            if proc.returncode != 0:
+                # "命令退出码" 命中终端模式 -> 不重试
+                result["error"] = f"Git 命令退出码 {proc.returncode}: {output[:500]}"
             self._write_output(context, output)
             return result
         except subprocess.TimeoutExpired:
@@ -1737,13 +1840,17 @@ class ToolNode(BaseNode):
             info = get_weather(city, lang)
             report = format_weather_report(info)
 
+            has_err = "error" in info
             result = {
                 "action_type": "weather",
                 "city": city,
-                "success": "error" not in info,
+                "success": not has_err,
                 "weather_info": info,
                 "content": report,
             }
+            if has_err:
+                # 补顶层 error：否则 ToolExecutor 拿不到 error 字段，会回退到整个 dict 转储
+                result["error"] = f"天气查询失败: {info['error']}"
             self._write_output(context, report[:5000])
             return result
 

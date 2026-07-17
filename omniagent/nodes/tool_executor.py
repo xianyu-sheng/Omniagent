@@ -135,16 +135,31 @@ def validate_tool_params(params: dict[str, Any]) -> tuple[bool, str]:
 
 
 # ── 错误分类 ───────────────────────────────────────────────
+# 终端错误：确定性失败，重试无意义（文件/参数/编码/路径/未安装/配置态/限流/
+# 命令已执行完返回非零/本地超时）。覆盖此前"都不命中则重试"兜底漏掉的确定性错误，
+# 避免把"未找到匹配/UnicodeDecodeError/路径越界/未安装/403 限流/命令退出码"等
+# 必然失败无谓重试 2 次（用户主诉"反复看到工具调用失败"的核心放大器）。
 _TERMINAL_PATTERNS = re.compile(
-    r"文件不存在|不存在|not found|no such|找不到|permission denied|"
-    r"权限拒绝|access denied|参数非法|非法参数|invalid param|illegal|"
+    r"文件不存在|路径不存在|不存在|not found|no such|找不到|未找到匹配|找到.*处匹配|匹配文本|"
+    r"permission denied|权限拒绝|access denied|forbidden|403|"
+    r"参数非法|非法参数|invalid param|illegal|参数校验失败|参数缺失|需要.*参数|"
     r"is a directory|not a directory|already exists|已存在|"
-    r"不支持|unsupported|unknown action",
+    r"不支持|unsupported|unknown action|未知 refactor_action|未知 mcp 工具|"
+    r"路径越界|securityerror|过大|上限|超过.*限制|"
+    r"unicodedecodeerror|codec|编码|二进制|"
+    r"未安装|not a .*repository|not found in path|"
+    r"未初始化|子进程未运行|未连接|"
+    r"断路器|"
+    r"命令退出码|exit code|returncode|命令执行超时|git 命令超时|"
+    r"限流|rate limit|429",
     re.IGNORECASE,
 )
+# 瞬时错误：网络/超时/连接抖动，重试可能成功。限流(429/403/rate limit)不在此列--
+# 立即重试只会烧配额、加剧限流，归终端错误让 LLM 退避换路。本地命令超时
+# （命令执行超时/Git 命令超时）也归终端，避免用户等 2 倍超时周期。
 _TRANSIENT_PATTERNS = re.compile(
-    r"timeout|timed out|限流|429|rate limit|connection|econn|"
-    r"temporar|暂时|重试|retry|broken pipe|reset",
+    r"timeout|timed out|请求超时|connection|econn|"
+    r"temporar|暂时|重试|retry|broken pipe|reset|503|502",
     re.IGNORECASE,
 )
 
@@ -176,7 +191,13 @@ def _tool_alternative_hint(tool_name: str, params: dict[str, object]) -> str:
 
 
 def is_terminal_error(error: str) -> bool:
-    """终端错误（文件不存在/权限/参数非法）不重试；瞬时错误（超时/限流/网络）重试。"""
+    """判断是否为不应重试的终端错误。
+
+    优先级：瞬时错误（超时/连接抖动/502/503）→ 重试；终端错误（文件/参数/编码/
+    路径/未安装/限流/命令退出码/本地超时）→ 不重试；二者都不命中 → 默认重试
+    （保留对未知瞬时错误的容错）。终端错误覆盖面已大幅扩展，多数确定性失败会
+    在此被拦下，避免无谓重试放大"工具调用失败"日志。
+    """
     if not error:
         return False
     if _TRANSIENT_PATTERNS.search(error):
@@ -351,7 +372,11 @@ class ToolExecutor:
                         attempts=attempts, raw=raw,
                     )
                 # 执行返回失败
-                last_error = str(result.get("error") or result)
+                last_error = str(
+                    result.get("error")
+                    or result.get("stderr")
+                    or result
+                )
                 breaker.record_failure()
                 if is_terminal_error(last_error):
                     break  # 终端错误不重试
