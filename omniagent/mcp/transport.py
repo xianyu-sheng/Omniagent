@@ -50,6 +50,11 @@ class StdioTransport(MCPTransport):
         # stdout 行缓冲：跨多次 _readline_with_timeout 调用保留未消费字节，
         # 避免与 BufferedReader 内部缓冲冲突。
         self._read_buf = bytearray()
+        # F7/§8.1.4：stderr 由后台守护线程持续 drain 到有界缓冲，防子进程 stderr
+        # 大量输出写满管道缓冲（~64KB）后阻塞 -> stdout 不再响应 -> 死锁/超时。
+        self._stderr_buf: list[str] = []
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: threading.Thread | None = None
         self._start()
 
     def _start(self) -> None:
@@ -70,6 +75,11 @@ class StdioTransport(MCPTransport):
                 text=True,
             )
             logger.info(f"MCP 子进程启动: {' '.join(cmd)} (PID: {self._proc.pid})")
+            # F7/§8.1.4：起后台守护线程持续 drain stderr
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr, name="mcp-stderr-drain", daemon=True
+            )
+            self._stderr_thread.start()
         except FileNotFoundError:
             raise RuntimeError(f"MCP 命令不存在: {self.command}")
         except Exception as e:
@@ -148,24 +158,38 @@ class StdioTransport(MCPTransport):
                 return ""
             self._read_buf += chunk
 
-    def _read_stderr_safely(self) -> str:
-        """非阻塞读取 stderr 当前可读内容（仅用于错误诊断）。"""
+    def _drain_stderr(self) -> None:
+        """后台持续读取子进程 stderr 到有界缓冲（防管道写满死锁 + 保留近期诊断）。
+
+        drain 线程**独占** stderr 的读取与关闭：子进程退出/关闭 stderr 时
+        ``readline`` 返回 ``""``，循环结束后在 finally 中关闭 stderr。
+        这样主线程的 ``close()`` 不再直接关闭 stderr，避免与 drain 线程争抢
+        stderr 内部锁导致 ``close()`` 死锁（§8.1.4/F7）。
+        """
         if not self._proc or not self._proc.stderr:
-            return ""
+            return
+        stream = self._proc.stderr
         try:
-            fd = self._proc.stderr.fileno()
-            chunks: list[bytes] = []
-            while True:
-                ready, _, _ = select.select([fd], [], [], 0)
-                if not ready:
-                    break
-                data = self._proc.stderr.buffer.read1(4096)
-                if not data:
-                    break
-                chunks.append(data)
-            return b"".join(chunks).decode("utf-8", errors="replace")
+            for line in iter(stream.readline, ""):
+                with self._stderr_lock:
+                    self._stderr_buf.append(line)
+                    # 上限保护：仅保留最近 200 行，防无界增长
+                    if len(self._stderr_buf) > 200:
+                        del self._stderr_buf[: len(self._stderr_buf) - 200]
         except Exception:
-            return ""
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def _read_stderr_safely(self) -> str:
+        """返回近期 stderr 缓冲内容（由后台 drain 线程持续填充，仅用于错误诊断）。"""
+        with self._stderr_lock:
+            if not self._stderr_buf:
+                return ""
+            return "".join(self._stderr_buf[-50:])  # 最近 50 行
 
     def request(self, method: str, params: dict[str, Any] | None = None,
                 max_lines: int = 50, timeout: float = 30.0) -> dict[str, Any]:
@@ -222,18 +246,15 @@ class StdioTransport(MCPTransport):
                 f"MCP 请求超时：读取 {max_lines} 行后仍未收到 id={request_id} 的响应")
 
     def close(self) -> None:
-        """关闭子进程。"""
+        """关闭子进程。
+
+        顺序很关键：先关 stdin + terminate 让子进程退出；子进程退出 -> stderr EOF ->
+        drain 线程的 readline 返回并自行关闭 stderr。主线程随后 join drain 线程、关 stdout。
+        **不直接关 stderr**，避免与 drain 线程争抢 stderr 内部锁导致死锁（§8.1.4/F7）。
+        """
         if self._proc:
             try:
                 self._proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                self._proc.stdout.close()
-            except Exception:
-                pass
-            try:
-                self._proc.stderr.close()
             except Exception:
                 pass
             try:
@@ -242,8 +263,17 @@ class StdioTransport(MCPTransport):
             except Exception:
                 try:
                     self._proc.kill()
+                    self._proc.wait(timeout=2)
                 except Exception:
                     pass
+            # 子进程已终止 -> stderr EOF -> drain 线程退出（已自行关闭 stderr）
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=2.0)
+                self._stderr_thread = None
+            try:
+                self._proc.stdout.close()
+            except Exception:
+                pass
             self._proc = None
 
     def __del__(self) -> None:
@@ -309,3 +339,10 @@ class SSETransport(MCPTransport):
 
     def close(self) -> None:
         self._client.close()
+
+    def __del__(self) -> None:
+        # §8.1.5：与 StdioTransport 一致，GC 丢弃时释放 httpx 连接池，防资源泄漏
+        try:
+            self.close()
+        except Exception:
+            pass
