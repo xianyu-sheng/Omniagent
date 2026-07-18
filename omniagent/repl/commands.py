@@ -1046,7 +1046,11 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
     from omniagent.mcp.registry import MCPRegistry
 
     parts = args.strip().split()
-    sub = parts[0] if parts else "list"
+    sub = parts[0] if parts else ""
+
+    # 无子命令 → 显示使用指南
+    if not sub:
+        return _MCP_USAGE
 
     # 确保注册表存在
     if not hasattr(repl, '_mcp_registry') or repl._mcp_registry is None:
@@ -1231,7 +1235,33 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
             return f"❌ 安装失败: {e}"
 
     else:
-        return "用法: /mcp [add|list|tools|remove|discover|install] [args]"
+        # 无子命令或无效子命令 → 显示完整使用指南
+        return _MCP_USAGE
+
+
+_MCP_USAGE = """\
+═══ MCP 使用指南 ═══
+
+📡 浏览云端 MCP 库（7000+ 服务器）：
+  /mcp discover              浏览全部
+  /mcp discover <关键词>      搜索（如: 搜索 / 数据库 / github）
+
+📥 安装 MCP 服务器：
+  /mcp install <名称>         从库安装（惰性，按需连接）
+  /mcp add <名称> <命令>      手动安装本地 MCP
+
+📋 管理已安装的 MCP：
+  /mcp list                   查看已安装列表
+  /mcp tools                  查看已发现工具
+  /mcp remove <名称>          移除
+
+🔄 其他：
+  /library refresh            强制刷新库缓存
+
+示例：
+  /mcp discover 浏览器        → 搜索浏览器相关 MCP
+  /mcp install playwright     → 安装 Playwright 浏览器自动化
+  /mcp install vercel/grep    → 安装 Smithery 远程服务器"""
 
 
 # /library ───────────────────────────────────────────────
@@ -1853,24 +1883,38 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
 
     if canonical == "list":
         skills = manager.list_all()
-        if not skills:
-            return (
-                "暂无技能。\n\n"
-                "创建技能的方式:\n"
-                "  /skill create <名称> <描述>  — 快速创建\n"
-                "  /skill <自然语言描述>         — AI 自动生成，如 /skill 帮我设计前端页面\n"
-                "  /skill import <url>           — 从 GitHub 导入"
-            )
 
-        lines = [f"共 {len(skills)} 个技能:\n"]
-        for s in skills:
-            lines.append(f"  /{s.name} — {s.description}")
-            type_counts: dict[str, int] = {}
-            for st in s.steps:
-                type_counts[st.type] = type_counts.get(st.type, 0) + 1
-            step_summary = ", ".join(f"{n}×{t}" for t, n in sorted(type_counts.items()))
-            lines.append(f"    步骤: {len(s.steps)} 个 ({step_summary})")
-        return "\n".join(lines)
+        # 已安装的技能
+        installed = ""
+        if skills:
+            lines = [f"═══ 已安装技能（{len(skills)} 个）═══\n"]
+            for s in skills:
+                type_counts: dict[str, int] = {}
+                for st in s.steps:
+                    type_counts[st.type] = type_counts.get(st.type, 0) + 1
+                step_summary = ", ".join(f"{n}×{t}" for t, n in sorted(type_counts.items()))
+                lines.append(f"  /{s.name} — {s.description}")
+                lines.append(f"    {len(s.steps)} 步 ({step_summary})")
+            installed = "\n".join(lines) + "\n"
+        else:
+            installed = "暂无已安装技能。\n"
+
+        # 库浏览指引
+        library_guide = """\
+📡 浏览云端 Skill 库：
+  /skill-discover              浏览全部
+  /skill-discover <关键词>      搜索
+
+📥 安装 Skill：
+  /skill-install <名称>         一键安装
+  /skill import <GitHub URL>   从 URL 导入
+
+🛠 其他：
+  /skill create                交互式创建
+  /skill delete <名称>          删除
+  /skill reload                从磁盘重新加载
+"""
+        return installed + library_guide
 
     elif canonical == "create":
         return _skill_create_interactive(manager, registry=registry)
@@ -1918,9 +1962,9 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
                 hint = f"\n\n💡 你是不是想用 [bold]/skill {matched}[/bold]？"
             return (
                 f"无法识别的子命令: [bold]{sub}[/bold]{hint}\n\n"
-                f"用法: /skill create|list|run|delete|import [参数]\n\n"
-                f"💡 提示：你也可以用自然语言直接描述需求，如：\n"
-                f"   /skill 帮我创建一个设计前端页面的技能"
+                f"用法: /skill [list|create|run|delete|import|reload]\n\n"
+                f"📡 浏览云端库: /skill-discover | /skill-install <名称>\n"
+                f"💡 自然语言创建: /skill 帮我设计前端页面的技能"
             )
 
 
