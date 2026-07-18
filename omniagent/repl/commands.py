@@ -1147,8 +1147,8 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
         lib = get_mcp_library()
         results = lib.discover(keyword)
         if not results:
-            return f"未找到匹配 '{keyword}' 的 MCP 服务器。\n输入 /mcp discover 浏览全部，或 /library update 更新库"
-        lines = [f"═══ MCP 库{' — 搜索: ' + keyword if keyword else ''} ═══\n"]
+            return f"未找到匹配 '{keyword}' 的 MCP 服务器。\n输入 /mcp discover 浏览全部"
+        lines = [f"═══ MCP 库{' — 搜索: ' + keyword if keyword else ''} ═══ [dim]{lib.source_label}[/dim]\n"]
         for s in results:
             env_hint = ""
             if s.env:
@@ -1187,24 +1187,24 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
             if "<" in env_val or "你的" in env_val or "Token" in env_val:
                 import os as _os
                 if not _os.environ.get(env_key):
-                    env_warnings.append(f"  ⚠️ {env_key} 未设置（当前为空）；请设置后重启或 /mcp remove {entry.name} 再 /mcp install {entry.name}")
+                    env_warnings.append(f"  ⚠️ {env_key} 未设置；设置环境变量后使用 /mcp remove {entry.name} 再重新安装")
 
         try:
-            # 连接并持久化
+            # v0.5.4: 惰性连接 — 仅持久化配置，首次调用时再启动子进程
             if entry.command:
-                registry.add_server(entry.name, command=entry.command, args=entry.args)
+                registry.add_server_pending(entry.name, command=entry.command, args=entry.args)
                 from omniagent.repl.provider_registry import save_mcp_server
                 save_mcp_server(entry.name, command=entry.command, args=entry.args)
+            elif entry.url:
+                registry.add_server_pending(entry.name, url=entry.url)
+                from omniagent.repl.provider_registry import save_mcp_server
+                save_mcp_server(entry.name, url=entry.url)
             else:
                 return f"❌ '{entry.name}' 没有可执行的命令配置"
 
-            # 发现工具
-            tools = registry.discover_tools()
-            tool_count = len(tools.get(entry.name, []))
-
-            msg = f"✅ MCP 服务器 '{entry.name}' 已安装并连接\n"
+            msg = f"✅ MCP 服务器 '{entry.name}' 已登记（按需连接）\n"
             msg += f"   {entry.description[:80]}\n"
-            msg += f"   发现 {tool_count} 个工具"
+            msg += f"   下次启动或首次调用时自动连接"
             if env_warnings:
                 msg += "\n\n" + "\n".join(env_warnings)
             return msg
@@ -1217,23 +1217,44 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
 
 # /library ───────────────────────────────────────────────
 
-register_command("/library", "更新 MCP/Skill 库", "/library update")
+register_command("/library", "刷新 MCP/Skill 库缓存", "/library refresh")
 
 @_handler("/library")
 def _cmd_library(*, args: str, **kwargs: Any) -> str:
+    """强制刷新库缓存，从 GitHub 重新拉取。"""
     parts = args.strip().split()
-    sub = parts[0] if parts else ""
+    sub = parts[0] if parts else "refresh"
 
-    if sub == "update":
+    if sub in ("refresh", "update"):
         from omniagent.repl.library import get_mcp_library, get_skill_library
-        mcp_ok, mcp_msg = get_mcp_library().update_from_remote()
-        skill_ok, skill_msg = get_skill_library().update_from_remote()
-        lines = ["📚 库更新结果:\n"]
-        lines.append(f"  MCP:  {'✅' if mcp_ok else '❌'} {mcp_msg}")
-        lines.append(f"  Skill: {'✅' if skill_ok else '❌'} {skill_msg}")
+        import time
+
+        lines = ["📚 库刷新结果:\n"]
+
+        # 删除缓存，强制重新拉取
+        try:
+            from omniagent.repl.library import _CACHE_MCP, _CACHE_SKILL
+            for p in [_CACHE_MCP, _CACHE_SKILL]:
+                if p.exists():
+                    p.unlink()
+        except Exception:
+            pass
+
+        mcp_lib = get_mcp_library(force_refresh=True)
+        count_mcp = len(mcp_lib.discover())
+        lines.append(f"  MCP:  {count_mcp} 个服务器  [dim]{mcp_lib.source_label}[/dim]")
+        if mcp_lib._error:
+            lines.append(f"    [dim]⚠️ {mcp_lib._error}[/dim]")
+
+        skill_lib = get_skill_library(force_refresh=True)
+        count_skill = len(skill_lib.discover())
+        lines.append(f"  Skill: {count_skill} 个  [dim]{skill_lib.source_label}[/dim]")
+        if skill_lib._error:
+            lines.append(f"    [dim]⚠️ {skill_lib._error}[/dim]")
+
         return "\n".join(lines)
     else:
-        return "用法: /library update （从 GitHub 拉取最新库）"
+        return "用法: /library refresh （清除缓存并从 GitHub 拉取最新库）"
 
 
 # /skill discover / install ──────────────────────────────
@@ -1249,8 +1270,8 @@ def _cmd_skill_discover(*, args: str, **kwargs: Any) -> str:
     lib = get_skill_library()
     results = lib.discover(keyword)
     if not results:
-        return f"未找到匹配 '{keyword}' 的 Skill。\n输入 /skill-discover 浏览全部，或 /library update 更新库"
-    lines = [f"═══ Skill 库{' — 搜索: ' + keyword if keyword else ''} ═══\n"]
+        return f"未找到匹配 '{keyword}' 的 Skill。\n输入 /skill-discover 浏览全部"
+    lines = [f"═══ Skill 库{' — 搜索: ' + keyword if keyword else ''} ═══ [dim]{lib.source_label}[/dim]\n"]
     for s in results:
         cat = f"[{s.category}]" if s.category else ""
         step_count = len(s.steps) if s.steps else 0
@@ -1276,16 +1297,8 @@ def _cmd_skill_install(*, args: str, **kwargs: Any) -> str:
             hint = f"\n\n相似的: {names}"
         return f"❌ {msg}{hint}"
     # 刷新 REPL 已缓存的 skill 列表
-    import logging
-    _logger = logging.getLogger(__name__)
-    try:
-        from omniagent.repl.skill_manager import SkillManager
-        mgr = SkillManager()
-        mgr.load()
-        _logger.info(f"Skill 列表已刷新（{len(mgr.skills)} 个）")
-    except Exception as e:
-        _logger.debug(f"刷新 Skill 列表失败: {e}")
-    return msg + "\n输入 /{name} 使用"
+    lib.refresh_repl_skills()
+    return msg + f"\n输入 /{name} 使用"
 
 
 # /status ──────────────────────────────────────────────────
