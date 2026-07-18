@@ -1878,6 +1878,10 @@ class REPL:
         # 网页抓取
         re.compile(r"(?:抓取|下载|获取|访问).{0,20}(?:网页|页面|url|网址)", re.I),
         re.compile(r"(?:fetch|download|scrape|crawl).{0,20}(?:web|page|url)", re.I),
+        # GitHub / 仓库分析
+        re.compile(r"github\.com/\w+/\w+", re.I),
+        re.compile(r"(?:分析|拉取|克隆|查看).{0,10}(?:仓库|项目|代码库|repo)", re.I),
+        re.compile(r"(?:analyze|clone|pull|review).{0,10}(?:repo|project|codebase)", re.I),
         # 文件路径模式（./xxx, src/xxx, C:\xxx, .py, .js 等）
         re.compile(r"(?:^|\s)(?:\./|\.\./|src/|tests?/|lib/|app/|dist/|build/)\S+", re.I),
         re.compile(r"(?:^|\s)[A-Z]:\\[\w\\/.]+", re.I),
