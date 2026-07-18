@@ -63,7 +63,8 @@ if _HAS_PROMPT_TOOLKIT:
             if isinstance(container.content, BufferControl) and not container.style:
                 container.style = style
                 # 关键：不让输入窗口高度扩展填满屏幕
-                container.dont_extend_height = True
+                from prompt_toolkit.filters import to_filter
+                container.dont_extend_height = to_filter(True)
         elif hasattr(container, 'get_children'):
             for child in container.get_children():
                 _inject_window_style(child, style)
