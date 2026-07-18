@@ -1327,6 +1327,8 @@ def _cmd_skill_discover(*, args: str, **kwargs: Any) -> str:
         lines.append(f"  {s.name} {cat} ({step_count} 步)")
         lines.append(f"    {s.description[:120]}")
         lines.append(f"    安装: /skill-install {s.name}")
+    if not keyword:
+        lines.append("\n[dim]💡 想贡献你的 Skill？欢迎 PR → https://github.com/xianyu-sheng/Omniagent[/dim]")
     return "\n".join(lines)
 
 
