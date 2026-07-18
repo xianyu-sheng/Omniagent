@@ -413,6 +413,7 @@ class ModelPool:
 
         v0.4.0 Step 10: 先确定任务 tier，从匹配队列中选模型，
         用 _score 细粒度排序。队列空时 fallback 到全局。
+        v0.5.6: Tier 边界模糊，也考虑相邻 tier 的模型。
 
         Args:
             profile: TaskProfile (from difficulty_estimator)
@@ -423,18 +424,29 @@ class ModelPool:
         """
         # Step 10: 多优先级队列调度
         task_tier = self._resolve_task_tier(profile)
-        aliases = self._resolve_tier_queue(task_tier)
 
-        if aliases:
-            entries = []
-            with self._lock:
+        # v0.5.6: Tier 边界模糊 — 同时考虑目标 tier 和相邻 tier
+        tiers_to_check = [task_tier]
+        if task_tier > MIN_TIER:
+            tiers_to_check.append(task_tier - 1)
+        if task_tier < MAX_TIER:
+            tiers_to_check.append(task_tier + 1)
+
+        # 收集所有候选
+        seen_aliases = set()
+        entries = []
+        with self._lock:
+            for t in tiers_to_check:
+                aliases = self._resolve_tier_queue(t)
                 for a in aliases:
-                    if e := self._entries.get(a):
+                    if a not in seen_aliases and (e := self._entries.get(a)):
+                        seen_aliases.add(a)
                         entries.append(e)
-            if entries:
-                scored = [(self._score(e, profile), e) for e in entries]
-                scored.sort(key=lambda x: x[0], reverse=True)
-                return [e for _, e in scored[:count]]
+
+        if entries:
+            scored = [(self._score(e, profile), e) for e in entries]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [e for _, e in scored[:count]]
 
         # Fallback: 全局搜索（所有健康模型）
         healthy = self.get_healthy()
@@ -453,6 +465,7 @@ class ModelPool:
 
         P2: 权重向量受 perf_profile(fast|cost|balanced)动态调整;
         新增 in_flight 负载因子(并发高的扣分)。
+        v0.5.6: 根据 intent 调整权重，让任务类型真正影响路由。
         """
         cap = entry.capability
         h = entry.health
@@ -469,6 +482,31 @@ class ModelPool:
             w_reason, w_coding, w_tools = 3.0, 2.0, 1.5
         else:
             w_reason, w_coding, w_tools = 4.0, 3.0, 2.0
+
+        # v0.5.6: Intent-specific weighting（真正按任务类型路由）
+        intent = getattr(profile, "intent", None)
+        if intent == "novel":
+            # 小说：创意推理 + 长上下文最重要
+            w_reason *= 1.5
+            score += float(cap.context_window) * 0.00001
+        elif intent == "debug":
+            # 调试：推理能力 + 工具使用都重要
+            w_reason *= 1.3
+            w_tools *= 1.2
+        elif intent == "design":
+            # 设计：推理能力最重要
+            w_reason *= 1.4
+        elif intent == "refactor":
+            # 重构：推理 + 代码能力
+            w_reason *= 1.2
+            w_coding *= 1.2
+        elif intent == "write_test":
+            # 写测试：代码能力 + 工具使用
+            w_coding *= 1.3
+            w_tools *= 1.2
+        elif intent in ("chat", "query", "explain"):
+            # 简单对话/查询：工具使用更重要（快速响应）
+            w_tools *= 1.2
 
         # Capability match
         if getattr(profile, "requires_reasoning", False):

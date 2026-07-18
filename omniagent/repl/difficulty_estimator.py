@@ -73,8 +73,20 @@ class DifficultyEstimator:
             score += 0.15
         if re.search(r"(?:复杂|困难|很难|挑战|大规模)", text):
             score += 0.1
-        if len(text) > 500:
+        # v0.5.6: 更细致的长度感知
+        text_len = len(text)
+        if text_len > 200:
+            score += 0.05
+        if text_len > 500:
+            score += 0.08
+        if text_len > 1000:
             score += 0.1
+        # v0.5.6: 有换行/分段说明用户花了心思，任务可能更细
+        if "\n" in text:
+            score += 0.03
+        # v0.5.6: 代码块标记说明有代码要处理
+        if "```" in text:
+            score += 0.05
         file_refs = len(re.findall(r"\b\w+\.(?:py|js|ts|java|go|rs)\b", text))
         score += min(file_refs * 0.05, 0.15)
         return min(score, 1.0)
