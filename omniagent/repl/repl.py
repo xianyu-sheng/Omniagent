@@ -58,10 +58,12 @@ except ImportError:
 
 if _HAS_PROMPT_TOOLKIT:
     def _inject_window_style(container, style: str) -> None:
-        """只给包含 BufferControl 的输入窗口注入背景样式。"""
+        """给输入窗口注入背景样式，并限制高度为内容高度（不填满屏幕）。"""
         if isinstance(container, Window):
             if isinstance(container.content, BufferControl) and not container.style:
                 container.style = style
+                # 关键：不让输入窗口高度扩展填满屏幕
+                container.dont_extend_height = True
         elif hasattr(container, 'get_children'):
             for child in container.get_children():
                 _inject_window_style(child, style)
