@@ -381,10 +381,11 @@ class NovelEngine(BaseEngine):
 
             # v0.5.3: Python 的 "key" in list 检查的是值成员而非键存在，
             # 所以 list[dict] 永远返回 False，导致并行工具调用被静默跳过。
+            # v0.6.1: "action" in dict → bool(dict.get("action")) 防止空字符串误判
             _has_action = (
-                (isinstance(parsed, dict) and "action" in parsed) or
+                (isinstance(parsed, dict) and bool(parsed.get("action", ""))) or
                 (isinstance(parsed, list) and any(
-                    isinstance(a, dict) and "action" in a for a in parsed
+                    isinstance(a, dict) and bool(a.get("action", "")) for a in parsed
                 ))
             )
             if _has_action:

@@ -237,6 +237,78 @@ def _repair_json(text: str) -> str | None:
     return text
 
 
+def _split_adjacent_json_objects(text: str) -> list[dict] | None:
+    """
+    拆分 LLM 输出的多个相邻 JSON 对象（如 {...} {...}）。
+
+    LLM 有时会输出多个 JSON 对象而不是一个 JSON 数组：
+        {"action": "list_files", ...} {"action": "github_fetch", ...}
+    这不是合法 JSON，但意图清晰——每个对象是一个独立工具调用。
+    按 } 后紧跟空白 + { 的边界拆分，逐个解析。
+    """
+    # 找到所有 } ... { 边界位置
+    boundaries: list[int] = []
+    i = 0
+    while i < len(text):
+        brace_close = text.find("}", i)
+        if brace_close == -1:
+            break
+        # 查找 } 之后的第一个 {
+        after_close = brace_close + 1
+        # 允许空白和换行
+        j = after_close
+        while j < len(text) and text[j] in (' ', '\n', '\r', '\t'):
+            j += 1
+        if j < len(text) and text[j] == '{':
+            boundaries.append((brace_close, j))
+            i = j
+        else:
+            i = after_close
+
+    if not boundaries:
+        return None
+
+    # 按边界拆分并逐个解析
+    objects: list[dict] = []
+    prev_start = 0
+    for close_pos, open_pos in boundaries:
+        segment = text[prev_start:close_pos + 1].strip()
+        if segment:
+            try:
+                obj = json.loads(segment, strict=False)
+                if isinstance(obj, dict):
+                    objects.append(obj)
+            except json.JSONDecodeError:
+                repaired = _repair_json(segment)
+                if repaired:
+                    try:
+                        obj = json.loads(repaired, strict=False)
+                        if isinstance(obj, dict):
+                            objects.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+        prev_start = open_pos
+
+    # 最后一个对象（从最后一个边界到文本末尾）
+    last_segment = text[prev_start:].strip()
+    if last_segment:
+        try:
+            obj = json.loads(last_segment, strict=False)
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except json.JSONDecodeError:
+            repaired = _repair_json(last_segment)
+            if repaired:
+                try:
+                    obj = json.loads(repaired, strict=False)
+                    if isinstance(obj, dict):
+                        objects.append(obj)
+                except json.JSONDecodeError:
+                    pass
+
+    return objects if objects else None
+
+
 def _extract_json(text: str) -> dict | list | None:
     """从 LLM 输出中提取 JSON 对象或数组，处理 markdown 代码块和多余文字。
 
@@ -247,28 +319,38 @@ def _extract_json(text: str) -> dict | list | None:
     # 尝试 ```json ... ``` 代码块
     m = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if m:
+        inner = m.group(1)
         try:
-            return json.loads(m.group(1), strict=False)
+            return json.loads(inner, strict=False)
         except json.JSONDecodeError:
-            repaired = _repair_json(m.group(1))
+            repaired = _repair_json(inner)
             if repaired:
                 try:
                     return json.loads(repaired, strict=False)
                 except json.JSONDecodeError:
                     pass
+            # v0.6.1: code block 内可能是多个相邻 JSON 对象
+            adjacent = _split_adjacent_json_objects(inner)
+            if adjacent:
+                return adjacent
 
     # 尝试 ``` ... ``` 代码块（无 json 标记）
     m = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
     if m:
+        inner = m.group(1)
         try:
-            return json.loads(m.group(1), strict=False)
+            return json.loads(inner, strict=False)
         except json.JSONDecodeError:
-            repaired = _repair_json(m.group(1))
+            repaired = _repair_json(inner)
             if repaired:
                 try:
                     return json.loads(repaired, strict=False)
                 except json.JSONDecodeError:
                     pass
+            # v0.6.1: code block 内可能是多个相邻 JSON 对象
+            adjacent = _split_adjacent_json_objects(inner)
+            if adjacent:
+                return adjacent
 
     # 直接尝试解析
     try:
@@ -308,6 +390,14 @@ def _extract_json(text: str) -> dict | list | None:
                 return result
         except json.JSONDecodeError:
             pass
+
+    # v0.6.1: 处理 LLM 输出的多个相邻 JSON 对象（如 {...} {...}），
+    # 这些对象不是合法 JSON 数组（缺少逗号和方括号），前面的策略
+    # "从第一个 { 取到最后一个 }" 会产生非法的混合文本。
+    # 这里按 } 后紧跟空白 + { 的边界拆分，逐个解析为 list[dict]。
+    adjacent_objects = _split_adjacent_json_objects(text)
+    if adjacent_objects:
+        return adjacent_objects
 
     return None
 
@@ -363,7 +453,11 @@ def parse_react(raw: str) -> dict[str, Any] | list[dict[str, Any]]:
     """
     data = _extract_json(raw)
     if data is None:
-        return {**_react_template(), "thought": raw, "final_answer": raw}
+        # v0.6.1: 解析失败时不要把原始模型输出设为 final_answer，
+        # 否则引擎会将未解析的 JSON 文本直接展示给用户。
+        # 将 raw text 只放在 thought 中，留空 final_answer 让引擎
+        # 走到 "无有效 JSON 输出" 路径做二次处理。
+        return {**_react_template(), "thought": raw}
 
     # v0.5.0: JSON 数组 → 并行工具调用
     if isinstance(data, list):
@@ -376,7 +470,7 @@ def parse_react(raw: str) -> dict[str, Any] | list[dict[str, Any]]:
                 actions.append(act)
         if actions:
             return actions
-        return {**_react_template(), "thought": raw, "final_answer": raw}
+        return {**_react_template(), "thought": raw}
 
     result = _pick(data, _REACT_FIELD_ALIASES)
 

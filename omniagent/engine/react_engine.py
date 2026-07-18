@@ -237,6 +237,21 @@ BUILTIN_TOOLS = {
     # 白名单约束（A1），重名受 _BUILTIN_ACTION_TYPES 约束（A3）。
     # v0.5.4: create_skill / list_skills 不在此暴露给 LLM——仅在 /skill 命令路径可用，
     # 避免 LLM 在无关对话中自发调用创建 skill（REGRESSION-3 审计发现）。
+    # v0.6.1: clone_repo — 将 GitHub 仓库克隆到本地，返回结构化摘要，
+    # 用于后续代码分析（省去手动 git clone + list_files 流程）。
+    "clone_repo": {
+        "name": "clone_repo",
+        "description": (
+            "将 GitHub 仓库克隆到本地缓存目录（~/.omniagent/repos/），并自动分析："
+            "目录结构、关键文件（README/配置/入口点）、代码统计。"
+            "重复克隆同一仓库不会重复下载。"
+            "克隆后可配合 list_files/read_file/search_files 深入分析代码。"
+        ),
+        "params": {
+            "repo": "GitHub 仓库 URL 或 owner/repo 格式，如 'https://github.com/user/repo' 或 'user/repo'",
+            "branch": "分支名（可选，默认 main，失败时自动尝试 master）",
+        },
+    },
 }
 
 
@@ -520,9 +535,9 @@ class ReActEngine(BaseEngine):
             # 所以 list[dict] 永远返回 False，导致并行工具调用被静默跳过。
             # 正确做法：对 dict 检查键存在，对 list 检查任一元素含 action 键。
             _has_action = (
-                (isinstance(parsed, dict) and "action" in parsed) or
+                (isinstance(parsed, dict) and bool(parsed.get("action", ""))) or
                 (isinstance(parsed, list) and any(
-                    isinstance(a, dict) and "action" in a for a in parsed
+                    isinstance(a, dict) and bool(a.get("action", "")) for a in parsed
                 ))
             )
             if _has_action:
@@ -637,10 +652,28 @@ class ReActEngine(BaseEngine):
                     budget.on_compression()
             else:
                 # v0.5.4: LLM 没有给出有效 JSON 输出（无 final_answer 且无 action）。
-                # 优先返回 LLM 原始响应文本，而非观察包装文本。
-                # 仅当原始响应为空或过短时，才从最后一条观察中提取内容。
+                # v0.6.1: 如果原始响应包含 "action" 模式的 JSON 片段（说明解析
+                # 失败但模型确实尝试输出工具调用），不直接展示 raw text，
+                # 而是要求模型重新输出格式正确的 JSON。
                 if response and len(response.strip()) > 50:
-                    result = response.strip()
+                    raw_cleaned = response.strip()
+                    # 检测：原始响应中是否包含未成功解析的 action JSON
+                    if '"action"' in raw_cleaned and ('"action_input"' in raw_cleaned or '"action_type"' in raw_cleaned):
+                        self.callback.on_warning(
+                            "LLM 响应包含工具调用但格式无法解析，要求重新输出"
+                        )
+                        logger.warning(
+                            f"ReAct: 响应含未解析的 action JSON，"
+                            f"要求模型使用标准格式重试"
+                        )
+                        messages.append({"role": "user", "content": (
+                            "你的回答格式不正确。请使用标准 JSON 格式：\n"
+                            '{"action": "工具名", "action_input": {...}}\n'
+                            '或 {"final_answer": "你的回答"}'
+                        )})
+                        budget.on_retry()
+                        continue
+                    result = raw_cleaned
                 else:
                     # 尝试从最后一条观察中提取
                     last_obs = ""
@@ -921,10 +954,14 @@ class ReActEngine(BaseEngine):
             # 命令执行
             "执行", "运行", "命令", "脚本", "程序",
             "run", "execute", "command", "script",
-            # Git
-            "git", "commit", "push", "pull", "clone",
+            # Git / 代码分析
+            "git", "commit", "push", "pull", "clone", "仓库", "拉取", "下载",
+            "github", "repo", "fetch", "download",
             # 搜索
             "搜索", "查找", "grep", "find", "search",
+            # v0.6.1: 代码分析 / 重构场景（常需要读取文件、执行工具）
+            "分析", "重构", "优化", "改进", "审查", "评审", "review",
+            "源码", "代码", "source", "code", "analyze", "refactor",
             # 路径模式
             ".py", ".js", ".ts", ".html", ".css", ".json", ".yaml",
             ".md", ".txt", ".sh", ".bat",

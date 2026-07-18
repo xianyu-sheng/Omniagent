@@ -84,6 +84,7 @@ _BUILTIN_ACTION_TYPES: frozenset[str] = frozenset({
     "git", "web_fetch", "edit_file", "create_directory", "batch_write",
     "batch_edit", "code_index", "ast_analyze", "refactor", "diff_preview",
     "mcp_call", "github_fetch", "weather", "datetime", "register_tool",
+    "clone_repo",
 })
 
 
@@ -345,7 +346,7 @@ class ToolNode(BaseNode):
         tool_name: str = "",
         tool_args: dict | None = None,
         mcp_server: str = "",
-        # github_fetch 参数
+        # github_fetch / clone_repo 参数
         repo: str = "",
         github_action: str = "list_files",  # list_files | fetch_file | fetch_readme
         github_path: str = "",
@@ -635,6 +636,7 @@ class ToolNode(BaseNode):
             "diff_preview": self._diff_preview,
             "mcp_call": self._mcp_call,
             "github_fetch": self._github_fetch,
+            "clone_repo": self._clone_repo,
             "weather": self._weather,
             "datetime": self._datetime,
             "register_tool": self._register_tool,
@@ -1771,6 +1773,9 @@ class ToolNode(BaseNode):
 
         # 规范化 repo 格式：支持完整 URL 或 owner/repo
         repo = repo.strip().rstrip("/")
+        # v0.6.1: 去掉 .git 后缀（git clone URL 常以 .git 结尾）
+        if repo.endswith(".git"):
+            repo = repo[:-4]
         if "github.com" in repo:
             # 从 URL 提取 owner/repo
             m = re.search(r"github\.com/([^/]+/[^/]+)", repo)
@@ -1899,6 +1904,215 @@ class ToolNode(BaseNode):
                 "action": action, "content": "", "success": False,
                 "error": f"GitHub 操作失败: {e}",
             }
+
+    def _clone_repo(self, context: AgentContext) -> dict[str, Any]:
+        """将 GitHub 仓库克隆到本地缓存并返回结构化摘要。
+
+        - 缓存目录：~/.omniagent/repos/{owner}_{repo}/
+        - 浅克隆（--depth 1），节省时间和空间
+        - 自动分析：目录结构、关键文件、代码统计
+        """
+        import subprocess
+        import re as _re
+
+        repo_input = self._resolve_template(self.repo, context)
+        if not repo_input:
+            raise ValueError(f"[{self.id}] clone_repo 需要 repo 参数（格式: owner/repo 或完整 URL）")
+
+        # ── 规范化 repo 标识（同 github_fetch 逻辑，但 clone_repo 还支持 .git 后缀）──
+        repo = repo_input.strip().rstrip("/")
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        if "github.com" in repo:
+            m = _re.search(r"github\.com/([^/]+/[^/]+)", repo)
+            if m:
+                repo = m.group(1)
+        repo = repo.rstrip("/")
+        if not _re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+            return {
+                "action_type": "clone_repo", "repo": repo_input,
+                "success": False,
+                "error": f"repo 格式非法（应为 owner/repo）: {repo_input}",
+            }
+
+        # ── 解析分支 ──
+        branch = self._resolve_template(self.branch, context) or "main"
+
+        # ── 构建缓存路径 ──
+        cache_root = Path.home() / ".omniagent" / "repos"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        target_dir = cache_root / repo.replace("/", "_")
+
+        # ── 克隆（如果尚未缓存）──
+        clone_url = f"https://github.com/{repo}.git"
+        if not (target_dir / ".git").exists():
+            logger.info(f"[{self.id}] 克隆仓库: {clone_url} → {target_dir}")
+            try:
+                result = subprocess.run(
+                    ["git", "clone", "--depth", "1", "--single-branch", "-b", branch,
+                     clone_url, str(target_dir)],
+                    capture_output=True, text=True, timeout=self.timeout,
+                )
+                if result.returncode != 0:
+                    # 如果 main 失败，尝试 master
+                    if branch == "main":
+                        logger.info(f"[{self.id}] main 分支失败，尝试 master")
+                        result = subprocess.run(
+                            ["git", "clone", "--depth", "1", "--single-branch", "-b", "master",
+                             clone_url, str(target_dir)],
+                            capture_output=True, text=True, timeout=self.timeout,
+                        )
+                    if result.returncode != 0:
+                        return {
+                            "action_type": "clone_repo", "repo": repo,
+                            "success": False,
+                            "error": f"git clone 失败: {result.stderr.strip()}",
+                        }
+            except FileNotFoundError:
+                return {
+                    "action_type": "clone_repo", "repo": repo,
+                    "success": False,
+                    "error": "本机未安装 git，无法克隆仓库。请先安装 git。",
+                }
+            except subprocess.TimeoutExpired:
+                return {
+                    "action_type": "clone_repo", "repo": repo,
+                    "success": False,
+                    "error": f"git clone 超时（>{self.timeout}s）",
+                }
+        else:
+            logger.info(f"[{self.id}] 仓库已缓存: {target_dir}")
+
+        # ── 分析克隆结果 ──
+        return self._analyze_cloned_repo(target_dir, repo, branch)
+
+    @staticmethod
+    def _analyze_cloned_repo(target_dir: Path, repo: str, branch: str) -> dict[str, Any]:
+        """分析已克隆的仓库，返回结构化摘要。"""
+        import fnmatch
+
+        # ── 文件列表 ──
+        all_files: list[str] = []
+        dirs: dict[str, int] = {}  # 顶层目录 → 文件数
+        key_files: dict[str, str] = {}  # 关键文件 → 描述
+        lang_counts: dict[str, int] = {}  # 语言 → 文件数
+        total_lines = 0
+
+        # 忽略的目录和文件
+        ignore_patterns = [
+            ".git", "__pycache__", "node_modules", ".venv", "venv",
+            ".tox", ".eggs", "*.egg-info", ".pytest_cache", ".mypy_cache",
+            ".ruff_cache", "dist", "build", "*.pyc", ".DS_Store",
+        ]
+
+        ext_to_lang = {
+            ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+            ".go": "Go", ".rs": "Rust", ".java": "Java", ".c": "C",
+            ".cpp": "C++", ".h": "C/C++ Header", ".rb": "Ruby",
+            ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
+            ".yaml": "YAML", ".yml": "YAML", ".json": "JSON",
+            ".toml": "TOML", ".md": "Markdown", ".rst": "reStructuredText",
+            ".txt": "Text", ".html": "HTML", ".css": "CSS",
+            ".sql": "SQL", ".dockerfile": "Dockerfile",
+        }
+
+        key_file_patterns = {
+            "README.md": "项目说明", "README.rst": "项目说明",
+            "README": "项目说明", "pyproject.toml": "Python 项目配置",
+            "setup.py": "Python 打包配置", "setup.cfg": "Python 打包配置",
+            "package.json": "Node.js 项目配置", "Cargo.toml": "Rust 项目配置",
+            "go.mod": "Go 模块定义", "Makefile": "构建脚本",
+            "Dockerfile": "容器镜像定义", "docker-compose.yml": "容器编排",
+            ".github/workflows": "CI 工作流", "LICENSE": "许可证",
+        }
+
+        for root, _dirs, files in os.walk(target_dir):
+            # 跳过忽略的目录
+            rel_root = os.path.relpath(root, target_dir)
+            parts = rel_root.split(os.sep)
+            if any(fnmatch.fnmatch(p, pat) or p in ignore_patterns for p in parts for pat in ignore_patterns):
+                _dirs[:] = []  # 不进入子目录
+                continue
+            # 就地过滤忽略的目录
+            _ignored: list[str] = []
+            for d in _dirs:
+                if d in ignore_patterns or any(fnmatch.fnmatch(d, p) for p in ignore_patterns):
+                    _ignored.append(d)
+            for d in _ignored:
+                _dirs.remove(d)
+
+            for fname in sorted(files):
+                fpath = os.path.join(root, fname)
+                rel_path = os.path.relpath(fpath, target_dir)
+                all_files.append(rel_path)
+
+                # 顶层目录统计
+                top_dir = rel_path.split(os.sep)[0] if os.sep in rel_path else "(root)"
+                dirs[top_dir] = dirs.get(top_dir, 0) + 1
+
+                # 语言统计
+                _, ext = os.path.splitext(fname)
+                lang = ext_to_lang.get(ext.lower(), ext or "(no ext)")
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
+
+                # 行数统计（仅文本文件）
+                if ext.lower() in {'.py', '.js', '.ts', '.go', '.rs', '.java', '.c', '.cpp',
+                                    '.h', '.rb', '.sh', '.bash', '.zsh', '.yaml', '.yml',
+                                    '.json', '.toml', '.md', '.rst', '.txt', '.html', '.css',
+                                    '.sql', ''}:
+                    try:
+                        with open(fpath, encoding='utf-8', errors='ignore') as f:
+                            line_count = sum(1 for _ in f)
+                        total_lines += line_count
+                    except Exception:
+                        pass
+
+                # 关键文件识别
+                for pattern, desc in key_file_patterns.items():
+                    if pattern.startswith("."):
+                        # 目录模式（如 .github/workflows）
+                        if rel_path.startswith(pattern + os.sep) or rel_path == pattern:
+                            key_files[rel_path] = desc
+                    elif fname == pattern:
+                        key_files[rel_path] = desc
+
+        # ── 构建返回结果 ──
+        # 顶层目录（按文件数降序，最多 15 个）
+        sorted_dirs = sorted(dirs.items(), key=lambda x: -x[1])[:15]
+        dir_tree = "\n".join(f"  {d}/ ({n} files)" for d, n in sorted_dirs)
+
+        # 语言统计（按文件数降序，最多 10 个）
+        sorted_langs = sorted(lang_counts.items(), key=lambda x: -x[1])[:10]
+        lang_summary = ", ".join(f"{l}: {n}" for l, n in sorted_langs)
+
+        # 关键文件（最多 20 个）
+        key_list = [f"  {p} — {d}" for p, d in sorted(key_files.items())[:20]]
+        key_summary = "\n".join(key_list) if key_list else "  (未识别到关键文件)"
+
+        summary = (
+            f"# 仓库分析: {repo}\n"
+            f"- 路径: {target_dir}\n"
+            f"- 分支: {branch}\n"
+            f"- 文件总数: {len(all_files)}\n"
+            f"- 代码总行数: {total_lines:,}\n"
+            f"- 语言: {lang_summary}\n"
+            f"\n## 目录结构\n{dir_tree}\n"
+            f"\n## 关键文件\n{key_summary}"
+        )
+
+        return {
+            "action_type": "clone_repo",
+            "repo": repo,
+            "repo_path": str(target_dir),
+            "branch": branch,
+            "file_count": len(all_files),
+            "total_lines": total_lines,
+            "top_dirs": dict(sorted_dirs),
+            "languages": dict(sorted_langs),
+            "key_files": {p: d for p, d in sorted(key_files.items())},
+            "content": summary,
+            "success": True,
+        }
 
     @staticmethod
     def _html_to_text(html: str) -> str:

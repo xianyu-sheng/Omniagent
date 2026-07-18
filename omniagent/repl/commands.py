@@ -1515,6 +1515,7 @@ def _cmd_tools(**kwargs: Any) -> str:
         ("diff_preview", "预览文件修改 diff", "file_path, old_text, new_text"),
         ("mcp_call", "调用 MCP 外部工具", "tool_name, tool_args"),
         ("github_fetch", "GitHub 仓库操作（列出文件/获取内容/README）", "repo, github_action, github_path, branch"),
+        ("clone_repo", "克隆 GitHub 仓库到本地并分析代码结构", "repo, branch"),
     ]
 
     lines = ["可用工具类型:\n"]
