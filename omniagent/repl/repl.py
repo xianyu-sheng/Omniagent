@@ -60,10 +60,9 @@ if _HAS_PROMPT_TOOLKIT:
     def _inject_window_style(container, style: str) -> None:
         """只给包含 BufferControl 的输入窗口注入背景样式。"""
         if isinstance(container, Window):
-            # 只给有 BufferControl 的窗口加背景（即输入行），不影响工具栏/菜单
             if isinstance(container.content, BufferControl) and not container.style:
                 container.style = style
-        elif isinstance(container, (HSplit, FloatContainer, ConditionalContainer)):
+        elif hasattr(container, 'get_children'):
             for child in container.get_children():
                 _inject_window_style(child, style)
         elif isinstance(container, Float):
@@ -224,8 +223,8 @@ class REPL:
         style = Style.from_dict({
             # 默认 — 透明底
             "": "#e0e0e0",
-            # 输入行窗口背景 — 仅覆盖输入行，不填满屏幕
-            "input-bg": "bg:#2d2d2d",
+            # 输入行窗口背景 — Tokyo Night 暗蓝灰，好看不刺眼
+            "input-bg": "bg:#24283b",
             # 提示符 `>`
             "prompt": "bold #ffffff bg:#4a4a4a",
         })
@@ -239,14 +238,8 @@ class REPL:
                 key_bindings=kb,
                 style=style,
             )
-            # 猴子补丁：给输入窗口加背景样式，让它只在输入行显示而非填满全屏
-            _orig_create_layout = self._pt_session._create_layout
-            def _patched_create_layout(_self=None):
-                layout = _orig_create_layout()
-                # 找到输入 buffer 的 Window 并加样式
-                _inject_window_style(layout, "class:input-bg")
-                return layout
-            self._pt_session._create_layout = _patched_create_layout
+            # 给已创建的 layout 中输入窗口注入背景样式
+            _inject_window_style(self._pt_session.layout.container, "class:input-bg")
         except Exception:
             logger.debug("prompt_toolkit 初始化失败，回退自建输入", exc_info=True)
             self._pt_session = None
