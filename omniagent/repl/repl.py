@@ -225,7 +225,6 @@ class REPL:
 
     def _confirm_tool(self, tool_name: str, params: dict, risk: str) -> tuple[bool, str]:
         import os
-        from rich.prompt import Prompt
         from omniagent.repl.permissions import PermissionGate
 
         if not sys.stdin.isatty() or os.environ.get("OMNIAGENT_ASSUME_YES") == "1":
