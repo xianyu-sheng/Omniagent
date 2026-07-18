@@ -1087,13 +1087,18 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
             return f"❌ 连接失败: {e}"
 
     elif sub == "list":
-        if not registry.clients:
+        has_connected = bool(registry.clients)
+        has_pending = registry.has_pending_servers()
+        if not has_connected and not has_pending:
             return "当前无 MCP 服务器。使用 /mcp add 添加。"
         lines = ["═══ MCP 服务器 ═══\n"]
         for name, client in registry.clients.items():
             info = client.server_info
             tool_count = len(client.tools)
             lines.append(f"  {name}: {info.get('name', 'unknown')} v{info.get('version', '?')} ({tool_count} 工具)")
+        if has_pending:
+            for name in registry.get_pending_server_names():
+                lines.append(f"  {name}: [dim]惰性（首次调用时连接）[/dim]")
         return "\n".join(lines)
 
     elif sub == "tools":
@@ -1125,6 +1130,15 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
             from omniagent.repl.provider_registry import remove_mcp_server
             remove_mcp_server(name)
             return f"✅ MCP 服务器 '{name}' 已移除"
+        # v0.5.4: 也处理惰性服务器
+        if name in registry.get_pending_server_names():
+            if not _confirm(f"移除惰性 MCP 服务器 '{name}'（尚未连接）？", default=False):
+                return "已取消"
+            # 从 pending_configs 中删除
+            registry._pending_configs.pop(name, None)
+            from omniagent.repl.provider_registry import remove_mcp_server
+            remove_mcp_server(name)
+            return f"✅ MCP 服务器 '{name}' 已移除（惰性）"
         return f"❌ 未找到 MCP 服务器 '{name}'"
 
     else:

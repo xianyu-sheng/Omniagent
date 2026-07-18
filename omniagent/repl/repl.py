@@ -671,8 +671,8 @@ class REPL:
         # 加载自定义快捷指令和技能
         self._load_custom_commands()
 
-        # v0.5.3: 自动连接持久化的 MCP 服务器
-        self._auto_connect_mcp_servers()
+        # v0.5.4: 惰性登记 MCP 服务器（不连接，不阻塞启动）
+        self._preload_mcp_server_configs()
 
     def _print_welcome(self) -> None:
         """打印简洁的欢迎界面。
@@ -1582,17 +1582,20 @@ class REPL:
         console.print(f"[error]❌ 所有模型均调用失败: {last_error}[/error]")
 
     def _inject_mcp_tools_into_engine(self, engine: object) -> None:
-        """v0.5.3: 将可用 MCP 工具列表注入引擎的 system prompt。
+        """v0.5.4: 将可用 MCP 工具（或惰性描述）注入引擎的 system prompt。
 
         所有引擎（ReAct/PlanExecute/Reflection 等）统一使用此方法，
-        让 LLM 在 mcp_call 工具描述中看到具体可用的 MCP 工具名和描述。
+        让 LLM 知道有哪些 MCP 服务器可用。
+
+        惰性模式下：只显示服务器名列表，不调用 discover_tools()。
+        当 LLM 实际决定调用 mcp_call 时，_ensure_mcp_ready() 才触发连接。
         """
         try:
             mcp_tools_list = self._build_mcp_tools_list()
         except Exception as e:
             logger.debug(f"构建 MCP 工具列表失败: {e}")
             return
-        if mcp_tools_list and hasattr(engine, '_mcp_tools_list'):
+        if hasattr(engine, '_mcp_tools_list'):
             try:
                 engine._mcp_tools_list = mcp_tools_list
                 if hasattr(engine, '_build_system_prompt'):
@@ -1923,46 +1926,56 @@ class REPL:
         return False
 
     def _has_mcp_tools(self) -> bool:
-        """检查是否有已连接的 MCP 服务器且提供了工具。"""
+        """检查是否有 MCP 服务器可用（含已连接和惰性）。"""
         try:
             registry = getattr(self, '_mcp_registry', None)
             if registry is None:
                 return False
-            return bool(registry.clients)
+            return bool(registry.clients) or registry.has_pending_servers()
         except Exception:
             return False
 
     def _build_mcp_tools_list(self) -> str:
-        """v0.5.3: 构建可用 MCP 工具列表，注入到引擎的 system prompt 中。
+        """v0.5.4: 构建可用 MCP 工具/服务器列表，注入到引擎 system prompt。
 
-        LLM 需要知道具体有哪些 MCP 工具可用，才能正确调用 mcp_call。
-        不提供的话 LLM 只能猜测工具名（如 query_train），必然失败。
+        - 已连接的服务器：展示完整工具列表
+        - 惰性（未连接）服务器：仅展示服务器名，提示按需调用
+
+        LLM 需要知道有哪些 MCP 工具可用，才能正确调用 mcp_call。
         """
         registry = getattr(self, '_mcp_registry', None)
-        if not registry or not registry.tool_map:
+        if not registry:
             return ""
 
-        # 确保工具已发现
-        if not registry.tool_map:
-            try:
-                registry.discover_tools()
-            except Exception:
-                return ""
+        parts: list[str] = [""]
 
-        tools_by_server: dict[str, list[tuple[str, str]]] = {}
-        for full_name, (server_name, tool) in registry.tool_map.items():
-            desc = tool.get("description", "")[:80] if isinstance(tool, dict) else str(tool)[:80]
-            tools_by_server.setdefault(server_name, []).append((full_name, desc))
+        # 已连接的工具
+        if registry.tool_map:
+            tools_by_server: dict[str, list[tuple[str, str]]] = {}
+            for full_name, (server_name, tool) in registry.tool_map.items():
+                desc = tool.get("description", "")[:80] if isinstance(tool, dict) else str(tool)[:80]
+                tools_by_server.setdefault(server_name, []).append((full_name, desc))
 
-        parts = ["\n当前可用的 MCP 工具："]
-        for server, tools in sorted(tools_by_server.items()):
-            parts.append(f"  [{server}]")
-            for name, desc in tools:
-                parts.append(f"    - {name}: {desc}")
-        return "\n".join(parts)
+            parts.append("当前可用的 MCP 工具：")
+            for server, tools in sorted(tools_by_server.items()):
+                parts.append(f"  [{server}]")
+                for name, desc in tools:
+                    parts.append(f"    - {name}: {desc}")
 
-    def _auto_connect_mcp_servers(self) -> None:
-        """v0.5.3: 启动时自动连接已持久化的 MCP 服务器。"""
+        # 惰性服务器（尚未连接）
+        pending = registry.get_pending_server_names()
+        if pending:
+            parts.append("\n可用的 MCP 服务器（首次调用时自动连接）：")
+            for name in sorted(pending):
+                parts.append(f"  - {name}:* — 使用 mcp_call tool_name=\"{name}:<工具名>\" 调用")
+
+        return "\n".join(parts) if len(parts) > 1 else ""
+
+    def _preload_mcp_server_configs(self) -> None:
+        """v0.5.4: 启动时仅登记 MCP 服务器配置，不连接（惰性）。
+
+        首次工具调用时才会真正启动子进程并发现工具，避免启动时阻塞。
+        """
         from omniagent.mcp.registry import MCPRegistry
         from omniagent.repl.provider_registry import load_mcp_servers
 
@@ -1974,39 +1987,47 @@ class REPL:
             self._mcp_registry = MCPRegistry()
             self.agent_context.set("_mcp_registry", self._mcp_registry)
 
-        connected = 0
+        pending_count = 0
         for s in servers:
             name = s.get("name", "")
             if not name:
                 continue
             try:
                 if s.get("url"):
-                    self._mcp_registry.add_server(name, url=str(s["url"]))
+                    self._mcp_registry.add_server_pending(name, url=str(s["url"]))
                 else:
                     cmd = str(s.get("command", ""))
                     args = [str(a) for a in s.get("args", [])]
                     if cmd:
-                        self._mcp_registry.add_server(name, command=cmd, args=args)
+                        self._mcp_registry.add_server_pending(name, command=cmd, args=args)
                     else:
                         continue
-                connected += 1
+                pending_count += 1
             except Exception as e:
-                logger.debug(f"自动连接 MCP '{name}' 失败: {e}")
+                logger.debug(f"登记 MCP '{name}' 失败: {e}")
 
-        if connected:
-            # 发现工具
-            try:
-                self._mcp_registry.discover_tools()
-                total_tools = sum(
-                    len(client.tools)
-                    for client in self._mcp_registry.clients.values()
-                )
-                console.print(
-                    f"[dim]· 自动连接 {connected} 个 MCP 服务器"
-                    f"（{total_tools} 个工具）[/dim]"
-                )
-            except Exception:
-                console.print(f"[dim]· 自动连接 {connected} 个 MCP 服务器[/dim]")
+        if pending_count:
+            console.print(
+                f"[dim]· {pending_count} 个 MCP 服务器已登记（按需连接）[/dim]"
+            )
+
+    def _ensure_mcp_ready(self) -> None:
+        """确保所有惰性 MCP 服务器已连接并发现工具。
+
+        在 LLM 决定使用 mcp_call 时调用，或用户执行 /mcp tools 时调用。
+        连接完成后更新 _mcp_tools_list 以供后续引擎注入。
+        """
+        registry = getattr(self, '_mcp_registry', None)
+        if not registry or not registry.has_pending_servers():
+            return
+
+        console.print("[dim]· 正在连接 MCP 服务器...[/dim]", end="")
+        try:
+            registry.discover_tools()
+            total = sum(len(c.tools) for c in registry.clients.values())
+            console.print(f"[dim] 就绪（{len(registry.clients)} 个服务器，{total} 个工具）[/dim]")
+        except Exception as e:
+            console.print(f"[dim] 部分失败: {e}[/dim]")
 
     _FILE_CLAIM_KEYWORDS: list[str] = [
         "已创建", "已经创建", "已生成", "已经生成", "已写入", "已经写入",
