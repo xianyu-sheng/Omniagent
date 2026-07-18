@@ -1,0 +1,150 @@
+# OmniAgent MCP 库
+# 可通过 /library update 从 GitHub 更新，也可手动编辑
+# 格式: name, description, command, args, env (可选), category, homepage (可选), note (可选)
+
+version: "1.0"
+servers:
+  - name: filesystem
+    description: 安全的文件系统读写，支持目录浏览、文件创建/读取/编辑
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    category: 系统
+    homepage: https://github.com/modelcontextprotocol/servers
+    note: "dot(.) 表示当前目录，可按需替换为具体路径"
+
+  - name: github
+    description: GitHub API 集成 — 管理仓库、Issue、PR、代码搜索
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "<你的 GitHub Token>"
+    category: 开发
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: postgres
+    description: PostgreSQL 数据库查询（只读 schema 检查 + 只读查询）
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-postgres"]
+    env:
+      DATABASE_URL: "<你的数据库连接串>"
+    category: 数据库
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: sqlite
+    description: SQLite 数据库查询与操作
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "/tmp/test.db"]
+    category: 数据库
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: brave-search
+    description: Brave 搜索引擎 — 网页搜索
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-brave-search"]
+    env:
+      BRAVE_API_KEY: "<你的 Brave API Key>"
+    category: 搜索
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: fetch
+    description: HTTP 网页抓取 — 将网页内容转为 Markdown
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-fetch"]
+    category: 网络
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: memory
+    description: 知识图谱记忆系统 — 持久化上下文
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-memory"]
+    category: 工具
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: playwright
+    description: 浏览器自动化 — 截图、点击、表单填写、JS 执行
+    command: npx
+    args: ["-y", "@playwright/mcp"]
+    category: 浏览器
+    homepage: https://github.com/microsoft/playwright-mcp
+
+  - name: tavily-search
+    description: Tavily AI 搜索引擎 — 高质量实时搜索
+    command: npx
+    args: ["-y", "tavily-mcp"]
+    env:
+      TAVILY_API_KEY: "<你的 Tavily API Key>"
+    category: 搜索
+    homepage: https://github.com/tavily-ai/tavily-mcp
+
+  - name: exa-search
+    description: Exa AI 搜索引擎 — 语义搜索 + 内容抓取
+    command: npx
+    args: ["-y", "exa-mcp-server"]
+    env:
+      EXA_API_KEY: "<你的 Exa API Key>"
+    category: 搜索
+    homepage: https://github.com/exa-labs/exa-mcp-server
+
+  - name: slack
+    description: Slack 工作空间集成 — 发消息、读频道、管理用户
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-slack"]
+    env:
+      SLACK_BOT_TOKEN: "<你的 Slack Bot Token>"
+    category: 协作
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: docker
+    description: Docker 容器管理 — 查看/启停容器、镜像、compose
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-docker"]
+    category: 运维
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: todoist
+    description: Todoist 任务管理 — 增删改查任务和项目
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-todoist"]
+    env:
+      TODOIST_API_TOKEN: "<你的 Todoist API Token>"
+    category: 效率
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: sequential-thinking
+    description: 增强推理 — 多步骤顺序思考，适合复杂问题
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    category: 推理
+    homepage: https://github.com/modelcontextprotocol/servers
+
+  - name: puppeteer
+    description: Puppeteer 浏览器自动化 — 导航、截图、执行 JS
+    command: npx
+    args: ["-y", "@anthropic/puppeteer-mcp"]
+    category: 浏览器
+    homepage: https://github.com/anthropics/puppeteer-mcp
+
+  - name: cloudflare
+    description: Cloudflare Workers/KV/R2/D1 管理
+    command: npx
+    args: ["-y", "@cloudflare/mcp-server-cloudflare"]
+    env:
+      CLOUDFLARE_API_TOKEN: "<你的 Cloudflare API Token>"
+    category: 云服务
+    homepage: https://github.com/cloudflare/mcp-server-cloudflare
+
+  - name: context7
+    description: 实时技术文档查询（Context7）— 获取最新库/框架文档
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+    category: 开发
+    homepage: https://github.com/upstash/context7
+
+  - name: e2b
+    description: E2B 云端沙箱 — 安全执行代码
+    command: npx
+    args: ["-y", "@e2b/mcp-server"]
+    env:
+      E2B_API_KEY: "<你的 E2B API Key>"
+    category: 开发
+    homepage: https://github.com/e2b-dev/mcp-server

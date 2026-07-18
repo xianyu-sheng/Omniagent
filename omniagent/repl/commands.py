@@ -1035,7 +1035,7 @@ def _cmd_verbose(*, args: str, session_state: dict, **kwargs: Any) -> str:
 
 # /mcp ──────────────────────────────────────────────────
 
-register_command("/mcp", "管理 MCP 服务器连接", "/mcp [add|list|tools|remove] [args]")
+register_command("/mcp", "管理 MCP 服务器连接", "/mcp [add|list|tools|remove|discover|install] [args]")
 
 @_handler("/mcp")
 def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
@@ -1141,8 +1141,151 @@ def _cmd_mcp(*, args: str, session_state: dict, **kwargs: Any) -> str:
             return f"✅ MCP 服务器 '{name}' 已移除（惰性）"
         return f"❌ 未找到 MCP 服务器 '{name}'"
 
+    elif sub == "discover":
+        keyword = " ".join(parts[1:]) if len(parts) > 1 else ""
+        from omniagent.repl.library import get_mcp_library
+        lib = get_mcp_library()
+        results = lib.discover(keyword)
+        if not results:
+            return f"未找到匹配 '{keyword}' 的 MCP 服务器。\n输入 /mcp discover 浏览全部，或 /library update 更新库"
+        lines = [f"═══ MCP 库{' — 搜索: ' + keyword if keyword else ''} ═══\n"]
+        for s in results:
+            env_hint = ""
+            if s.env:
+                env_vars = ", ".join(s.env.keys())
+                env_hint = f"  [dim]需要环境变量: {env_vars}[/dim]"
+            cat = f"[{s.category}]" if s.category else ""
+            lines.append(f"  {s.name} {cat}")
+            lines.append(f"    {s.description[:100]}")
+            if s.note:
+                lines.append(f"    [dim]💡 {s.note}[/dim]")
+            if s.homepage:
+                lines.append(f"    [dim]{s.homepage}[/dim]")
+            if env_hint:
+                lines.append(f"    {env_hint}")
+            lines.append(f"    安装: /mcp install {s.name}")
+        return "\n".join(lines)
+
+    elif sub == "install":
+        if len(parts) < 2:
+            return "用法: /mcp install <name>\n\n提示: 先用 /mcp discover 浏览可用 MCP 服务器"
+        name = parts[1]
+        from omniagent.repl.library import get_mcp_library
+        lib = get_mcp_library()
+        entry = lib.get(name)
+        if not entry:
+            similar = lib.discover(name)
+            hint = ""
+            if similar:
+                names = ", ".join(s.name for s in similar[:5])
+                hint = f"\n\n相似的: {names}"
+            return f"❌ 未在库中找到 '{name}'。输入 /mcp discover 浏览全部{hint}"
+
+        # 检查环境变量
+        env_warnings = []
+        for env_key, env_val in entry.env.items():
+            if "<" in env_val or "你的" in env_val or "Token" in env_val:
+                import os as _os
+                if not _os.environ.get(env_key):
+                    env_warnings.append(f"  ⚠️ {env_key} 未设置（当前为空）；请设置后重启或 /mcp remove {entry.name} 再 /mcp install {entry.name}")
+
+        try:
+            # 连接并持久化
+            if entry.command:
+                registry.add_server(entry.name, command=entry.command, args=entry.args)
+                from omniagent.repl.provider_registry import save_mcp_server
+                save_mcp_server(entry.name, command=entry.command, args=entry.args)
+            else:
+                return f"❌ '{entry.name}' 没有可执行的命令配置"
+
+            # 发现工具
+            tools = registry.discover_tools()
+            tool_count = len(tools.get(entry.name, []))
+
+            msg = f"✅ MCP 服务器 '{entry.name}' 已安装并连接\n"
+            msg += f"   {entry.description[:80]}\n"
+            msg += f"   发现 {tool_count} 个工具"
+            if env_warnings:
+                msg += "\n\n" + "\n".join(env_warnings)
+            return msg
+        except Exception as e:
+            return f"❌ 安装失败: {e}"
+
     else:
-        return "用法: /mcp [add|list|tools|remove] [args]"
+        return "用法: /mcp [add|list|tools|remove|discover|install] [args]"
+
+
+# /library ───────────────────────────────────────────────
+
+register_command("/library", "更新 MCP/Skill 库", "/library update")
+
+@_handler("/library")
+def _cmd_library(*, args: str, **kwargs: Any) -> str:
+    parts = args.strip().split()
+    sub = parts[0] if parts else ""
+
+    if sub == "update":
+        from omniagent.repl.library import get_mcp_library, get_skill_library
+        mcp_ok, mcp_msg = get_mcp_library().update_from_remote()
+        skill_ok, skill_msg = get_skill_library().update_from_remote()
+        lines = ["📚 库更新结果:\n"]
+        lines.append(f"  MCP:  {'✅' if mcp_ok else '❌'} {mcp_msg}")
+        lines.append(f"  Skill: {'✅' if skill_ok else '❌'} {skill_msg}")
+        return "\n".join(lines)
+    else:
+        return "用法: /library update （从 GitHub 拉取最新库）"
+
+
+# /skill discover / install ──────────────────────────────
+
+register_command("/skill-discover", "浏览/搜索 Skill 库", "/skill-discover [keyword]")
+register_command("/skill-install", "安装 Skill", "/skill-install <name>")
+
+
+@_handler("/skill-discover")
+def _cmd_skill_discover(*, args: str, **kwargs: Any) -> str:
+    keyword = args.strip()
+    from omniagent.repl.library import get_skill_library
+    lib = get_skill_library()
+    results = lib.discover(keyword)
+    if not results:
+        return f"未找到匹配 '{keyword}' 的 Skill。\n输入 /skill-discover 浏览全部，或 /library update 更新库"
+    lines = [f"═══ Skill 库{' — 搜索: ' + keyword if keyword else ''} ═══\n"]
+    for s in results:
+        cat = f"[{s.category}]" if s.category else ""
+        step_count = len(s.steps) if s.steps else 0
+        lines.append(f"  {s.name} {cat} ({step_count} 步)")
+        lines.append(f"    {s.description[:120]}")
+        lines.append(f"    安装: /skill-install {s.name}")
+    return "\n".join(lines)
+
+
+@_handler("/skill-install")
+def _cmd_skill_install(*, args: str, **kwargs: Any) -> str:
+    name = args.strip()
+    if not name:
+        return "用法: /skill-install <name>\n\n提示: 先用 /skill-discover 浏览可用 Skill"
+    from omniagent.repl.library import get_skill_library
+    lib = get_skill_library()
+    ok, msg = lib.install(name)
+    if not ok:
+        similar = lib.discover(name)
+        hint = ""
+        if similar:
+            names = ", ".join(s.name for s in similar[:5])
+            hint = f"\n\n相似的: {names}"
+        return f"❌ {msg}{hint}"
+    # 刷新 REPL 已缓存的 skill 列表
+    import logging
+    _logger = logging.getLogger(__name__)
+    try:
+        from omniagent.repl.skill_manager import SkillManager
+        mgr = SkillManager()
+        mgr.load()
+        _logger.info(f"Skill 列表已刷新（{len(mgr.skills)} 个）")
+    except Exception as e:
+        _logger.debug(f"刷新 Skill 列表失败: {e}")
+    return msg + "\n输入 /{name} 使用"
 
 
 # /status ──────────────────────────────────────────────────

@@ -1,0 +1,116 @@
+# OmniAgent Skill 库
+# 可通过 /skill install <name> 安装，或手动放到 ~/.omniagent/skills/
+# 格式: name, description, category, file_url (YAML 文件直链)
+
+version: "1.0"
+skills:
+  - name: git-commit
+    description: AI 生成 commit message — 分析 staged changes 生成规范的提交信息
+    category: 开发
+    steps:
+      - type: command
+        action: git diff --cached
+        output_var: diff
+      - type: llm
+        prompt: |
+          根据以下 git diff 生成一条规范的 commit message（中文，50 字以内）：
+          
+          {diff}
+
+  - name: todo-write
+    description: 将 TODO 项写入项目根目录的 TODO.md
+    category: 效率
+    params:
+      - name: task
+        description: 待办事项描述
+    steps:
+      - type: write_file
+        file_path: TODO.md
+        content: "- [ ] {task}"
+      - type: echo
+        prompt: "✅ 已添加到 TODO.md: {task}"
+
+  - name: summarize-log
+    description: 分析最近的日志文件，提取错误和警告摘要
+    category: 运维
+    params:
+      - name: file
+        description: 日志文件路径
+        default: /var/log/syslog
+      - name: lines
+        description: 读取行数
+        default: "200"
+    steps:
+      - type: command
+        action: tail -n {lines} {file}
+        output_var: log
+      - type: llm
+        prompt: |
+          分析以下日志片段，提取错误和警告摘要：
+          
+          {log}
+          
+          格式：
+          - [级别] 时间: 摘要
+
+  - name: bench
+    description: 快速性能测试 — 用 ab/wrk 压测本地服务
+    category: 运维
+    params:
+      - name: url
+        description: 要压测的 URL
+        default: http://localhost:8080
+      - name: requests
+        description: 请求总数
+        default: "100"
+      - name: concurrency
+        description: 并发数
+        default: "10"
+    steps:
+      - type: command
+        action: ab -n {requests} -c {concurrency} {url}
+        output_var: result
+      - type: llm
+        prompt: |
+          分析 ab 压测结果，给出关键指标和优化建议：
+          
+          {result}
+
+  - name: pkg-size
+    description: 分析 npm/pip 包大小和依赖树
+    category: 开发
+    params:
+      - name: pkg
+        description: 包名
+        default: ""
+    steps:
+      - type: command
+        action: npm pack {pkg} --dry-run 2>&1 || pip install {pkg} --dry-run --report - 2>&1
+        output_var: report
+      - type: llm
+        prompt: |
+          分析 {pkg} 的依赖情况：
+          
+          {report}
+
+  - name: quick-sql
+    description: 用自然语言查询 SQLite 数据库
+    category: 数据库
+    params:
+      - name: question
+        description: 你想查询什么？用自然语言描述
+      - name: db
+        description: SQLite 数据库文件路径
+        default: data.db
+    steps:
+      - type: read_file
+        file_path: "{db}"
+        output_var: schema_info
+      - type: llm
+        prompt: |
+          SQLite 数据库路径: {db}
+          用户问题: {question}
+          
+          请生成 SQL 查询语句。只输出 SQL，不要解释。
+      - type: command
+        action: sqlite3 {db} "{last_output}"
