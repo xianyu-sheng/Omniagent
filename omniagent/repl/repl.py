@@ -42,12 +42,32 @@ try:
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.styles import Style
     from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.layout.containers import Window, HSplit, FloatContainer, Float, ConditionalContainer
+    from prompt_toolkit.layout.controls import BufferControl
     from pathlib import Path as _Path
     _HISTORY_DIR = _Path.home() / ".omniagent"
     _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     _HAS_PROMPT_TOOLKIT = True
 except ImportError:
     _HAS_PROMPT_TOOLKIT = False
+    PromptSession = None  # type: ignore
+    FileHistory = None  # type: ignore
+    KeyBindings = None  # type: ignore
+    Style = None  # type: ignore
+    HTML = None  # type: ignore
+
+if _HAS_PROMPT_TOOLKIT:
+    def _inject_window_style(container, style: str) -> None:
+        """只给包含 BufferControl 的输入窗口注入背景样式。"""
+        if isinstance(container, Window):
+            # 只给有 BufferControl 的窗口加背景（即输入行），不影响工具栏/菜单
+            if isinstance(container.content, BufferControl) and not container.style:
+                container.style = style
+        elif isinstance(container, (HSplit, FloatContainer, ConditionalContainer)):
+            for child in container.get_children():
+                _inject_window_style(child, style)
+        elif isinstance(container, Float):
+            _inject_window_style(container.content, style)
 
 # ── 自定义主题 ────────────────────────────────────────────
 _theme = Theme({
@@ -202,9 +222,11 @@ class REPL:
                 event.app.invalidate()
 
         style = Style.from_dict({
-            # 输入区 — 极暗底色 (#121212)，与纯黑终端几乎一致但略有区分
-            "": "#e0e0e0 bg:#121212",
-            # 提示符 `>` — 灰底白字色块，输入行的锚点
+            # 默认 — 透明底
+            "": "#e0e0e0",
+            # 输入行窗口背景 — 仅覆盖输入行，不填满屏幕
+            "input-bg": "bg:#2d2d2d",
+            # 提示符 `>`
             "prompt": "bold #ffffff bg:#4a4a4a",
         })
 
@@ -217,6 +239,14 @@ class REPL:
                 key_bindings=kb,
                 style=style,
             )
+            # 猴子补丁：给输入窗口加背景样式，让它只在输入行显示而非填满全屏
+            _orig_create_layout = self._pt_session._create_layout
+            def _patched_create_layout(_self=None):
+                layout = _orig_create_layout()
+                # 找到输入 buffer 的 Window 并加样式
+                _inject_window_style(layout, "class:input-bg")
+                return layout
+            self._pt_session._create_layout = _patched_create_layout
         except Exception:
             logger.debug("prompt_toolkit 初始化失败，回退自建输入", exc_info=True)
             self._pt_session = None
