@@ -2824,3 +2824,74 @@ def _cmd_permissions(*, args: str, session_state: dict[str, Any] | None = None, 
     gate.set_mode(new_mode)
     gate.reset_session()  # 切换模式时清除记忆
     return f"✅ 权限模式已切换为: [bold cyan]{new_mode.value}[/bold cyan]"
+
+
+# ══════════════════════════════════════════════════════════════
+# /cost — DeepSeek 缓存命中率 + 费用面板
+# ══════════════════════════════════════════════════════════════
+
+register_command(
+    "/cost",
+    "显示缓存命中率 + 费用明细（本地计算，不消耗 API）",
+    "/cost [模型名]",
+)
+
+
+def _cmd_cost(*, args: str = "", session_state: dict = None, **kwargs: Any) -> str:
+    """显示 DeepSeek 缓存命中率 + 费用明细面板。
+
+    所有数据来自 API 响应的 usage.*_tokens 字段，配合本地定价表
+    纯本地计算。不调任何 LLM API（零额外消费）。
+    """
+    repl = session_state.get("_repl") if session_state else None
+    tracker = getattr(repl, "_cache_tracker", None) if repl else None
+
+    if not tracker:
+        return "[dim]CacheTracker 未初始化。仅在 DeepSeek 模型调用后可用。[/dim]"
+
+    total_cache = tracker.cache_hits + tracker.cache_misses
+    if total_cache == 0:
+        return "[dim]暂无缓存数据。进行 DeepSeek API 调用后自动统计。[/dim]"
+
+    lines: list[str] = []
+    model_filter = args.strip() if args else ""
+
+    models = tracker.all_models
+    if model_filter:
+        models = [m for m in models if model_filter.lower() in m.lower()]
+
+    for model_id in sorted(models):
+        snap = tracker.model_snapshot(model_id)
+        if not snap:
+            continue
+
+        hr = snap["cache_hit_rate"]
+        hr_color = "green" if hr >= 0.70 else ("yellow" if hr >= 0.40 else "red")
+
+        lines.append(f"\n[bold cyan]模型:[/bold cyan] {model_id}")
+        lines.append(f"  [dim]调用次数:[/dim] {snap['calls']}")
+        lines.append(f"  [dim]Input:[/dim] {snap['prompt_tokens']:,} tokens"
+                     f"  [dim]Output:[/dim] {snap['completion_tokens']:,} tokens")
+        lines.append(f"  [bold cyan]缓存命中:[/bold cyan] [{hr_color}]{snap['cache_hit_tokens']:,}[/{hr_color}]"
+                     f"  ([{hr_color}]{hr:.1%}[/{hr_color}])")
+        lines.append(f"  [dim]缓存未命中:[/dim] {snap['cache_miss_tokens']:,}"
+                     f"  ([dim]{1 - hr:.1%}[/dim])")
+        lines.append(f"  [bold yellow]预估费用:[/bold yellow] ¥{snap['cost_yuan']:.4f}")
+        if snap['saved_yuan'] > 0.0001:
+            saved_pct = int(snap['saved_yuan'] / (snap['cost_yuan'] + snap['saved_yuan']) * 100)
+            lines.append(f"  [bold green]节省:[/bold green] ¥{snap['saved_yuan']:.4f} ({saved_pct}%)"
+                         f"  [dim]vs 全未命中[/dim]")
+        lines.append("")
+
+    # 汇总
+    if len(models) > 1:
+        lines.append("[bold]─── 汇总 ───[/bold]")
+        lines.append(f"  [dim]总缓存命中率:[/dim] [bold]{tracker.cache_hit_rate_pct}[/bold]")
+        lines.append(f"  [dim]总费用:[/dim] [bold yellow]{tracker.estimated_cost_display}[/bold yellow]")
+        if tracker.savings_pct > 0:
+            lines.append(f"  [dim]总节省:[/dim] [bold green]¥{tracker.savings_yuan:.4f} ({tracker.savings_pct}%)[/bold green]")
+
+    if not lines:
+        return f"[dim]未找到匹配 '{model_filter}' 的模型数据。[/dim]"
+
+    return "\n".join(lines)

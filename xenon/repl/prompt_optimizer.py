@@ -418,3 +418,93 @@ def get_intent_display(intent: str | None) -> str:
     if intent is None:
         return "💬 通用对话"
     return display_map.get(intent, "💬 通用对话")
+
+
+# ══════════════════════════════════════════════════════════════
+# 缓存优化：固定内容前置（DeepSeek Prefix Caching 友好）
+# ══════════════════════════════════════════════════════════════
+
+
+def optimize_messages_for_cache(
+    messages: list[dict[str, str]],
+    tools_schema: str = "",
+    system_prompt_core: str = "",
+) -> list[dict[str, str]]:
+    """重组消息列表以最大化 DeepSeek Prefix Caching 命中率。
+
+    原则：
+    - system 消息在最前面且内容固定（工具定义 + 角色设定）
+    - 动态内容（时间戳、用户任务、文件路径）移至 user 消息
+    - system prompt 长度稳定有助于 prefix alignment
+
+    Args:
+        messages: 原始消息列表。
+        tools_schema: 工具定义的 JSON schema 文本（高度稳定）。
+        system_prompt_core: 系统角色设定（高度稳定）。
+
+    Returns:
+        重组后的消息列表。
+    """
+    result: list[dict[str, str]] = []
+
+    # 1. 构造稳定 system prompt（工具定义 + 角色 → 固定前缀）
+    sys_parts: list[str] = []
+    if tools_schema:
+        sys_parts.append(tools_schema)
+    if system_prompt_core:
+        sys_parts.append(system_prompt_core)
+
+    # 2. 检查原消息中是否已有 system 消息，提取其稳定部分
+    other_messages: list[dict[str, str]] = []
+    dynamic_sys_parts: list[str] = []
+    for msg in messages:
+        if msg["role"] == "system":
+            # 把已有 system prompt 内容合并进来
+            content = msg.get("content", "")
+            # 检测动态部分（包含时间、路径等可变信息）
+            if _is_dynamic_content(content):
+                dynamic_sys_parts.append(content)
+            else:
+                sys_parts.append(content)
+        else:
+            other_messages.append(msg)
+
+    # 3. 组装最终 system 消息（稳定部分）
+    stable_sys = "\n\n".join(sys_parts).strip()
+    if stable_sys:
+        result.append({"role": "system", "content": stable_sys})
+
+    # 4. 动态内容移入首个 user 消息前
+    if dynamic_sys_parts:
+        dynamic_text = "\n".join(dynamic_sys_parts)
+        if other_messages and other_messages[0]["role"] == "user":
+            # 注入到首条 user 消息
+            other_messages[0]["content"] = (
+                "[上下文信息]\n" + dynamic_text + "\n\n[任务]\n" + other_messages[0]["content"]
+            )
+        else:
+            # 插入为独立的 user 消息
+            other_messages.insert(0, {"role": "user", "content": dynamic_text})
+
+    result.extend(other_messages)
+    return result
+
+
+def _is_dynamic_content(text: str) -> bool:
+    """检测文本是否包含动态可变内容（应移出 system prompt）。
+
+    system prompt 中的动态内容会破坏 prefix caching，应移至 user 消息。
+    """
+    import re
+    dynamic_patterns = [
+        r'\d{4}[-/]\d{2}[-/]\d{2}',           # 日期
+        r'\d{2}:\d{2}:\d{2}',                   # 时间
+        r'(?:/|[A-Z]:\\)[^\s,;]+',             # 文件路径
+        r'\bcurrent (?:time|date|datetime)\b',
+        r'\b\$\{[^}]+\}',                       # ${VAR} 模板变量
+        r'\buser(?:name|_id|_name)\b',
+    ]
+    for pat in dynamic_patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            return True
+    return False
