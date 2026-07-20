@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <!-- 氙气蓝光渐变 -->
+    <radialGradient id="sparkGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.8"/>
+      <stop offset="60%" stop-color="#3b82f6" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#1e40af" stop-opacity="0"/>
+    </radialGradient>
+    <!-- 背景暗色渐变 -->
+    <radialGradient id="bgGrad" cx="50%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </radialGradient>
+    <!-- 六边形边框渐变 -->
+    <linearGradient id="hexStroke" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#475569"/>
+      <stop offset="50%" stop-color="#94a3b8"/>
+      <stop offset="100%" stop-color="#475569"/>
+    </linearGradient>
+    <!-- 卫星轨道渐变 -->
+    <linearGradient id="satGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 背景圆角方块 -->
+  <rect x="0" y="0" width="400" height="400" rx="60" fill="url(#bgGrad)"/>
+
+  <!-- 轨道环（虚线椭圆，暗示电子轨道 / 模型池） -->
+  <ellipse cx="200" cy="195" rx="160" ry="45"
+           fill="none" stroke="#334155" stroke-width="1.5"
+           stroke-dasharray="8 6" opacity="0.6"/>
+
+  <!-- 四条轨道线（对角方向，连接卫星到核心） -->
+  <line x1="200" y1="195" x2="70" y2="120"  stroke="#1e3a5f" stroke-width="0.8" opacity="0.5"/>
+  <line x1="200" y1="195" x2="330" y2="120" stroke="#1e3a5f" stroke-width="0.8" opacity="0.5"/>
+  <line x1="200" y1="195" x2="70" y2="270"  stroke="#1e3a5f" stroke-width="0.8" opacity="0.5"/>
+  <line x1="200" y1="195" x2="330" y2="270" stroke="#1e3a5f" stroke-width="0.8" opacity="0.5"/>
+
+  <!-- 卫星 ◇（4 颗，模型池多模态节点） -->
+  <g transform="translate(70, 120)">
+    <rect x="-8" y="-8" width="16" height="16" rx="3" fill="url(#satGrad)"
+          transform="rotate(45)" opacity="0.9"/>
+  </g>
+  <g transform="translate(330, 120)">
+    <rect x="-8" y="-8" width="16" height="16" rx="3" fill="url(#satGrad)"
+          transform="rotate(45)" opacity="0.7"/>
+  </g>
+  <g transform="translate(70, 270)">
+    <rect x="-8" y="-8" width="16" height="16" rx="3" fill="url(#satGrad)"
+          transform="rotate(45)" opacity="0.7"/>
+  </g>
+  <g transform="translate(330, 270)">
+    <rect x="-8" y="-8" width="16" height="16" rx="3" fill="url(#satGrad)"
+          transform="rotate(45)" opacity="0.9"/>
+  </g>
+
+  <!-- 六边形（终端 REPL 界面） -->
+  <polygon points="200,120 285,165 285,225 200,270 115,225 115,165"
+           fill="none" stroke="url(#hexStroke)" stroke-width="2.5"
+           stroke-linejoin="round"/>
+
+  <!-- 氙气放电光晕（✦ 背后） -->
+  <circle cx="200" cy="195" r="40" fill="url(#sparkGlow)"/>
+
+  <!-- Xe 核心文字 -->
+  <text x="200" y="188" text-anchor="middle" dominant-baseline="middle"
+        font-family="'SF Mono','Cascadia Code','Consolas',monospace"
+        font-size="42" font-weight="700" fill="#f8fafc"
+        letter-spacing="-2">
+    Xe
+  </text>
+
+  <!-- 氙气放电火花 ✦（发光效果：外层大光晕 + 内层锐利） -->
+  <text x="200" y="195" text-anchor="middle" dominant-baseline="middle"
+        font-size="12" fill="#93c5fd" opacity="0.4">✦</text>
+  <text x="200" y="210" text-anchor="middle" dominant-baseline="middle"
+        font-size="24" fill="#60a5fa" opacity="0.9">✦</text>
+  <text x="200" y="208" text-anchor="middle" dominant-baseline="middle"
+        font-size="12" fill="#bfdbfe" opacity="1">✦</text>
+
+  <!-- 底部文字 XENON -->
+  <text x="200" y="330" text-anchor="middle" dominant-baseline="middle"
+        font-family="'SF Mono','Cascadia Code',monospace"
+        font-size="22" font-weight="500" fill="#64748b" letter-spacing="8">
+    XENON
+  </text>
+
+  <!-- 底部发光点 -->
+  <circle cx="200" cy="315" r="2" fill="#60a5fa" opacity="0.5"/>
+</svg>
