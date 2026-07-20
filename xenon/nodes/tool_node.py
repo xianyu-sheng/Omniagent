@@ -90,6 +90,18 @@ _BUILTIN_ACTION_TYPES: frozenset[str] = frozenset({
 })
 
 
+def _last_error_lines(stderr: str, max_chars: int = 300) -> str:
+    """从 stderr 尾部提取错误信息。
+
+    git 等工具把 info 行（如 "Cloning into..."）输出在前，
+    真正的错误（如 "fatal: ..."）在末尾。取后 max_chars 字符。
+    """
+    stderr = stderr.strip()
+    if len(stderr) <= max_chars:
+        return stderr
+    return "…" + stderr[-(max_chars - 1):]
+
+
 def _validate_register_module(module_path: str) -> tuple[bool, str]:
     """校验 register_tool 模式1 的 module_path 是否在安全白名单内。
 
@@ -2027,7 +2039,7 @@ class ToolNode(BaseNode):
                             "action_type": "clone_repo", "repo": repo,
                             "success": False,
                             "error": (
-                                f"git clone 失败 (branch={branch}): {stderr[:300]}"
+                                f"git clone 失败 (branch={branch}): {_last_error_lines(stderr)}"
                                 f"\n提示: 仓库可能不存在、已改名或需认证。可尝试用浏览器打开 {clone_url}"
                             ),
                         }
