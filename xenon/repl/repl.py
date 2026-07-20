@@ -211,6 +211,8 @@ class REPL:
         style = Style.from_dict({
             # 提示符 `>` — 灰底白字色块，醒目锚点
             "prompt": "bold #ffffff bg:#5c5c8a",
+            # 底部状态栏 — 暗色，不抢注意力
+            "bottom-toolbar": "dim #888888",
         })
 
         history_path = _HISTORY_DIR / "input_history.txt"
