@@ -119,6 +119,7 @@ class REPL:
         self._clipboard_monitor = ClipboardMonitor(
             on_image=self._on_clipboard_image
         )
+        self._logo_shown: bool = False       # 启动动画只播一次
 
         # v0.4.0: Auto router + model pool (replaces role_priority)
         from xenon.repl.model_pool import ModelPool
@@ -782,6 +783,15 @@ class REPL:
         版本、范式、模型、一个实用提示。用 Unicode 细线框替代 ASCII 艺术。
         """
         import random
+
+        # ── 启动动画 Logo（仅在交互模式播放）──
+        if not self._logo_shown and sys.stdout.isatty():
+            self._logo_shown = True
+            try:
+                from xenon.utils.logo import print_logo as _print_logo
+                _print_logo(animated=True, duration=2.0)
+            except Exception:
+                pass  # Logo 加载失败不影响启动
 
         mode = self.registry.get_current_mode()
         models = self.registry.list_models()
