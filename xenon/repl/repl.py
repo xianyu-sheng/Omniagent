@@ -558,15 +558,16 @@ class REPL:
     def _set_console_title() -> None:
         """设置控制台窗口标题。"""
         import sys
+        title = "✦ Xenon"
         if sys.platform == "win32":
             try:
                 import ctypes
-                ctypes.windll.kernel32.SetConsoleTitleW("🚀 Xenon")
+                ctypes.windll.kernel32.SetConsoleTitleW(title)
             except Exception:
                 pass
         else:
             # Linux/macOS 用 ANSI 转义
-            sys.stdout.write("\033]0;🚀 Xenon\007")
+            sys.stdout.write(f"\033]0;{title}\007")
             sys.stdout.flush()
 
     def run(self) -> None:
