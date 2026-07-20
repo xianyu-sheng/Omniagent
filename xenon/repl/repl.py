@@ -221,6 +221,7 @@ class REPL:
                 completer=self._completer,
                 key_bindings=kb,
                 style=style,
+                bottom_toolbar=self.status_bar.get_toolbar_text,
             )
         except Exception:
             logger.debug("prompt_toolkit 初始化失败，回退自建输入", exc_info=True)

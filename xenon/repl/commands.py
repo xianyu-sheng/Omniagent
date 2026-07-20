@@ -2837,6 +2837,7 @@ register_command(
 )
 
 
+@_handler("/cost")
 def _cmd_cost(*, args: str = "", session_state: dict = None, **kwargs: Any) -> str:
     """显示 DeepSeek 缓存命中率 + 费用明细面板。
 
