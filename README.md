@@ -8,11 +8,9 @@
 [![HumanEval](https://img.shields.io/badge/HumanEval_Pass@1-88.4%25_(official)-success.svg)](https://github.com/openai/human-eval)
 [![v0.6.0](https://img.shields.io/badge/version-0.6.0-orange.svg)](https://github.com/xianyu-sheng/Xenon/releases)
 
-![Xenon terminal demo](docs/assets/terminal-demo.svg)
+![Xenon terminal demo](docs/demo.gif)
 
-<video src="https://github.com/xianyu-sheng/Xenon/blob/main/docs/assets/demo.webm?raw=true" controls width="100%"></video>
-
-> 👆 完整终端操作录屏，含 dim 日志、引导线输入、斜杠命令、ReAct 工具调用等。
+*💡 DeepSeek 缓存命中率实时追踪：底部 toolbar 显示 💾96% 命中率 / 💰¥<0.01 费用 / 💡92% 节省，`/cost` 查看完整面板，退出时自动打印省钱报告。全部数据走本地确定性计算，零额外 LLM 消费。*
 
 > 12 家模型商、8 种推理范式、MCP + Smithery 7000+ 服务器库、断路器、上下文压缩、28 个内建技能——一个终端 Agent 该有的工程机制，这里都有。
 > 23K 行 Python，1110+ 测试，MIT 开源。**适合想深入理解 Agent 架构的开发者阅读、修改、二次开发。**
