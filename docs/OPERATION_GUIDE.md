@@ -77,7 +77,7 @@ xenon chat
 xenon chat -m anthropic/claude-3-5-sonnet
 
 # 指定多个模型（自动 Fallback）
-xenon chat -m anthropic/claude-3-5-sonnet openai/gpt-4o deepseek/deepseek-coder
+xenon chat -m anthropic/claude-3-5-sonnet openai/gpt-4o deepseek/deepseek-v4-pro
 
 # 指定思考范式
 xenon chat -m anthropic/claude-3-5-sonnet --mode plan-execute
@@ -143,7 +143,7 @@ xenon run config/default_flow.yaml --dry-run
 ```
 /set_model claude anthropic/claude-3-5-sonnet
 /set_model gpt openai/gpt-4o
-/set_model deepseek deepseek/deepseek-coder
+/set_model deepseek deepseek/deepseek-v4-pro
 /set_model local ollama/llama3 base_url=http://localhost:11434
 /set_model custom openai/gpt-4o api_key=sk-xxx base_url=https://proxy.example.com/v1
 ```
@@ -170,7 +170,7 @@ xenon run config/default_flow.yaml --dry-run
 
   [claude] anthropic/claude-3-5-sonnet
   [gpt] openai/gpt-4o
-  [deepseek] deepseek/deepseek-coder
+  [deepseek] deepseek/deepseek-v4-pro
 
 角色分配:
   planner: claude -> gpt
@@ -385,7 +385,7 @@ xenon run config/code_execution_flow.yaml \
 ### 5.2 交互模式中快速生成代码
 
 ```bash
-xenon chat -m deepseek/deepseek-coder
+xenon chat -m deepseek/deepseek-v4-pro
 ```
 
 ```
@@ -446,7 +446,7 @@ nodes:
 - id: "generate_code"
   type: "llm"
   model: "coder"                    # 引用 models.coder
-  # 或直接指定: model: "deepseek/deepseek-coder"
+  # 或直接指定: model: "deepseek/deepseek-v4-pro"
   # 或列表: model: ["anthropic/claude-3-5-sonnet", "openai/gpt-4o"]
   system_prompt: "你是一个 Python 专家"
   prompt: |
@@ -544,7 +544,7 @@ You> 什么是快速排序？请用 Python 实现
 ### 8.2 多模型 Fallback
 
 ```bash
-xenon chat -m anthropic/claude-3-5-sonnet openai/gpt-4o deepseek/deepseek-coder
+xenon chat -m anthropic/claude-3-5-sonnet openai/gpt-4o deepseek/deepseek-v4-pro
 ```
 
 ```

@@ -709,6 +709,17 @@ class REPL:
         if not calls:
             return 0
 
+        provider_messages = list(
+            getattr(engine, "_last_provider_messages", []) or []
+        )
+        provider_tool_results = sum(
+            1 for message in provider_messages
+            if isinstance(message, dict) and message.get("role") == "tool"
+        )
+        if provider_messages:
+            self.ctx_mgr.add_provider_messages(provider_messages)
+        protocol_covers_trace = provider_tool_results >= len(calls)
+
         import os as _os
 
         created: list[str] = []
@@ -722,13 +733,14 @@ class REPL:
             success = bool(getattr(call, "success", False))
             result = str(getattr(call, "result_summary", "") or "")
             error = getattr(call, "error", None)
-            self.ctx_mgr.add_tool_trace(
-                tool_name,
-                params,
-                success,
-                result=result,
-                error=str(error) if error else None,
-            )
+            if not protocol_covers_trace:
+                self.ctx_mgr.add_tool_trace(
+                    tool_name,
+                    params,
+                    success,
+                    result=result,
+                    error=str(error) if error else None,
+                )
             recent_activity.append({
                 "tool": tool_name,
                 "success": success,

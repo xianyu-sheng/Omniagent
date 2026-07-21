@@ -1,8 +1,8 @@
 # Xenon 架构设计
 
-> **设计哲学：让开发者零成本享受 DeepSeek 极致性价比。**
+> **设计哲学：让开发者可靠、透明、低成本地使用 DeepSeek。**
 >
-> 每一处抽象都 justified by 实际的缓存经济效益或工具执行可靠性。
+> 核心抽象围绕缓存经济效益、工具权限和失败恢复设计。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 🏛️ Pillar 1 — Cache-Aware Cost Loop（缓存感知的费用闭环）
 
-**问题：** DeepSeek API 的上下文缓存命中/未命中价差高达 120 倍，但官方没有提供命中率追踪工具。
+**问题：** 按 2026-07-21 官方价格，DeepSeek V4 API 的上下文缓存命中/未命中价差最高 120 倍；API 返回逐次 token 数据，但会话级命中率、成本和节省额仍需客户端聚合。
 
 **方案：** 三层监控体系，全部走本地确定性计算，零额外 LLM 消费。
 
@@ -29,8 +29,8 @@ L3 · 会话结束省钱报告
 ```
 
 **关键决策：**
-- 数据源 100% 来自 API 响应的 `usage.prompt_cache_hit/miss_tokens` 字段
-- 定价表本地硬编码（DeepSeek V4-Pro: hit ¥0.025 / miss ¥3.0 / output ¥6.0）
+- 数据源 100% 来自 API 响应的 `usage.prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 字段
+- 本地版本化价格快照（V4 Flash: ¥0.02 / ¥1 / ¥2；V4 Pro: ¥0.025 / ¥3 / ¥6；单位均为百万 token）
 - PromptOptimizer 自动分离静态/动态内容，最大化前缀匹配窗口
 
 **与 Reasonix Prefix-Cache Stability 的差异：**
@@ -60,7 +60,7 @@ AutoRouter（任务难度评估 + 意图检测）
 │ react-reflection · ReAct + 反思审查      │
 └─────────────────────────────────────────┘
     ↓
-ModelPool（12 家模型商 · 3 Tier 分级 · 故障自动转移）
+    ModelPool（11 家模型商预设 · 3 Tier 分级 · 故障自动转移）
 ```
 
 **关键决策：**
@@ -96,7 +96,7 @@ Stage 6 · 结果封装     → 统一 {success, error, data} 格式
 
 ## 独有亮点
 
-### 1. 12 模型商 · 3 Tier 分级 · 故障自动转移
+### 1. 11 家模型商预设 · 3 Tier 分级 · 故障自动转移
 
 ```
 Tier 1 · DeepSeek (主力推理)
@@ -149,7 +149,7 @@ xenon/
 │   ├── repl.py       · 主循环（2400 行，模式分发 + 上下文桥接）
 │   ├── commands.py   · 命令注册（/cost /vision /mode /model ...）
 │   ├── status_bar.py · 三段式 toolbar（💾缓存 / 模型·范式 / Token）
-│   ├── model_pool.py · 模型池（12 家 / 3 Tier / 故障转移）
+│   ├── model_pool.py · 模型池（11 家预设 / 3 Tier / 故障转移）
 │   └── auto_router.py · 任务难度评估 + 模型路由
 ├── nodes/            · 工具执行管线
 │   ├── tool_node.py  · 26 个工具实现（2600 行）
@@ -157,13 +157,13 @@ xenon/
 ├── tools/            · 惰性加载工具
 │   ├── vision_bridge.py  · 视觉桥接器（多模态→文字→DeepSeek）
 │   └── clipboard_monitor.py · 全局热键监听（Ctrl+Alt+V）
-├── mcp/              · MCP 协议（Smithery 7000+ 服务器）
+├── mcp/              · MCP 协议（stdio / Streamable HTTP）
 ├── utils/            · 基础能力
-│   ├── llm_client.py     · LLM 客户端（12 家 API 适配）
+│   ├── llm_client.py     · 多厂商 LLM 客户端
 │   ├── deepseek_cache.py · 缓存追踪器（SHA256 + 滚动窗口）
 │   ├── response_adapter.py · 输出解析（JSON 提取 + 字段别名）
 │   └── logo.py          · 启动动画（氙气轨道 Σ-3）
-└── tests/            · 131 用例 · pytest
+└── tests/            · 离线 / live / e2e 分层的 pytest 测试
 ```
 
 ---
@@ -172,20 +172,21 @@ xenon/
 
 1. **缓存优先** — 任何可能影响 DeepSeek 缓存命中率的设计决策，优先选择对齐缓存的方案
 2. **失败要可见** — 工具失败、模型降级、引擎回退全部输出到终端，不做静默降级
-3. **默认零成本** — 费用追踪、缓存检测、模型路由全部本地计算，不额外消耗 token
+3. **观测不增耗** — 费用追踪、缓存检测、模型路由均在本地计算，不额外消耗 token
 4. **惰性优于预加载** — 视觉桥接、热键监听、MCP 连接全部按需初始化
 5. **深度适配 > 泛泛支持** — DeepSeek 缓存优化深度远超其他模型，优先投入 Tier 1
 
 ---
 
-## 与 Reasonix 的对比
+## 与 Reasonix 的工程取向对照
+
+Reasonix 是公开的第三方参考项目，不是 DeepSeek 发布的“官方指定标准”。下表只依据其公开工程规范比较取向，不代表 DeepSeek 背书或认证。
 
 | 维度 | Reasonix | Xenon |
 |------|----------|-------|
-| 缓存策略 | 消息排序防失效 | 三层监控 + 提示词自动对齐 |
-| 引擎数量 | 单一 ReAct | 8 种范式自动路由 |
-| 工具执行 | Tool-Call Repair | 7 阶段管线 + 断路器 |
-| 模型支持 | DeepSeek-native | 12 家 · 3 Tier · 故障转移 |
-| 多模态 | 无 | Vision Bridge（任意模型→DeepSeek） |
-| 语言 | TypeScript → Go | Python 3.11+ |
-| 核心指标 | "Leave it running" | "零成本享受 DeepSeek 极致性价比" |
+| 分发 | Go 单一静态二进制、跨平台构建 | Python 3.10+ 包与 `xenon` CLI |
+| 核心扩展 | 配置/注册表驱动，内置与 MCP 插件 | 8 种引擎、26 个内置工具与 MCP |
+| 工具安全 | allow/ask/deny 策略、工具契约 | 权限闸门、事务化写入、结构化失败与断路器 |
+| 恢复 | 检查点、恢复规范与持久会话 | 自动保存、跨轮工具轨迹、工作记忆与模型恢复 |
+| 主机集成 | ACP、远程与多客户端能力 | 当前以终端 TUI 为主，尚未实现 ACP |
+| DeepSeek 观测 | 供应商配置与价格元数据 | V4 思考模式工具续轮、缓存命中率与人民币费用追踪 |

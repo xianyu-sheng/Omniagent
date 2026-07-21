@@ -106,6 +106,13 @@ class ModelRegistry:
             alias: 简短别名
             **kwargs: api_key, base_url, max_tokens, temperature, context_window, weight
         """
+        normalized_model = model_id.lower().rsplit("/", 1)[-1]
+        if (
+            "context_window" not in kwargs
+            and normalized_model in {"deepseek-v4-pro", "deepseek-v4-flash"}
+        ):
+            # DeepSeek 官方 V4 模型规格（核对日期 2026-07-21）。
+            kwargs["context_window"] = 1_000_000
         config = ModelConfig(model_id=model_id, alias=alias, **kwargs)
         self.models[alias] = config
         return config

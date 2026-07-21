@@ -31,8 +31,9 @@ import yaml
 
 
 # ══════════════════════════════════════════════════════════════
-# DeepSeek 定价表（2025 年 7 月，来自官方 API 文档）
+# DeepSeek 定价表（核对日期：2026-07-21，来自官方中文 API 文档）
 # 单位：元 / 百万 tokens
+# https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
 # ══════════════════════════════════════════════════════════════
 
 # 默认定价（当无法匹配具体模型时使用 V4-Pro 定价）
@@ -45,18 +46,29 @@ _DEFAULT_PRICING = {
 # 按模型细分的定价
 _MODEL_PRICING: dict[str, dict[str, float]] = {
     "deepseek-v4-pro": _DEFAULT_PRICING,
-    "deepseek-v4-base": {"input_cache_hit": 0.01, "input_cache_miss": 1.0, "output": 2.0},
-    "deepseek-r1": {"input_cache_hit": 0.025, "input_cache_miss": 3.0, "output": 8.0},
-    "deepseek-v3": {"input_cache_hit": 0.01, "input_cache_miss": 1.0, "output": 2.0},
-    "deepseek-chat": {"input_cache_hit": 0.01, "input_cache_miss": 1.0, "output": 2.0},
+    "deepseek-v4-flash": {
+        "input_cache_hit": 0.02,
+        "input_cache_miss": 1.0,
+        "output": 2.0,
+    },
+}
+
+# 旧别名在 2026-07-24 23:59（北京时间）前映射到 V4 Flash；保留价格
+# 映射只为历史 usage 账单，不再把它们暴露为可选模型。
+_LEGACY_MODEL_ALIASES = {
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek-v4-flash",
 }
 
 
 def _match_pricing(model_id: str) -> dict[str, float]:
-    """根据 model_id 匹配定价表（模糊匹配）。"""
-    key = model_id.lower().replace("deepseek/", "").replace("_", "-")
+    """根据 model_id 匹配当前官方定价；未知模型保守按 V4 Pro 估算。"""
+    key = model_id.lower().rsplit("/", 1)[-1].replace("_", "-")
+    key = _LEGACY_MODEL_ALIASES.get(key, key)
+    if key in _MODEL_PRICING:
+        return _MODEL_PRICING[key]
     for name, pricing in _MODEL_PRICING.items():
-        if name in key or key in name:
+        if name in key:
             return pricing
     return _DEFAULT_PRICING
 

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -71,6 +73,10 @@ class BaseEngine(ABC):
         # P3-Q2: 链路追踪 ID——每次 run() 起点生成，贯穿该 run 内所有 _call_llm
         # 调用与 fallback；调试多模型失败时可把散落日志串成一条链（§8.8.4）。
         self.run_id: str | None = None
+        # Native function-calling 的协议消息。pending 供当前工具执行轮消费；
+        # last_provider_messages 供 REPL 按原协议持久到后续用户轮次。
+        self._pending_native_response: Any = None
+        self._last_provider_messages: list[dict[str, Any]] = []
 
     def _begin_run(self) -> str:
         """P3-Q2: run() 起点调用——生成 run_id 并记日志，返回 run_id。
@@ -80,6 +86,8 @@ class BaseEngine(ABC):
         """
         from xenon.engine.trace import new_run_id, prefix
         self.run_id = new_run_id()
+        self._pending_native_response = None
+        self._last_provider_messages = []
         logging.getLogger("xenon.engine").info(
             f"{prefix(self.run_id)} run 开始 ({type(self).__name__})")
         return self.run_id
@@ -111,7 +119,7 @@ class BaseEngine(ABC):
         ]
         return min(windows) if windows else 128000
 
-    def _near_context_window(self, messages: list[dict[str, str]], ratio: float = 0.8) -> bool:
+    def _near_context_window(self, messages: list[dict[str, Any]], ratio: float = 0.8) -> bool:
         """F6: 估算 messages token 是否接近上下文窗口（默认 80%）。
 
         粗估（字符数//2）仅用于预算预警/拒绝大 observation，非精确计费。
@@ -119,7 +127,13 @@ class BaseEngine(ABC):
         window = self._context_window()
         if window <= 0:
             return False
-        est = sum(len(m.get("content", "")) for m in messages) // 2
+        def content_size(message: dict[str, Any]) -> int:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return len(content)
+            return len(json.dumps(content, ensure_ascii=False, default=str))
+
+        est = sum(content_size(message) for message in messages) // 2
         return est > ratio * window
 
     def _history_messages(
@@ -161,16 +175,20 @@ class BaseEngine(ABC):
 
     def _maybe_compact_messages(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         turn: int,
         every: int = 5,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         """F4 + v0.5.0 P0-2: 每 ``every`` 轮压缩 in-run messages，复用 F3 + 分层策略。
 
         新增：压缩前对工具观察消息（"Observation: ..."）做分类压缩，
         减少工具输出占用的 prompt 空间，让 LLM 摘要更聚焦于推理链。
         """
         if turn <= 0 or turn % every != 0:
+            return messages
+        # ContextManager 的摘要格式不能表达 provider-issued tool_call_id。
+        # 一旦存在原生工具协议消息，本轮保持原样，避免压缩后产生无效历史。
+        if any(message.get("role") == "tool" or message.get("tool_calls") for message in messages):
             return messages
         try:
             from xenon.repl.context_manager import ContextManager
@@ -558,6 +576,7 @@ class BaseEngine(ABC):
         ``content``（由调用方 ``parse_react``）。无 ``tools_schema`` 且无
         ``response_format`` 时直接回退 ``_call_llm``。
         """
+        self._pending_native_response = None
         if not tools_schema and not response_format:
             return self._call_llm(messages, max_tokens=max_tokens)
 
@@ -575,6 +594,7 @@ class BaseEngine(ABC):
                 continue  # 本层降级，试下一层
             if resp.has_tool_calls:
                 logger.info(f"_call_llm_native {tier_name} 拿到原生 tool_calls")
+                self._pending_native_response = resp
                 return self._tool_calls_to_react_json(resp.tool_calls)
             if resp.content and resp.content.strip():
                 logger.info(f"_call_llm_native {tier_name} 返回文本（parse_react）")
@@ -583,6 +603,66 @@ class BaseEngine(ABC):
 
         logger.warning("_call_llm_native 三层全败，回退 _call_llm")
         return self._call_llm(messages, max_tokens=max_tokens)
+
+    def _has_pending_native_tool_calls(self) -> bool:
+        """当前响应是否包含尚未写回历史的原生工具调用。"""
+        response = self._pending_native_response
+        return bool(response is not None and getattr(response, "has_tool_calls", False))
+
+    def _consume_native_tool_messages(
+        self,
+        observations: list[str],
+    ) -> list[dict[str, Any]]:
+        """生成可继续调用 DeepSeek/OpenAI 的完整工具协议消息。
+
+        DeepSeek V4 思考模式要求工具调用后的请求带回 assistant 的
+        ``reasoning_content``、``tool_calls`` 以及逐个 ``tool_call_id`` 对应的
+        tool result。这里使用 API 原始 assistant message，并只补齐缺失字段。
+        """
+        response = self._pending_native_response
+        self._pending_native_response = None
+        if response is None or not getattr(response, "has_tool_calls", False):
+            return []
+
+        tool_calls = list(getattr(response, "tool_calls", []) or [])
+        if len(tool_calls) != len(observations):
+            logger.warning(
+                "原生工具调用与观察结果数量不一致 (%s != %s)，回退普通观察消息",
+                len(tool_calls),
+                len(observations),
+            )
+            return []
+
+        assistant = copy.deepcopy(getattr(response, "assistant_message", None) or {})
+        assistant["role"] = "assistant"
+        assistant["content"] = assistant.get("content") or ""
+        if getattr(response, "reasoning_content", "") and not assistant.get("reasoning_content"):
+            assistant["reasoning_content"] = response.reasoning_content
+        if not assistant.get("tool_calls"):
+            assistant["tool_calls"] = [
+                {
+                    "id": call.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": call.get("name", ""),
+                        "arguments": json.dumps(
+                            call.get("arguments", {}) or {}, ensure_ascii=False
+                        ),
+                    },
+                }
+                for call in tool_calls
+            ]
+
+        protocol_messages: list[dict[str, Any]] = [assistant]
+        for call, observation in zip(tool_calls, observations):
+            protocol_messages.append({
+                "role": "tool",
+                "tool_call_id": str(call.get("id", "")),
+                "content": observation,
+            })
+
+        self._last_provider_messages.extend(copy.deepcopy(protocol_messages))
+        return protocol_messages
 
     # ── F2: 合成提示注入 ─────────────────────────────────────
 

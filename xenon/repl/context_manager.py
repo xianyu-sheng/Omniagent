@@ -289,6 +289,44 @@ class ContextManager:
         )
         self.end_semantic_group(group_id)
 
+    def add_provider_messages(self, messages: list[dict[str, Any]]) -> int:
+        """Keep native provider protocol messages for active-session replay.
+
+        The exact payload is volatile metadata: it is used by ``get_messages``
+        during the current process so DeepSeek can continue thinking-mode tool
+        calls across user turns. Session export intentionally drops the raw
+        payload and keeps only a bounded human-readable summary, avoiding the
+        persistence of long reasoning traces or unredacted tool output.
+        """
+        added = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", ""))
+            if role not in {"assistant", "tool"}:
+                continue
+            raw_content = message.get("content", "")
+            if isinstance(raw_content, str) and raw_content:
+                summary = raw_content[:2000]
+            elif message.get("tool_calls"):
+                names = []
+                for call in message.get("tool_calls", []):
+                    function = call.get("function", {}) if isinstance(call, dict) else {}
+                    name = str(function.get("name", ""))
+                    if name:
+                        names.append(name)
+                summary = f"[原生工具调用: {', '.join(names) or 'unknown'}]"
+            else:
+                summary = "[原生工具协议消息]"
+            self.add_message(
+                role,
+                summary,
+                turn_type="tool_call" if role == "assistant" else "tool_result",
+                metadata={"api_message": copy.deepcopy(message)},
+            )
+            added += 1
+        return added
+
     def add_user_message(self, content: str) -> None:
         self.add_message("user", content)
 
@@ -298,7 +336,7 @@ class ContextManager:
     def add_system_message(self, content: str) -> None:
         self.add_message("system", content)
 
-    def get_messages(self, *, include_working_memory: bool = False) -> list[dict[str, str]]:
+    def get_messages(self, *, include_working_memory: bool = False) -> list[dict[str, Any]]:
         """Convert history to API-safe messages.
 
         Persisted tool turns intentionally do not pretend to be native function
@@ -307,13 +345,16 @@ class ContextManager:
         as user observations while retaining role=tool in ``history`` for
         compaction, routing and session inspection.
         """
-        messages: list[dict[str, str]] = []
+        messages: list[dict[str, Any]] = []
         if include_working_memory:
             memory = self.working_memory_prompt()
             if memory:
                 messages.append({"role": "system", "content": memory})
         for turn in self.history:
-            if turn.role == "tool":
+            api_message = (turn.metadata or {}).get("api_message")
+            if isinstance(api_message, dict):
+                messages.append(copy.deepcopy(api_message))
+            elif turn.role == "tool":
                 tool_name = str((turn.metadata or {}).get("tool_name", "unknown"))
                 messages.append({
                     "role": "user",
@@ -331,7 +372,11 @@ class ContextManager:
                 "content": turn.content,
                 "model_used": turn.model_used,
                 "node_id": turn.node_id,
-                "metadata": self._safe_context_value(turn.metadata),
+                "metadata": self._safe_context_value({
+                    key: value
+                    for key, value in (turn.metadata or {}).items()
+                    if key != "api_message"
+                }),
                 "task_tier": turn.task_tier,
                 "turn_type": turn.turn_type,
                 "semantic_group_id": turn.semantic_group_id,

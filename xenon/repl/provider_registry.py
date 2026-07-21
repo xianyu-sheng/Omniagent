@@ -27,6 +27,12 @@ MODEL_LIST_TIMEOUT = 8.0
 logger = logging.getLogger(__name__)
 MODEL_FETCH_ERRORS: dict[str, str] = {}
 
+_DEEPSEEK_RETIRED_MODEL_NAMES = frozenset({
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-coder",
+})
+
 
 @dataclass
 class ProviderInfo:
@@ -64,7 +70,7 @@ PROVIDERS: dict[str, ProviderInfo] = {
         key="deepseek",
         base_url="https://api.deepseek.com/v1",
         env_key="DEEPSEEK_API_KEY",
-        models=["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-coder", "deepseek-reasoner"],
+        models=["deepseek-v4-pro", "deepseek-v4-flash"],
         model_list_path="https://api.deepseek.com/models",
     ),
     "google": ProviderInfo(
@@ -148,7 +154,7 @@ def get_all_model_ids() -> list[str]:
 def find_model_id(short_name: str) -> str | None:
     """
     根据短名查找完整的 model_id。
-    例: "deepseek-coder" -> "deepseek/deepseek-coder"
+    例: "deepseek-v4-pro" -> "deepseek/deepseek-v4-pro"
     """
     for p in PROVIDERS.values():
         if short_name in p.models:
@@ -336,6 +342,11 @@ def get_configured_providers(*, refresh_models: bool = True) -> list[ProviderInf
         if refresh_models:
             models = fetch_provider_models(info, api_key)
             if models:
+                if key == "deepseek":
+                    models = [
+                        model for model in models
+                        if model not in _DEEPSEEK_RETIRED_MODEL_NAMES
+                    ]
                 # v0.3.0+ 修复（B-3）：拉取的列表按内置 info.models 顺序重排
                 # 通用机制：内置"已知能力排序"（如 deepseek-v4-pro > v4-flash）
                 # 优先于外部 API 返回顺序——外部 API 顺序由服务器决定

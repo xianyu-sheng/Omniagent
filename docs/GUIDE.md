@@ -89,9 +89,14 @@ it, then passes the description to your main reasoning model:
 
 | Model | Best for | Cache support |
 |-------|----------|--------------|
-| `deepseek-chat` (V3) | General tasks | Yes |
-| `deepseek-reasoner` (R1) | Complex reasoning | Yes |
-| `deepseek-v4-pro` | Long context, advanced reasoning | Yes |
+| `deepseek-v4-pro` | Coding, complex agents, advanced reasoning | Yes |
+| `deepseek-v4-flash` | Fast, high-concurrency and cost-efficient tasks | Yes |
+
+Both V4 models support thinking and non-thinking modes, tool calls, a 1M-token
+context window, and up to 384K output. The legacy `deepseek-chat` and
+`deepseek-reasoner` aliases are not presented by Xenon's offline fallback because
+DeepSeek will retire them on 2026-07-24 23:59 Beijing time. When online, Xenon
+still discovers the model list from your endpoint rather than assuming it.
 
 > **Cache savings**: Xenon's CacheTracker automatically shows how much
 > you save via DeepSeek's context caching. Hit `/cost` to see real-time numbers.

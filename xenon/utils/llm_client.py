@@ -67,6 +67,7 @@ class LLMResponse:
     """chat_completion_with_tools 的结构化返回。
 
     - content: 模型文本回复（可能为空，当模型仅发起 tool_call 时）
+    - reasoning_content: 思考模型返回的推理内容；工具调用续轮必须保留
     - tool_calls: 原生 FC 解析出的工具调用列表，每项形如
       {"id": str, "name": str, "arguments": dict}；无工具调用时为空列表
     - finish_reason: OpenAI 风格的结束原因（stop|tool_calls|length|...）
@@ -75,10 +76,13 @@ class LLMResponse:
     """
 
     content: str = ""
+    reasoning_content: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = ""
     usage: LLMUsage = field(default_factory=LLMUsage)
     raw: dict[str, Any] | None = None
+    provider: str = ""
+    assistant_message: dict[str, Any] | None = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -722,14 +726,8 @@ def _call_anthropic_once(
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
-    # Anthropic 要求 system 单独传递
-    system_text = ""
-    chat_messages = []
-    for msg in messages:
-        if msg["role"] == "system":
-            system_text = msg["content"]
-        else:
-            chat_messages.append(msg)
+    # Anthropic 要求 system 单独传递，并使用 content blocks 表示工具往返。
+    system_text, chat_messages = _messages_for_anthropic(messages)
 
     payload: dict[str, Any] = {
         "model": endpoint.model_name,
@@ -822,6 +820,67 @@ def _parse_anthropic_tool_calls(blocks: list[Any]) -> tuple[str, list[dict[str, 
                 "arguments": b.get("input") or {},
             })
     return "".join(text_parts), tool_calls, ""
+
+
+def _messages_for_anthropic(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """把内部 OpenAI 风格历史转换为 Anthropic messages。
+
+    Xenon 将原生工具往返统一保存为 OpenAI 风格，方便 DeepSeek 与其他兼容
+    端点原样续轮。模型回退到 Anthropic 时，在边界处转换为 ``tool_use`` /
+    ``tool_result`` blocks，避免跨厂商 fallback 因历史格式不兼容而失败。
+    """
+    system_parts: list[str] = []
+    chat_messages: list[dict[str, Any]] = []
+    pending_results: list[dict[str, Any]] = []
+
+    def flush_tool_results() -> None:
+        if pending_results:
+            chat_messages.append({"role": "user", "content": list(pending_results)})
+            pending_results.clear()
+
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if role == "system":
+            flush_tool_results()
+            system_parts.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+            continue
+        if role == "tool":
+            pending_results.append({
+                "type": "tool_result",
+                "tool_use_id": str(message.get("tool_call_id", "")),
+                "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
+            })
+            continue
+
+        flush_tool_results()
+        if role == "assistant" and message.get("tool_calls"):
+            blocks: list[dict[str, Any]] = []
+            if content:
+                blocks.append({"type": "text", "text": str(content)})
+            for tool_call in message.get("tool_calls", []):
+                function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+                arguments = function.get("arguments", {})
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        arguments = {"_raw": arguments}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": str(tool_call.get("id", "")),
+                    "name": str(function.get("name", "")),
+                    "input": arguments if isinstance(arguments, dict) else {},
+                })
+            chat_messages.append({"role": "assistant", "content": blocks})
+            continue
+
+        chat_messages.append({"role": role, "content": content})
+
+    flush_tool_results()
+    return "\n\n".join(part for part in system_parts if part), chat_messages
 
 
 def chat_completion_with_tools(
@@ -919,6 +978,15 @@ def _call_openai_compat_with_tools(
         payload["response_format"] = response_format
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
+        # DeepSeek V4 默认开启思考模式，而服务端不允许思考模式与
+        # required/none/指定函数等强制选择同时使用。此时优先保证
+        # tool_choice 语义，仅关闭这一次请求的思考模式。
+        if (
+            endpoint.provider == "deepseek"
+            and endpoint.model_name.startswith("deepseek-v4-")
+            and tool_choice != "auto"
+        ):
+            payload["thinking"] = {"type": "disabled"}
 
     client = _get_pooled_client(endpoint, timeout)
     resp = client.post(url, json=payload, headers=headers, timeout=timeout)
@@ -929,10 +997,19 @@ def _call_openai_compat_with_tools(
     choice = data.get("choices", [{}])[0]
     msg = choice.get("message", {})
     content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or msg.get("thinking") or ""
     finish = choice.get("finish_reason", "")
     tool_calls = _parse_openai_tool_calls(msg)
-    return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish,
-                       usage=_extract_usage(data, endpoint.provider), raw=data)
+    return LLMResponse(
+        content=content,
+        reasoning_content=reasoning,
+        tool_calls=tool_calls,
+        finish_reason=finish,
+        usage=_extract_usage(data, endpoint.provider),
+        raw=data,
+        provider=endpoint.provider,
+        assistant_message=dict(msg),
+    )
 
 
 def _call_anthropic_with_tools(
@@ -956,13 +1033,7 @@ def _call_anthropic_with_tools(
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
-    system_text = ""
-    chat_messages: list[dict[str, Any]] = []
-    for msg in messages:
-        if msg["role"] == "system":
-            system_text = msg["content"]
-        else:
-            chat_messages.append(msg)
+    system_text, chat_messages = _messages_for_anthropic(messages)
 
     if response_format and "json" in json.dumps(response_format).lower():
         system_text = (system_text + "\n\n" if system_text else "") + "请严格以合法 JSON 输出，不要包含多余文本。"
@@ -1002,8 +1073,29 @@ def _call_anthropic_with_tools(
     # Anthropic stop_reason → OpenAI 风格 finish_reason
     stop = data.get("stop_reason", "")
     finish = "tool_calls" if stop == "tool_use" else ("length" if stop == "max_tokens" else stop or "stop")
-    return LLMResponse(content=text, tool_calls=tool_calls, finish_reason=finish,
-                       usage=_extract_usage(data, endpoint.provider), raw=data)
+    canonical_calls = [
+        {
+            "id": call.get("id", ""),
+            "type": "function",
+            "function": {
+                "name": call.get("name", ""),
+                "arguments": json.dumps(call.get("arguments", {}), ensure_ascii=False),
+            },
+        }
+        for call in tool_calls
+    ]
+    assistant_message: dict[str, Any] = {"role": "assistant", "content": text}
+    if canonical_calls:
+        assistant_message["tool_calls"] = canonical_calls
+    return LLMResponse(
+        content=text,
+        tool_calls=tool_calls,
+        finish_reason=finish,
+        usage=_extract_usage(data, endpoint.provider),
+        raw=data,
+        provider=endpoint.provider,
+        assistant_message=assistant_message,
+    )
 
 
 # ── 流式调用接口 ──────────────────────────────────────────
@@ -1112,13 +1204,7 @@ def _stream_anthropic(
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
-    system_text = ""
-    chat_messages = []
-    for msg in messages:
-        if msg["role"] == "system":
-            system_text = msg["content"]
-        else:
-            chat_messages.append(msg)
+    system_text, chat_messages = _messages_for_anthropic(messages)
 
     payload: dict[str, Any] = {
         "model": endpoint.model_name,

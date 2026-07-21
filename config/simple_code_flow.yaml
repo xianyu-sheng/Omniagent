@@ -6,12 +6,10 @@ workflow: "simple-code-execution"
 
 models:
   planner:
-    - "anthropic/claude-3-5-sonnet"
-    - "openai/gpt-4o"
+    - "deepseek/deepseek-v4-pro"
   coder:
-    - "deepseek/deepseek-coder"
-    - "openai/gpt-4o-mini"
-    - "openai/gpt-4o"
+    - "deepseek/deepseek-v4-pro"
+    - "deepseek/deepseek-v4-flash"
 
 start_node: "generate_code"
 

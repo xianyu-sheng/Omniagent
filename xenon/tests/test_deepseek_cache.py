@@ -351,13 +351,21 @@ class TestCacheTrackerPricing:
         assert p["input_cache_miss"] == 3.0
         assert p["output"] == 6.0
 
-    def test_match_r1(self):
-        p = _match_pricing("deepseek/deepseek-r1")
-        assert p["output"] == 8.0
+    def test_match_v4_flash(self):
+        p = _match_pricing("deepseek/deepseek-v4-flash")
+        assert p == {
+            "input_cache_hit": 0.02,
+            "input_cache_miss": 1.0,
+            "output": 2.0,
+        }
 
-    def test_match_v3(self):
+    def test_legacy_chat_uses_flash_price_for_historical_usage(self):
         p = _match_pricing("deepseek-chat")
-        assert p["input_cache_hit"] == 0.01
+        assert p == _match_pricing("deepseek-v4-flash")
+
+    def test_legacy_reasoner_uses_flash_price_for_historical_usage(self):
+        p = _match_pricing("deepseek-reasoner")
+        assert p == _match_pricing("deepseek-v4-flash")
 
     def test_match_unknown_fallback(self):
         p = _match_pricing("some-unknown-model")

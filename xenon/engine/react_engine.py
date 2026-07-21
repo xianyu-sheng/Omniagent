@@ -343,7 +343,7 @@ class ReActEngine(BaseEngine):
         tools: dict[str, dict] | None = None,
         callback: EngineCallback | None = None,
         model_configs: dict[str, Any] | None = None,
-        native_fc: bool = False,
+        native_fc: bool | None = None,
         project_root: str | None = None,
         max_subagent_iterations: int = 6,
         max_subagent_depth: int = 1,
@@ -369,9 +369,17 @@ class ReActEngine(BaseEngine):
         self._tool_executor = ToolExecutor(permission_gate=permission_gate)
         # F2: 空洞回答检测器（无状态，实例共享）
         self._hollow = HollowDetector()
-        # F5: 原生 function-calling 三层降级开关（默认关——需逐模型验证 FC 兼容性，
-        # 见审计 §9 line 84 风险注）。开启后 run() 用 _call_llm_native 替代 _call_llm。
-        self.native_fc = native_fc
+        # F5: DeepSeek V4 的思考模式工具协议已经单元测试和真实 API
+        # 闭环验证，因此在它作为主模型时自动开启原生 function calling。
+        # 其他模型仍保持关闭，调用方也可显式传入 True/False 覆盖。
+        if native_fc is None:
+            primary = model_priority[0].lower() if model_priority else ""
+            self.native_fc = primary in {
+                "deepseek/deepseek-v4-pro",
+                "deepseek/deepseek-v4-flash",
+            }
+        else:
+            self.native_fc = native_fc
         # P2-E1: DirectoryScout 项目结构扫描（防路径幻觉）。仅当显式传入 project_root
         # 时启用：run() 启动时把真实文件树注入 user_input，让 LLM 基于真实文件规划。
         self._scout = DirectoryScout(project_root) if project_root else None
@@ -584,7 +592,10 @@ class ReActEngine(BaseEngine):
                     messages, tools_schema, response_format)
             else:
                 response = self._call_llm(messages)
-            messages.append({"role": "assistant", "content": response})
+            # 原生工具调用必须等工具执行完后，与 reasoning_content、tool_call_id
+            # 和 tool result 一起按协议写回；普通文本响应仍立即写入。
+            if not self._has_pending_native_tool_calls():
+                messages.append({"role": "assistant", "content": response})
 
             # 解析 LLM 输出
             parsed = self._parse_response(response)
@@ -724,6 +735,7 @@ class ReActEngine(BaseEngine):
                             continue
 
                 # ── 单工具 vs 多工具分发 ──
+                tool_observations: list[str] = []
                 if len(raw_actions) == 1:
                     # ── 单工具路径 ──
                     action = raw_actions[0]["action"]
@@ -749,6 +761,7 @@ class ReActEngine(BaseEngine):
                         else:
                             observation = self._execute_tool(action, action_input, ctx, tracker)
                     self.callback.on_observe(observation)
+                    tool_observations = [observation]
                 else:
                     # ── v0.5.0: 多工具并行路径 ──
                     logger.debug(f"ReAct 思考: {thought}")
@@ -758,38 +771,56 @@ class ReActEngine(BaseEngine):
 
                     # 过滤收束阶段禁用的工具
                     executable: list[dict] = []
-                    blocked: list[str] = []
+                    blocked: dict[int, str] = {}
                     for a in raw_actions:
                         # v0.6.3: 重复检测（并行路径中也检查）
                         dup_hint = self._check_duplicate_call(
                             a["action"], a.get("action_input", {}), iteration
                         )
                         if dup_hint:
-                            blocked.append(f"{a['action']}: 重复调用（{dup_hint[:60]}...）")
+                            blocked[id(a)] = f"重复调用（{dup_hint[:60]}...）"
                             continue
                         allow, reason = budget.allow_tool(a["action"])
                         if allow:
                             executable.append(a)
                         else:
-                            blocked.append(f"{a['action']}: {reason}")
+                            blocked[id(a)] = reason
 
                     # 并行执行
                     parallel_results = self._execute_tools_parallel(
                         executable, ctx, tracker,
                     )
+                    executed = {
+                        id(action): result for action, result in parallel_results
+                    }
                     observations: list[str] = []
-                    for a, obs in parallel_results:
-                        observations.append(f"[{a['action']}] {obs}")
-                    for b in blocked:
-                        observations.append(f"⚠️ [{b}]")
-                    observation = "\n\n".join(observations)
+                    for action in raw_actions:
+                        result = executed.get(id(action))
+                        if result is None:
+                            result = f"⚠️ {blocked.get(id(action), '未执行')}"
+                        tool_observations.append(result)
+                        observations.append(f"[{action['action']}] {result}")
                     for a, obs in parallel_results:
                         self.callback.on_observe(f"[{a['action']}] {obs[:200]}...")
+                    observation = "\n\n".join(observations)
 
                 # F6: 接近上下文窗口时拒绝大 observation（截断），防止下一轮超限
                 if self._near_context_window(messages):
                     self.callback.on_warning("接近上下文窗口，已截断本次工具输出")
-                    observation = observation[:500] + "\n...(已截断：接近上下文窗口)"
+                    tool_observations = [
+                        item[:500] + (
+                            "\n...(已截断：接近上下文窗口)"
+                            if len(item) > 500 else ""
+                        )
+                        for item in tool_observations
+                    ]
+                    if len(raw_actions) == 1:
+                        observation = tool_observations[0]
+                    else:
+                        observation = "\n\n".join(
+                            f"[{action['action']}] {item}"
+                            for action, item in zip(raw_actions, tool_observations)
+                        )
 
                 # 将观察结果加入对话
                 # v0.6.1: 简化包装 —— 保留防注入语义但不啰嗦
@@ -798,7 +829,13 @@ class ReActEngine(BaseEngine):
                     f"{observation}\n"
                     "[工具输出结束]"
                 )
-                messages.append({"role": "user", "content": obs_msg})
+                protocol_messages = self._consume_native_tool_messages(
+                    tool_observations
+                )
+                if protocol_messages:
+                    messages.extend(protocol_messages)
+                else:
+                    messages.append({"role": "user", "content": obs_msg})
                 logger.debug(f"ReAct 观察: {observation[:200]}")
                 no_tool_streak = 0
                 # F4: 每 5 轮压缩 in-run messages，抑制 O(n²) 增长；

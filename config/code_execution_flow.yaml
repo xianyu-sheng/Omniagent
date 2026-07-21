@@ -7,15 +7,12 @@ workflow: "code-execution"
 # ── 模型配置 ──────────────────────────────────────────────
 models:
   planner:
-    - "anthropic/claude-3-5-sonnet"
-    - "openai/gpt-4o"
+    - "deepseek/deepseek-v4-pro"
   coder:
-    - "deepseek/deepseek-coder"
-    - "openai/gpt-4o-mini"
-    - "openai/gpt-4o"
+    - "deepseek/deepseek-v4-pro"
+    - "deepseek/deepseek-v4-flash"
   reviewer:
-    - "openai/gpt-4o"
-    - "anthropic/claude-3-5-sonnet"
+    - "deepseek/deepseek-v4-pro"
 
 start_node: "analyze_task"
 

@@ -6,14 +6,13 @@ REPL 模块单元测试。
 
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
 
 import pytest
 
 from xenon.repl.context_manager import ContextManager
-from xenon.repl.model_registry import ModelRegistry, BUILTIN_MODES
+from xenon.repl.model_registry import ModelRegistry
 
 
 # ── Mock 辅助函数 ──────────────────────────────────────────
@@ -343,7 +342,13 @@ class TestProviderRegistry:
                 pass
 
             def json(self):
-                return {"data": [{"id": "deepseek-v4-pro"}, {"id": "deepseek-v4-flash"}]}
+                return {"data": [
+                    {"id": "deepseek-chat"},
+                    {"id": "deepseek-v4-pro"},
+                    {"id": "deepseek-reasoner"},
+                    {"id": "deepseek-v4-flash"},
+                    {"id": "deepseek-coder"},
+                ]}
 
         calls = []
 
@@ -971,7 +976,6 @@ class TestReactExceptionAssistantPlaceholder:
         repl = self._build_repl()
         repl.ctx_mgr.add_user_message("user msg to be cleaned")
         # Mock add_assistant_message 让其抛异常，触发 fallback trim_last_user
-        original_add = repl.ctx_mgr.add_assistant_message
         def failing_add(*args, **kwargs):
             raise RuntimeError("add failed")
         monkeypatch.setattr(repl.ctx_mgr, "add_assistant_message", failing_add)
@@ -1085,9 +1089,6 @@ class TestReadInputUnixPasteMode:
         流程：写入 bracketed paste start + content + paste end + \\r，
         然后从 _read_input_unix 的 select 循环中读输入。
         """
-        from xenon.repl.repl import REPL
-        import termios, sys
-
         # 模拟完整粘贴序列（含 \r 提交）
         full = "\x1b[200~" + content + "\x1b[201~\r"
         fake_stdin.feed(full)
@@ -1264,4 +1265,3 @@ class TestReadInputUnixPasteMode:
         assert not paste_mode, "paste end \\x1b[201~ 必须能关闭 paste_mode"
         # buffer 含 "X" + ESC + "Y"（ESC 被守卫 ② 整批追加保留）
         assert "".join(current_line) == "X\x1bY", f"buffer 错: {current_line!r}"
-

@@ -5,8 +5,6 @@
 - Anthropic：tools 转原生格式，解析 tool_use 块，tool_choice 映射，response_format 降级为 system 提示；
 - per-provider 长生命 httpx Client 池：同 endpoint 复用、close_clients 清空。
 """
-import json
-
 import xenon.utils.llm_client as llm
 from xenon.utils.llm_client import (
     LLMResponse,
@@ -120,6 +118,7 @@ class TestOpenaiFCPath:
             "choices": [{
                 "message": {
                     "content": None,
+                    "reasoning_content": "I should call echo.",
                     "tool_calls": [{"id": "c1", "type": "function",
                                     "function": {"name": "echo", "arguments": '{"text":"hi"}'}}],
                 },
@@ -137,6 +136,8 @@ class TestOpenaiFCPath:
         assert resp.has_tool_calls
         assert resp.tool_calls[0]["name"] == "echo"
         assert resp.finish_reason == "tool_calls"
+        assert resp.reasoning_content == "I should call echo."
+        assert resp.assistant_message["reasoning_content"] == "I should call echo."
         # 透传到 payload
         sent = fake.posts[0]["json"]
         assert sent["tools"][0]["function"]["name"] == "echo"
@@ -154,6 +155,31 @@ class TestOpenaiFCPath:
         )
         assert resp.content == '{"k":1}'
         assert fake.posts[0]["json"]["response_format"] == {"type": "json_object"}
+
+    def test_deepseek_v4_forced_tool_choice_disables_thinking(self, monkeypatch):
+        fake = _FakeClient()
+        fake.set_payload({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        })
+        endpoint = ModelEndpoint(
+            provider="deepseek",
+            model_name="deepseek-v4-flash",
+            base_url="https://api.deepseek.com/v1",
+            api_key="k",
+        )
+        monkeypatch.setattr(llm, "_get_pooled_client", lambda endpoint, timeout=120: fake)
+        monkeypatch.setattr(llm, "build_endpoint", lambda mid, c=None, b=None: endpoint)
+
+        chat_completion_with_tools(
+            "deepseek/deepseek-v4-flash",
+            [{"role": "user", "content": "call echo"}],
+            tools=[{"type": "function", "function": {"name": "echo", "parameters": {}}}],
+            tool_choice="required",
+        )
+
+        sent = fake.posts[0]["json"]
+        assert sent["tool_choice"] == "required"
+        assert sent["thinking"] == {"type": "disabled"}
 
     def test_no_tools_degrades_to_text(self, monkeypatch):
         fake = _FakeClient()

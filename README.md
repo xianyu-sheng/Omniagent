@@ -1,12 +1,12 @@
 # Xenon
 
-**让开发者零成本享受 DeepSeek 极致性价比。**
+**让开发者在终端里可靠、透明、低成本地使用 DeepSeek。**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)]()
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)]()
-[![Tests](https://img.shields.io/badge/tests-382-brightgreen.svg)]()
+[![CI](https://github.com/xianyu-sheng/Xenon/actions/workflows/ci.yml/badge.svg)](https://github.com/xianyu-sheng/Xenon/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/xianyu-sheng/Xenon/branch/main/graph/badge.svg)](https://codecov.io/gh/xianyu-sheng/Xenon)
-[![v0.6.2](https://img.shields.io/badge/version-0.6.2-orange.svg)](https://github.com/xianyu-sheng/Xenon/releases)
+[![v0.6.3](https://img.shields.io/badge/version-0.6.3-orange.svg)](https://github.com/xianyu-sheng/Xenon/releases)
 [![DeepSeek 缓存指南](https://img.shields.io/badge/DeepSeek-缓存最佳实践-1a73e8.svg)](docs/deepseek-guide.md)
 [![架构设计](https://img.shields.io/badge/📐-架构设计-8b5cf6.svg)](docs/ARCHITECTURE.md)
 
@@ -14,14 +14,14 @@
 
 ## 🏛️ 三大架构支柱
 
-> 不是又一个套壳 agent。每一处抽象都 justified by 实际的缓存经济效益或工具执行可靠性。
+> 不只是模型调用包装：核心抽象围绕缓存成本、工具权限和失败恢复设计。
 > 📐 完整设计哲学、目录结构、与 Reasonix 对比见 **[架构设计文档 →](docs/ARCHITECTURE.md)**
 
 ### Pillar 1 · Cache-Aware Cost Loop
 
 *缓存感知的费用闭环。全部本地计算，零额外 LLM 消费。*
 
-DeepSeek 上下文缓存命中/未命中价差高达 **120 倍**。Xenon 内置三层监控，让缓存效益**可见、可量化、可优化**。
+按 DeepSeek 2026-07-21 官方价格，V4 上下文缓存命中/未命中价差最高 **120 倍**。Xenon 内置三层监控，让缓存效益**可见、可量化、可优化**。
 
 ```
 L1 · StatusBar   💾96%  💰¥<0.01  💡92%    每次 API 调用毫秒级刷新
@@ -29,7 +29,7 @@ L2 · /cost       按模型拆分命中/未命中 token + 费用 breakdown + 节
 L3 · 退出报告    /exit 时自动打印总账单
 ```
 
-SHA256 去重 + 硬编码定价表 + PromptOptimizer 自动对齐前缀匹配窗口。
+SHA256 去重 + 本地版本化定价快照 + PromptOptimizer 自动对齐前缀匹配窗口。
 
 📖 **[DeepSeek 缓存最佳实践指南 →](docs/deepseek-guide.md)** · 📐 **[架构 §Pillar 1 →](docs/ARCHITECTURE.md#-pillar-1--cache-aware-cost-loop缓存感知的费用闭环)**
 
@@ -96,8 +96,8 @@ xenon                   # 启动 REPL，氙气轨道动画 Logo ✦
 | 类别 | 内容 |
 |------|------|
 | **推理范式** | 8 种（direct · react · plan-execute · reflection · novel + 4 组合） |
-| **模型商** | 12 家 · 3 Tier 分级 · 故障自动转移 |
-| **MCP 生态** | Smithery 7000+ 服务器 · 双传输 · 惰性加载 · `/mcp browse` 一键安装 |
+| **模型商** | 11 家预设 · 3 Tier 分级 · 故障自动转移 |
+| **MCP 生态** | Smithery 社区服务器 · 双传输 · 惰性加载 · `/mcp browse` 安装 |
 | **DeepSeek 缓存** | toolbar 实时 + `/cost` 面板 + 退出报告 + 命中率骤降告警 |
 | **视觉桥接** | `Ctrl+Alt+V` 粘贴 → 多模态转录 → DeepSeek 推理 · SHA256 去重 |
 | **工程可靠性** | 断路器 · 三阶段预算 · 空洞检测 · 6 步上下文压缩 |
@@ -105,18 +105,16 @@ xenon                   # 启动 REPL，氙气轨道动画 Logo ✦
 
 ---
 
-## 🆚 一句话差异
+## 🧭 设计重点
 
-Xenon 不是 IDE 替代品——是**深度控制面板**。你仍在 VSCode/JetBrains 里写代码，Xenon 在终端里精确控制模型、范式、费用。
+Xenon 不是 IDE 替代品，而是终端里的 AI 编程工作区：强调可观察的模型路由、费用、权限与工具执行轨迹。
 
-| 独有能力 | Xenon | 其他工具 |
-|----------|:-----:|:--------:|
-| 多范式引擎（8 种） | ✅ | ❌ |
-| DeepSeek 缓存追踪 | ✅ | ❌ |
-| 视觉桥接（任意模型组合） | ✅ | ❌ |
-| 工具断路器 + 三阶段预算 | ✅ | ❌ |
-| MCP 注册中心（7000+） | ✅ | 仅 Claude Code |
-| 12 家模型 · 故障转移 | ✅ | 部分 |
+| 重点 | Xenon 的实现 |
+|------|--------------|
+| DeepSeek 适配 | V4 模型发现、思考模式工具续轮、缓存与人民币费用追踪 |
+| 工具可靠性 | 权限闸门、结构化失败、断路器、事务化文件写入 |
+| 长任务连续性 | 跨轮工具轨迹、工作记忆、自动保存与恢复 |
+| 可扩展性 | 多模型 fallback、MCP、8 种执行范式 |
 
 ---
 
@@ -127,6 +125,7 @@ Xenon 不是 IDE 替代品——是**深度控制面板**。你仍在 VSCode/Jet
 | **[⚡ 快速上手指南](docs/GUIDE.md)** | 安装 → 配置 → 8 范式 → 多模型切换 → DeepSeek 接入（中英双语） |
 | **[架构设计](docs/ARCHITECTURE.md)** | 三大支柱详解 · 独有亮点 · 目录结构 · 设计原则 · vs Reasonix |
 | **[DeepSeek 缓存实践](docs/deepseek-guide.md)** | 原理 → 对齐策略 → 三层监控 → 费用对比 → 骤降诊断 |
+| **[DeepSeek 收录准备](docs/DEEPSEEK_INTEGRATION.md)** | 官方兼容性证据 · 收录 PR 文案 · 提交检查清单 |
 
 ---
 
@@ -146,7 +145,7 @@ pip install -e ".[dev]"
 | `/save` `/load` `/resume` `/clear` | 会话管理 |
 
 ```bash
-pytest tests/ -q    # 131 单元测试
+pytest tests xenon/tests -m "not live and not e2e" -q
 ```
 
 ---

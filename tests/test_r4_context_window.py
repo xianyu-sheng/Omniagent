@@ -14,6 +14,13 @@ class TestModelConfigContextWindow:
         reg.add_model("openai/gpt-4o", "gpt4", context_window=8000)
         assert reg.models["gpt4"].context_window == 8000
 
+    def test_deepseek_v4_uses_official_one_million_context_default(self):
+        reg = ModelRegistry()
+        reg.add_model("deepseek/deepseek-v4-pro", "ds-pro")
+        reg.add_model("deepseek/deepseek-v4-flash", "ds-flash")
+        assert reg.models["ds-pro"].context_window == 1_000_000
+        assert reg.models["ds-flash"].context_window == 1_000_000
+
 
 class TestContextWindowFor:
     def test_returns_min_window(self):

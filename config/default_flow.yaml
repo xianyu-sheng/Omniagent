@@ -8,14 +8,11 @@ workflow: "plan-and-execute"
 # 每个角色可配置多个模型，按优先级排列，第一个失败则自动切换到下一个
 models:
   planner:
-    - "anthropic/claude-3-5-sonnet"    # 优先：用强模型做规划
-    - "openai/gpt-4o"                  # 备选
+    - "deepseek/deepseek-v4-pro"       # 复杂规划
   executor:
-    - "deepseek/deepseek-coder"        # 优先：用性价比高的模型做执行
-    - "openai/gpt-4o-mini"             # 备选
+    - "deepseek/deepseek-v4-flash"     # 优先：用高性价比 V4 模型做执行
   reviewer:
-    - "openai/gpt-4o"                  # 审查用中等模型
-    - "anthropic/claude-3-5-sonnet"    # 备选
+    - "deepseek/deepseek-v4-pro"       # 代码审查
 
 # ── 工作流拓扑 ──────────────────────────────────────────
 start_node: "generate_plan"
