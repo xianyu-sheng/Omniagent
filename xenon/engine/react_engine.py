@@ -385,6 +385,64 @@ class ReActEngine(BaseEngine):
         self._subagent_history: list[str] = []
         self._last_tracker: ToolExecutionTracker | None = None  # run() 末态供父引擎读取
         self._last_subagent: ReActEngine | None = None  # 最近一次 spawn 的子引擎（调试/测试）
+        # v0.6.3: 重复工具调用检测 —— 记录最近 N 次 (tool_name, params_sig, turn)
+        self._recent_calls: list[tuple[str, str, int]] = []
+        self._max_recent_calls: int = 8
+
+    def _params_signature(self, params: dict[str, Any]) -> str:
+        """提取工具参数的特征签名，用于重复检测。
+
+        核心字段（路径/URL/repo/搜索词）保留原值，长文本只保留长度。
+        """
+        parts: list[str] = []
+        for k in sorted(params):
+            v = params[k]
+            if isinstance(v, str):
+                if len(v) > 50:
+                    # 长文本（文件内容等）：只记录长度，不比较内容
+                    parts.append(f"{k}:<str:{len(v)}>")
+                elif k in ("file_path", "path", "url", "repo", "city",
+                           "search_pattern", "action", "name"):
+                    parts.append(f"{k}:{v}")
+                else:
+                    parts.append(f"{k}:{v}")
+            elif isinstance(v, (list, dict)):
+                parts.append(f"{k}:<{type(v).__name__}:{len(v)}>")
+            else:
+                parts.append(f"{k}:{v}")
+        return "|".join(parts)
+
+    def _check_duplicate_call(
+        self, action: str, params: dict[str, Any], turn: int
+    ) -> str | None:
+        """检测重复工具调用。
+
+        同一工具 + 相同参数签名在第 N 次出现时（N>=3），返回提示消息；
+        否则记录并返回 None。
+
+        线程安全：仅主线程访问，无需加锁。
+        """
+        sig = self._params_signature(params)
+        same_count = sum(
+            1 for t, s, _ in self._recent_calls if t == action and s == sig
+        )
+        # 记录本次调用
+        self._recent_calls.append((action, sig, turn))
+        if len(self._recent_calls) > self._max_recent_calls:
+            self._recent_calls.pop(0)
+
+        if same_count >= 2:
+            # 三次相同调用 → 很可能在兜圈子
+            logger.warning(
+                f"ReAct: 重复工具调用 #{same_count + 1} {action}({sig[:120]})"
+            )
+            return (
+                f"⚠️ 你已连续 {same_count + 1} 次调用 {action} 且参数基本相同。"
+                f"请检查之前的 Observation 结果——如果信息已足够，直接给出 "
+                f"final_answer；如果不够，请改用其他工具（如 read_file 读取已发现"
+                f"的关键文件，或 search_files 精确搜索），不要重复相同的工具调用。"
+            )
+        return None
 
     def _build_system_prompt(self) -> str:
         import sys
@@ -457,6 +515,7 @@ class ReActEngine(BaseEngine):
         self._last_tracker = tracker  # P2-E5：供父引擎 spawn_agent 读取子 Agent 工具统计
         self._reset_interrupt()  # F6: 每轮 run 重置中断标志
         self._begin_run()  # P3-Q2: 生成本次 run 的链路 ID（贯穿所有 LLM 调用）
+        self._recent_calls.clear()  # v0.6.3: 每次 run 重置重复调用跟踪
         messages = [{"role": "system", "content": self.system_prompt}]
         # F4: ctx_mgr 注入时消费其（已压缩）消息，不再自行 [-10:] 截断；
         # 否则回退 AgentContext 的对话历史（保留 [-10:] 兜底）。
@@ -671,13 +730,21 @@ class ReActEngine(BaseEngine):
                     logger.debug(f"ReAct 行动: {action}({mask_sensitive_params(action_input)})")
                     self.callback.on_act(action, action_input)
 
-                    allow, gate_reason = budget.allow_tool(action)
-                    if not allow:
-                        observation = f"⚠️ {gate_reason}"
-                        self.callback.on_warning(gate_reason)
-                        logger.info(f"ReAct: 收束阶段拦截工具 {action}")
+                    # v0.6.3: 重复工具调用检测
+                    dup_hint = self._check_duplicate_call(action, action_input, iteration)
+                    if dup_hint:
+                        observation = dup_hint
+                        self.callback.on_warning(
+                            f"重复调用 {action}，注入提示引导模型换策略"
+                        )
                     else:
-                        observation = self._execute_tool(action, action_input, ctx, tracker)
+                        allow, gate_reason = budget.allow_tool(action)
+                        if not allow:
+                            observation = f"⚠️ {gate_reason}"
+                            self.callback.on_warning(gate_reason)
+                            logger.info(f"ReAct: 收束阶段拦截工具 {action}")
+                        else:
+                            observation = self._execute_tool(action, action_input, ctx, tracker)
                     self.callback.on_observe(observation)
                 else:
                     # ── v0.5.0: 多工具并行路径 ──
@@ -690,6 +757,13 @@ class ReActEngine(BaseEngine):
                     executable: list[dict] = []
                     blocked: list[str] = []
                     for a in raw_actions:
+                        # v0.6.3: 重复检测（并行路径中也检查）
+                        dup_hint = self._check_duplicate_call(
+                            a["action"], a.get("action_input", {}), iteration
+                        )
+                        if dup_hint:
+                            blocked.append(f"{a['action']}: 重复调用（{dup_hint[:60]}...）")
+                            continue
                         allow, reason = budget.allow_tool(a["action"])
                         if allow:
                             executable.append(a)
