@@ -1,6 +1,6 @@
 # Xenon 操作手册
 
-> 版本: 0.1.0 | 更新日期: 2026-06-01
+> 版本: 0.6.3 | 更新日期: 2026-07-21
 
 ---
 
@@ -24,8 +24,8 @@
 
 ```bash
 # 克隆项目
-git clone <repo-url>
-cd xenon
+git clone https://github.com/xianyu-sheng/Xenon.git
+cd Xenon
 
 # 安装（开发模式）
 pip install -e ".[dev]"
@@ -55,7 +55,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export DEEPSEEK_API_KEY="sk-..."
 ```
 
-> 优先级：环境变量 > 凭证文件
+> 优先级：凭证文件 > 环境变量。环境变量只补齐凭证文件中未配置的 provider。
 
 ### 1.3 验证安装
 
@@ -87,8 +87,12 @@ xenon chat -m anthropic/claude-3-5-sonnet --mode plan-execute
 
 启动后，直接输入文字即可与 AI 对话：
 
-```
-You> 帮我写一个 Python 快速排序算法
+```text
+───────────────────────────────────────────────
+  ❯ 帮我写一个 Python 快速排序算法
+───────────────────────────────────────────────
+
+  ● deepseek  ·  deepseek/deepseek-v4-pro  ·  direct  ·  context 0.3%  ·  Ctrl+O details  ·  Shift+Tab mode
 ```
 
 ### 2.3 运行工作流
@@ -105,14 +109,23 @@ xenon run config/default_flow.yaml --dry-run
 
 ## 3. 交互模式 (REPL)
 
-### 3.1 两种输入方式
+### 3.1 界面布局
+
+- 输入区的上下两条平行线贯穿终端宽度，下边界紧贴输入内容。
+- API、模型、范式、上下文、缓存和费用状态在下边界下方，固定于整个终端屏幕底端。
+- 最终回复和优化后的 Prompt 不使用大边框；辅助信息降低亮度，最终回复保持正常亮度。
+- 工具调用和探索日志默认折叠，`Ctrl+O` 展开/折叠上一次执行详情。
+
+详细视觉契约见 [TUI 设计与操作说明](TUI.md)。
+
+### 3.2 两种输入方式
 
 | 输入 | 行为 |
 |------|------|
 | 普通文本 | 发送给 AI 模型进行多轮对话 |
 | `/command args` | 执行斜杠命令 |
 
-### 3.2 会话生命周期
+### 3.3 会话生命周期
 
 ```
 启动 → 配置模型 → 对话 → 保存会话 → 退出
@@ -121,10 +134,10 @@ xenon run config/default_flow.yaml --dry-run
            /compact 压缩
 ```
 
-### 3.3 退出方式
+### 3.4 中断与退出
 
-- `Ctrl+C` — 中断当前操作
-- `Ctrl+D` — 退出程序
+- `Ctrl+C` 一次 — 中断当前操作
+- 空闲时连续两次 `Ctrl+C` — 退出程序
 
 ---
 
@@ -389,9 +402,9 @@ xenon chat -m deepseek/deepseek-v4-pro
 ```
 
 ```
-You> /code 写一个快速排序 --run
-You> /code 创建一个 Flask API --file app.py --run
-You> /code 写单元测试 --file tests/test_sort.py
+❯ /code 写一个快速排序 --run
+❯ /code 创建一个 Flask API --file app.py --run
+❯ /code 写单元测试 --file tests/test_sort.py
 ```
 
 ---
@@ -538,7 +551,7 @@ xenon chat -m anthropic/claude-3-5-sonnet
 ```
 
 ```
-You> 什么是快速排序？请用 Python 实现
+❯ 什么是快速排序？请用 Python 实现
 ```
 
 ### 8.2 多模型 Fallback
@@ -548,8 +561,8 @@ xenon chat -m anthropic/claude-3-5-sonnet openai/gpt-4o deepseek/deepseek-v4-pro
 ```
 
 ```
-You> /set_role planner claude gpt deepseek
-You> 帮我写一个 Web 爬虫
+❯ /set_role planner claude gpt deepseek
+❯ 帮我写一个 Web 爬虫
 ```
 
 > 如果 Claude 限流，自动切到 GPT-4o，再不行切 DeepSeek。
@@ -557,33 +570,33 @@ You> 帮我写一个 Web 爬虫
 ### 8.3 运行时切换模型
 
 ```
-You> /set_model gemini google/gemini-pro
-You> /set_role planner gemini
-You> /models    # 确认配置
-You> 重新帮我规划这个任务
+❯ /set_model gemini google/gemini-pro
+❯ /set_role planner gemini
+❯ /models    # 确认配置
+❯ 重新帮我规划这个任务
 ```
 
 ### 8.4 保存和恢复会话
 
 ```
-You> 帮我设计一个数据库方案
-You> ...（多轮对话）...
-You> /save db-design-session
-You> /exit
+❯ 帮我设计一个数据库方案
+❯ ...（多轮对话）...
+❯ /save db-design-session
+❯ /exit
 
 # 下次
 xenon chat
-You> /load db-design-session
-You> 继续上次的设计
+❯ /load db-design-session
+❯ 继续上次的设计
 ```
 
 ### 8.5 对话压缩
 
 ```
-You> ...（很长的对话）...
-You> /context    # 查看 token 用量
-You> /compact    # 压缩历史
-You> 继续刚才的工作
+❯ ...（很长的对话）...
+❯ /context    # 查看 token 用量
+❯ /compact    # 压缩历史
+❯ 继续刚才的工作
 ```
 
 ---
@@ -632,6 +645,6 @@ EOF
 
 **解决：**
 ```
-You> /context     # 查看用量
-You> /compact     # 压缩历史
+❯ /context     # 查看用量
+❯ /compact     # 压缩历史
 ```

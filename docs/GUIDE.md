@@ -6,10 +6,12 @@ and DeepSeek cache cost optimization.
 ## Installation
 
 ```bash
-pip install xenon
-# or bleeding edge:
-pip install git+https://github.com/xianyu-sheng/Xenon.git
+# Current v0.6.3 source (includes the new TUI):
+pip install -U "git+https://github.com/xianyu-sheng/Xenon.git"
 ```
+
+The `v0.6.3` tag and release package are still on the release checklist. Until
+they are published, installing from Git avoids accidentally using an older TUI.
 
 Requirements: Python 3.10+, Linux / macOS / Windows (PowerShell).
 
@@ -40,6 +42,30 @@ The tool automatically discovers available models from your API endpoint.
 ❯ /help                List all available commands
 ```
 
+## Terminal UI
+
+Xenon v0.6.3 keeps the existing engine architecture and replaces the high-frequency
+conversation layout:
+
+```text
+───────────────────────────────────────────────
+  ❯ Type a message
+───────────────────────────────────────────────
+
+  ● deepseek  ·  deepseek/deepseek-v4-pro  ·  react  ·  context 5.0%  ·  cache 89%  ·  ¥0.03  ·  Ctrl+O details  ·  Shift+Tab mode
+```
+
+- The two input rules span the terminal width. The lower rule belongs to the
+  input area; API/model state is a separate toolbar fixed to the screen bottom.
+- Assistant answers and optimized prompts no longer use large panels. Answers
+  keep normal brightness; metadata, HTTP logs, and helper text are dimmed.
+- Tool exploration is collapsed to one summary line by default. `Ctrl+O`
+  expands or collapses the previous execution trace.
+- Narrow terminals retain high-priority API/context fields and hide lower-priority
+  status items instead of wrapping the toolbar.
+
+See [TUI.md](TUI.md) for the complete layout contract, shortcuts, and fallback behavior.
+
 ### 8 Reasoning Paradigms
 
 | Mode | What it does | Best for |
@@ -60,7 +86,7 @@ The tool automatically discovers available models from your API endpoint.
 `ast_analyze` / `refactor` / `lsp_goto_def` / `lsp_find_refs` / `weather` / `datetime` /
 `spawn_agent` / `batch_write` / `batch_edit` / `diff_preview`
 
-Plus MCP integration — browse and install from 7000+ community tool servers:
+Plus MCP integration — browse and install community tool servers:
 
 ```
 ❯ /mcp browse
@@ -127,21 +153,25 @@ Or add models permanently in `/setup`:
 
 ## Architecture
 
-Xenon is built on three pillars:
+The v0.6.3 work hardens the existing components and refreshes the TUI; it does
+not replace Xenon's top-level architecture. The three pillars remain:
 
-1. **Multi-model abstraction** — Provider registry + model pool with automatic
-   failover. One API key outage won't kill your session.
-2. **8-engine reasoning** — From simple Q&A to plan-execute-reflect chains,
+1. **Cache-aware cost loop** — DeepSeek cache usage, estimated CNY cost, and
+   prompt-prefix alignment are observable without an extra model call.
+2. **8-engine auto-router** — From simple Q&A to plan-execute-reflect chains,
    each engine is a standalone module with pluggable callbacks.
-3. **Reliability pipeline** — Circuit breaker, budget manager, hollow answer
-   detector, context compressor. Every tool call passes 7 validation stages.
+3. **7-stage tool pipeline** — Parameter normalization, hallucination checks,
+   permissions, circuit breaking, execution, and structured results.
+
+Provider registry, ModelPool failover, and ContextManager remain supporting
+components inside those boundaries.
 
 Read the full breakdown in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Tips
 
 - **Shift+Tab** to cycle reasoning modes
-- **Ctrl+O** to expand/collapse the thinking panel
+- **Ctrl+O** to expand/collapse the previous execution details
 - **Ctrl+C** once to interrupt current engine, twice to exit
 - **`XENON_NO_PT=1 xenon`** to run without prompt-toolkit (plain readline mode)
 - **`/resume`** to list and restore previous sessions (auto-saved on exit)
@@ -166,7 +196,7 @@ Read the full breakdown in [ARCHITECTURE.md](ARCHITECTURE.md).
 git clone https://github.com/xianyu-sheng/Xenon.git
 cd Xenon
 pip install -e ".[dev]"
-pytest tests/ -q
+pytest tests xenon/tests -m "not live and not e2e" -q
 ```
 
 PRs welcome! Please include tests for new features.

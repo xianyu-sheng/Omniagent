@@ -6,6 +6,19 @@
 
 ---
 
+## v0.6.3 变更边界
+
+v0.6.3 **不是架构重写**。三大支柱、REPL 与引擎分层、ModelPool、ContextManager / AgentContext 双上下文以及 7 阶段工具管线仍然保持原有责任边界。
+
+| 变更类型 | v0.6.3 内容 | 是否改变顶层架构 |
+|----------|--------------|--------------------|
+| Bug 修复/可靠性 | 权限透传、事务化写入、模型恢复、GitHub URL、Plan 失败传播、跨轮轨迹 | 否，是对已有组件契约的补齐 |
+| DeepSeek 兼容性 | V4 模型/价格、思考模式工具续轮、强制 `tool_choice` 兼容 | 否，扩展原有 LLM 客户端与 ReAct 协议实现 |
+| 工程门禁 | 离线/live/e2e 分层、Python 3.10–3.12、覆盖率和打包检查 | 否，属于验证与发行工程 |
+| TUI 重新排版 | 双线输入区、固定底栏、无边框回复、折叠详情 | 不改引擎架构，但是明显的交互层变更 |
+
+---
+
 ## 三大架构支柱
 
 ### 🏛️ Pillar 1 — Cache-Aware Cost Loop（缓存感知的费用闭环）
@@ -16,7 +29,7 @@
 
 ```
 L1 · StatusBar 实时
-    💾96%  💰¥<0.01  💡92%
+    ● deepseek · context 3.1% · cache 99% · <¥0.01
     每次 API 调用后自动更新，毫秒级刷新
 
 L2 · /cost 完整面板
@@ -136,19 +149,35 @@ REPL 层      ContextManager  · 消息历史 · 用户增删改
 
 ---
 
+### 4. TUI 展示层（不是新引擎层）
+
+```text
+引擎事件 / 工具轨迹 / usage
+              ↓
+EngineCallback + ThinkingPanel 数据
+              ↓
+REPL 无边框渲染 + Ctrl+O 折叠
+              ↓
+prompt_toolkit 双线输入区 + 固定 bottom_toolbar
+```
+
+TUI 只消费引擎已有的回调和状态，不参与模型选择、推理循环或工具权限判定。`ThinkingPanel` 仍是内部的轨迹数据/渲染对象，但默认界面不再把它显示为大边框面板。详细布局契约见 [TUI 设计与操作说明](TUI.md)。
+
+---
+
 ## 目录结构
 
 ```
 xenon/
 ├── engine/           · 8 种推理引擎（react / plan-execute / reflection / novel + 组合）
 │   ├── base.py       · 引擎基类（LLM 调用 / 模型路由 / 权限闸门）
-│   ├── callbacks.py  · 回调体系（ConsoleCallback / ThinkingPanel）
+│   ├── callbacks.py  · 回调体系 + 可折叠执行轨迹数据
 │   ├── budget.py     · 三阶段软预算管理（探索→利用→收束）
 │   └── hollow_detector.py · 空洞回答检测
 ├── repl/             · 终端交互层
-│   ├── repl.py       · 主循环（2400 行，模式分发 + 上下文桥接）
+│   ├── repl.py       · 主循环、模式分发、上下文桥接与无边框渲染
 │   ├── commands.py   · 命令注册（/cost /vision /mode /model ...）
-│   ├── status_bar.py · 三段式 toolbar（💾缓存 / 模型·范式 / Token）
+│   ├── status_bar.py · 输入下边界 + 自适应固定底部 toolbar
 │   ├── model_pool.py · 模型池（11 家预设 / 3 Tier / 故障转移）
 │   └── auto_router.py · 任务难度评估 + 模型路由
 ├── nodes/            · 工具执行管线
