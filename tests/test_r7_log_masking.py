@@ -72,9 +72,7 @@ class TestConsoleCallbackOnActMasking:
         cb = ConsoleCallback(verbose=False)
         cb.on_act("write_file", {"content": "SECRET_PASSWORD", "api_key": "abc123xyz"})
         out = capsys.readouterr().out
-        # v0.6.2: 非 verbose 也输出工具调用行，但敏感参数已脱敏
-        assert "🔧 write_file" in out
+        # 非 TTY 不污染输出；TTY 只原地刷新一条瞬时活动行。
+        assert out == ""
         assert "SECRET_PASSWORD" not in out
         assert "abc123xyz" not in out  # API key 值不应暴露
-        # api_key 值被替换为 <masked len=N>
-        assert "<masked" in out

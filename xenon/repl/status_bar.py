@@ -1,5 +1,5 @@
 """
-Status Bar — 底部状态栏 (v0.5.5 · Reasonix 风格增强)。
+Status Bar — 输入区底部状态栏。
 
 在终端底部实时显示：
 - 当前模型 / auto-routing
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class StatusBar:
-    """Reasonix 风格底部状态栏。"""
+    """轻量、自适应的输入区状态栏。"""
 
     def __init__(
         self,
@@ -160,6 +160,7 @@ class StatusBar:
         iTerm, and the plain prompt_toolkit fallback.
         """
         try:
+            self._clear_expired_notification()
             stats = self.ctx_mgr.stats()
             mode = self.registry.get_current_mode()
             pct = self._parse_pct(stats["usage_ratio"])
@@ -169,34 +170,93 @@ class StatusBar:
             if len(model) > 28:
                 model = "…" + model[-27:]
 
-            state_class = (
-                "class:toolbar.danger" if stats["needs_compact"] else "class:toolbar.muted"
-            )
+            term_width = shutil.get_terminal_size((80, 24)).columns
+
+            provider_model = self._last_model or ""
+            provider = provider_model.split("/", 1)[0] if "/" in provider_model else "API"
+            if self._last_model:
+                api_style, api_text = "class:toolbar.good", f"  ● {provider}"
+            elif self.registry.list_models():
+                api_style, api_text = "class:toolbar.warning", "  ○ API configured"
+            else:
+                api_style, api_text = "class:toolbar.danger", "  ○ API /setup"
+
+            context_text = f"context {stats['usage_ratio']}"
+            if term_width < 42:
+                api_text = " ● API" if self._last_model else " ○ setup"
+                context_text = str(stats["usage_ratio"])
+
             usage_class = (
                 "class:toolbar.danger" if pct > 80 else
                 "class:toolbar.warning" if pct > 50 else
                 "class:toolbar.good"
             )
-            fragments = [
-                ("class:toolbar.brand", "  XENON "),
-                ("class:toolbar.separator", "│"),
-                ("class:toolbar.model", f"  {model}  "),
-                ("class:toolbar.separator", "│"),
-                ("class:toolbar.mode", f"  {mode.name}  "),
-                ("class:toolbar.separator", "│"),
-                (usage_class, f"  context {stats['usage_ratio']}  "),
-                ("class:toolbar.separator", "│"),
-                ("class:toolbar.muted", f"  {stats['total_messages']} messages · {self._fmt_duration(self.session_elapsed)}  "),
+            # (优先级, 样式, 文本)。先按优先级装入宽度预算，再按视觉顺序输出。
+            # 这样 60 列终端也不会因为长模型名或快捷键提示发生折行抖动。
+            groups: list[tuple[int, str, str]] = [
+                (0, api_style, api_text),
+                (1, "class:toolbar.model", model),
+                (2, "class:toolbar.mode", mode.name),
+                (0, usage_class, context_text),
             ]
-            if self._tool_call_count:
-                fragments.extend([("class:toolbar.separator", "│"), ("class:toolbar.muted", f"  🔧 {self._tool_call_count}  ")])
+
+            # 缓存和费用是 Xenon 的核心差异，优先于消息数/时长展示。
+            if self.cache_tracker:
+                total_cache = self.cache_tracker.cache_hits + self.cache_tracker.cache_misses
+                if total_cache > 0:
+                    groups.append((1, "class:toolbar.good", f"cache {self.cache_tracker.cache_hit_rate:.0%}"))
+                if self.cache_tracker.estimated_cost_yuan > 0:
+                    cost = self.cache_tracker.estimated_cost_yuan
+                    cost_text = "<¥0.01" if cost < 0.01 else f"¥{cost:.2f}"
+                    groups.append((2, "class:toolbar.muted", cost_text))
+
             if stats["needs_compact"]:
-                fragments.extend([("class:toolbar.separator", "│"), (state_class, "  ⚠ /compact  ")])
+                groups.append((0, "class:toolbar.danger", "⚠ /compact"))
             if self._notification:
-                fragments.extend([("class:toolbar.separator", "│"), ("class:toolbar.notice", f"  {self._notification}  ")])
+                groups.append((1, "class:toolbar.notice", self._notification))
+
+            if self._tool_call_count:
+                groups.append((3, "class:toolbar.muted", f"tools {self._tool_call_count}"))
+            groups.append((3, "class:toolbar.muted", self._fmt_duration(self.session_elapsed)))
+            groups.append((4, "class:toolbar.hint", "Ctrl+O details"))
+            groups.append((5, "class:toolbar.hint", "Shift+Tab mode"))
+
+            try:
+                from prompt_toolkit.utils import get_cwidth
+            except Exception:
+                get_cwidth = len
+
+            budget = max(16, term_width - 6)  # 给输入框两侧线条留空间
+            selected: set[int] = set()
+            used_width = 0
+            for priority in range(6):
+                for index, (item_priority, _style, text) in enumerate(groups):
+                    if item_priority != priority:
+                        continue
+                    extra = get_cwidth(text) + (5 if selected else 0)
+                    if priority == 0 or used_width + extra <= budget:
+                        selected.add(index)
+                        used_width += extra
+
+            fragments: list[tuple[str, str]] = []
+            for index, (_priority, item_style, text) in enumerate(groups):
+                if index not in selected:
+                    continue
+                if fragments:
+                    fragments.append(("class:toolbar.separator", "  ·  "))
+                fragments.append((item_style, text))
             return fragments
         except Exception:
             return [("class:toolbar.danger", "  状态不可用  ")]
+
+    def get_input_rule_fragments(self) -> list[tuple[str, str]]:
+        """返回紧贴输入区的完整下边界。"""
+        width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
+        return [("class:input.rule", "─" * width)]
+
+    def get_input_toolbar_fragments(self) -> list[tuple[str, str]]:
+        """兼容旧调用名；状态栏现在与下边界分行渲染。"""
+        return self.get_input_rule_fragments()
 
     def _toolbar_impl(self) -> str:
         stats = self.ctx_mgr.stats()

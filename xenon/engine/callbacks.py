@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import shutil
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -256,15 +258,35 @@ class ConsoleCallback(EngineCallback):
     """
     控制台回调，REPL 使用。
 
-    v0.6.1 修复：默认模式现在会实时输出工具调用和结果摘要，
-    不再完全静默。用户无需 Ctrl+O 就能看到执行进度。
-    verbose 模式额外输出思考过程和调试信息。
+    默认模式只在 TTY 的同一行更新紧凑活动状态，避免每次工具调用和观察
+    永久写入终端历史。完整轨迹保存在 ThinkingPanel 中，交给 Ctrl+O 展开。
+    verbose 模式仍逐条输出调试信息。
     """
 
     def __init__(self, *, verbose: bool = False) -> None:
         self.verbose = verbose
         self._panel = ThinkingPanel()
         self._tool_seq: int = 0  # 工具调用序号
+        self._activity_visible = False
+
+    def _update_activity(self, text: str) -> None:
+        """在同一终端行刷新活动摘要；非交互输出保持干净。"""
+        if self.verbose or not getattr(sys.stdout, "isatty", lambda: False)():
+            return
+        width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
+        clean = text.replace("\n", " ").strip()
+        if len(clean) > width - 4:
+            clean = clean[:width - 5] + "…"
+        sys.stdout.write(f"\r\033[2K  {clean}")
+        sys.stdout.flush()
+        self._activity_visible = True
+
+    def finish_activity(self) -> None:
+        """清除瞬时活动行，不把探索细节留在滚动历史中。"""
+        if self._activity_visible:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            self._activity_visible = False
 
     # ── 辅助 ──
     @staticmethod
@@ -313,17 +335,19 @@ class ConsoleCallback(EngineCallback):
         self._panel.add_action(action, action_input)
         self._tool_seq += 1
         brief = self._brief_params(action_input)
-        if brief:
-            # v0.6.1: 默认模式也输出工具调用状态行
+        if self.verbose and brief:
             seq_tag = f"#{self._tool_seq}" if self._tool_seq > 1 else ""
             print(f"  🔧 {action} {seq_tag}  →  {brief}")
-        else:
+        elif self.verbose:
             print(f"  🔧 {action}")
+        else:
+            suffix = f" · {brief}" if brief else ""
+            self._update_activity(f"⠿ exploring  {action}{suffix}  ·  Ctrl+O details")
 
     def on_observe(self, observation: str) -> None:
         self._panel.add_observation(observation)
         brief = self._brief_observation(observation)
-        if brief:
+        if self.verbose and brief:
             # 根据内容判断成功/失败
             is_error = any(kw in brief.lower() for kw in
                           ("错误", "error", "失败", "fail", "不存在", "not found",
@@ -333,28 +357,45 @@ class ConsoleCallback(EngineCallback):
         if self.verbose:
             obs_preview = observation[:300].replace("\n", " ")
             print(f"  [dim]👀 {obs_preview}[/dim]")
+        else:
+            marker = "✗" if self._panel.steps[-1].is_error else "✓"
+            self._update_activity(f"{marker} explored  {self._tool_seq} tool call(s)  ·  Ctrl+O details")
 
     def on_step(self, step_id: int, total: int, task: str) -> None:
-        print(f"  📋 [{step_id}/{total}] {task[:100]}")
+        if self.verbose:
+            print(f"  📋 [{step_id}/{total}] {task[:100]}")
+        else:
+            self._update_activity(f"⠿ planning  {step_id}/{total} · {task[:100]}")
 
     def on_step_done(self, step_id: int, success: bool, summary: str) -> None:
         icon = "✓" if success else "✗"
         preview = summary[:100].replace("\n", " ")
-        print(f"  {icon} 步骤 {step_id}: {preview}")
+        if self.verbose:
+            print(f"  {icon} 步骤 {step_id}: {preview}")
+        else:
+            self._update_activity(f"{icon} plan step {step_id} complete")
 
     def on_review(self, score: int, passed: bool, feedback: str) -> None:
         icon = "✓" if passed else "✗"
-        print(f"  🔍 审查 {icon} 评分: {score}/10 — {feedback[:100]}")
+        if self.verbose:
+            print(f"  🔍 审查 {icon} 评分: {score}/10 — {feedback[:100]}")
+        else:
+            self._update_activity(f"🔍 reviewing  {icon} {score}/10")
 
     def on_error(self, error: str) -> None:
         self._panel.add_error(error)
-        print(f"  ❌ {error}")  # v0.6.1: 错误始终输出
+        self.finish_activity()
+        print(f"  ❌ {error}")
 
     def on_warning(self, warning: str) -> None:
         self._panel.add_warning(warning)
-        print(f"  ⚠️  {warning}")  # v0.6.1: 警告始终输出
+        if self.verbose:
+            print(f"  ⚠️  {warning}")
+        else:
+            self._update_activity(f"⚠ {warning[:120]}")
 
     def on_finish(self, result: str) -> None:
+        self.finish_activity()
         if self.verbose:
             print(f"  ✅ 完成 ({len(result)} 字符)")
 
