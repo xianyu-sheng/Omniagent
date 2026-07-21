@@ -32,4 +32,10 @@ jobs:
         run: python -m pytest tests/ -q --tb=short
 
       - name: Coverage
-        run: python -m pytest tests/ --cov=xenon --cov-report=term-missing -q
+        run: python -m pytest tests/ --cov=xenon --cov-report=xml --cov-report=term-missing -q
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false

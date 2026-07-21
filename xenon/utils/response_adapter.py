@@ -153,14 +153,37 @@ def _repair_json(text: str) -> str | None:
     """尝试修复被截断或格式不完整的 JSON。
 
     策略：
-    1. 截断未完成的值（去掉尾部不完整的 key/value）
-    2. 关闭所有未闭合的 { 和 [
-    3. 去掉尾部多余的逗号
+    1. 提取 JSON 主体（去掉前后非 JSON 文字）
+    2. 截断未完成的值（去掉尾部不完整的 key/value）
+    3. 去掉尾部多余的逗号（包括对象/数组内部的 trailing comma）
+    4. 关闭所有未闭合的 { 和 [
     """
     if not text or not text.strip():
         return None
 
     text = text.strip()
+
+    # 0. 提取 JSON 主体：从第一个 { 或 [ 到最后一个 } 或 ]
+    # 去掉前后非 JSON 文字（如 "text before {"key": 1}" ）。
+    # 如果找不到闭合括号则跳过此步，交由后续步骤处理。
+    first_brace = text.find('{')
+    first_bracket = text.find('[')
+    if first_brace == -1 and first_bracket == -1:
+        return None  # 没有 JSON 结构
+    start = first_brace if first_bracket == -1 else (
+        first_bracket if first_brace == -1 else min(first_brace, first_bracket)
+    )
+    last_brace = text.rfind('}')
+    last_bracket = text.rfind(']')
+    end = last_brace if last_bracket == -1 else (
+        last_bracket if last_brace == -1 else max(last_brace, last_bracket)
+    )
+    # 只有当找到闭合括号且与开头不同位置时才截取
+    if end > start:
+        text = text[start:end + 1]
+    elif start > 0:
+        # 有开头没闭合 → 截掉开头前的文字，保留不完整的 JSON 主体
+        text = text[start:]
 
     # 1. 分析引号状态，找到最后一个未闭合的字符串
     in_string = False
@@ -199,8 +222,10 @@ def _repair_json(text: str) -> str | None:
                 if key_start != -1:
                     text = text[:key_start].rstrip().rstrip(',')
 
-    # 3. 去掉尾部逗号
-    text = text.rstrip().rstrip(',')
+    # 3. 去掉尾部逗号（包括对象/数组内部尾部的 ,} 和 ,]）
+    text = re.sub(r',\s*}', '}', text)
+    text = re.sub(r',\s*]', ']', text)
+    text = text.rstrip(',')
 
     # 4. 用栈追踪未闭合的括号（保持正确的嵌套顺序）
     bracket_stack: list[str] = []
