@@ -97,22 +97,23 @@ class TestSAARShortCircuit:
         pool.register("a/pro", alias="pro", weight=5.0)
         router = AutoRouter(pool)
         router.session_lock.lock("a/pro", 3, "tool_flow")
-        pool.get("pro").health.circuit_open_until = time.time() + 60  # 断路器开
+        pool.get("pro").health.circuit_open_until = time.monotonic() + 60  # 断路器开
         profile = TaskProfile(requires_tools=True, complexity=0.5)
         result = router._session_lock_route("x", profile, 3, 3)
         assert result is None  # 释放,交正常流程
         assert not router.session_lock.is_locked()
 
-    def test_release_on_consecutive_failures(self):
-        """连续失败达阈值 -> 视为不健康释放。"""
+    def test_expired_cooldown_is_half_open_and_can_keep_lock(self):
+        """冷却到期后必须允许一次探测调用，成功后才能恢复健康状态。"""
         pool = ModelPool()
         pool.register("a/pro", alias="pro", weight=5.0)
         router = AutoRouter(pool)
         router.session_lock.lock("a/pro", 3, "tool_flow")
         pool.get("pro").health.consecutive_failures = FAILURE_THRESHOLD
+        pool.get("pro").health.circuit_open_until = time.monotonic() - 1
         profile = TaskProfile(requires_tools=True, complexity=0.5)
-        assert router._session_lock_route("x", profile, 3, 3) is None
-        assert not router.session_lock.is_locked()
+        assert router._session_lock_route("x", profile, 3, 3) == ["a/pro"]
+        assert router.session_lock.is_locked()
 
     def test_release_on_drift(self):
         """决策漂移(task_tier 与锁定 tier 差距>=2)连续超阈值 -> 释放。"""

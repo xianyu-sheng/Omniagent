@@ -37,11 +37,11 @@ class CapabilityProfile:
 class HealthRecord:
     """运行时健康指标（动态，每次 API 调用更新）。
 
-    v0.5.3: 指数退避 + 永久驱逐机制。
+    v0.6.3: 阈值熔断 + 有上限的指数退避机制。
     - consecutive_failures: 连续失败次数（断路器用）
     - retry_cycle_count: 退避周期计数，每完成一次"禁止→解禁→重试仍失败"的周期 +1
     - circuit_open_until: 断路器打开截止时间戳，0 = 关闭
-    - permanently_evicted: 3 次退避周期后永久驱逐，不再参与调度
+    - permanently_evicted: 仅供用户显式的运行时驱逐；网络失败不会修改配置
     """
     total_calls: int = 0
     success_count: int = 0
@@ -71,42 +71,7 @@ class PoolEntry:
 FAILURE_THRESHOLD = 3        # 连续失败次数触发断路器
 COOLDOWN_BASE = 30.0         # 首次退避时间（秒）
 MAX_COOLDOWN = 600.0         # 最大退避时间（秒）
-MAX_RETRY_CYCLES = 3         # v0.5.3: 最多退避周期数，超过后永久驱逐
-
-
-def _evict_from_credentials(model_id: str) -> None:
-    """v0.5.3: 从 credentials.yaml 的 _custom_providers 中删除指定模型。"""
-    try:
-        import yaml as _yaml
-        from pathlib import Path as _Path
-        path = _Path.home() / ".xenon" / "credentials.yaml"
-        if not path.exists():
-            return
-        with open(path, encoding="utf-8") as f:
-            data = _yaml.safe_load(f) or {}
-        custom_providers = data.get("_custom_providers", {})
-        provider = model_id.split("/")[0] if "/" in model_id else ""
-        model_name = model_id.split("/", 1)[1] if "/" in model_id else model_id
-
-        removed = False
-        for key in list(custom_providers.keys()):
-            if key == provider or key == "custom" or key == "":
-                cfg = custom_providers[key]
-                models = cfg.get("models", [])
-                if model_name in models:
-                    models.remove(model_name)
-                    cfg["models"] = models
-                    removed = True
-                if not models:
-                    del custom_providers[key]
-
-        if removed:
-            from xenon.utils.atomic_write import atomic_write_text
-            atomic_write_text(
-                path, _yaml.dump(data, allow_unicode=True, default_flow_style=False),
-            )
-    except Exception:
-        pass  # 文件操作失败不影响运行时驱逐
+MAX_RETRY_CYCLES = 3         # 达到后保持 MAX_COOLDOWN，但不删除用户配置
 
 
 class ModelPool:
@@ -181,38 +146,18 @@ class ModelPool:
             return True
 
     def evict_permanently(self, alias: str) -> bool:
-        """v0.5.3: 永久驱逐模型，从内存池和 credentials.yaml 中删除。
+        """Explicitly evict a model from this in-memory pool only.
 
-        被驱逐的模型不再参与任何调度，需要重新 /setup 才能恢复。
-        线程安全：可在 _lock 内或外调用。
+        User credentials are configuration, not runtime health state, and are
+        never deleted by a circuit breaker.
         """
-        entry = self._find_entry(alias)
-        if not entry:
-            return False
-
-        model_id = entry.model_id
-
-        # 1) 标记为永久驱逐（立即生效，阻塞所有调度）
         with self._lock:
+            entry = self._find_entry(alias)
+            if not entry:
+                return False
             entry.health.permanently_evicted = True
             entry.health.circuit_open_until = float("inf")
-
-        # 2) 从 credentials.yaml 的 _custom_providers 中删除
-        _evict_from_credentials(model_id)
-
-        # 3) 从池中移除
-        return self.unregister(alias)
-
-    def _evict_if_needed(self, alias: str) -> bool:
-        """v0.5.3: 如果模型达到驱逐阈值，执行永久驱逐。
-        在 _lock 内调用，不会重复加锁。
-        """
-        entry = self._find_entry(alias)
-        if not entry or not entry.health.permanently_evicted:
-            return False
-        model_id = entry.model_id
-        # 不在 _lock 内做文件 IO，先释放锁
-        return True  # 调用方负责后续清理
+            return True
 
     def get(self, alias: str) -> PoolEntry | None:
         with self._lock:
@@ -295,17 +240,18 @@ class ModelPool:
     def record_failure(self, alias: str, *, is_retry: bool = False) -> bool:
         """记录一次失败调用。alias 可以是 alias 或完整 model_id。
 
-        v0.5.3: 指数退避 + 永久驱逐。
-        - 首次失败: 断路器打开 COOLDOWN_BASE 秒
+        v0.6.3: 阈值熔断 + 有上限的指数退避。
+        - 前 ``FAILURE_THRESHOLD - 1`` 次失败只降低健康分，不熔断
+        - 达到阈值后断路器打开 ``COOLDOWN_BASE`` 秒
         - 断路器到期后重试仍失败 (is_retry=True): 退避周期 +1，退避时间翻倍
-        - MAX_RETRY_CYCLES 次退避周期后: 永久驱逐
+        - 达到 MAX_RETRY_CYCLES 后只使用 MAX_COOLDOWN，不删除模型或凭据
 
         Args:
             alias: 模型别名或完整 model_id
             is_retry: True 表示这是一次解禁后的重试（退避周期 +1）
 
         Returns:
-            True 如果模型被永久驱逐。
+            保留兼容返回值；运行时失败不再永久驱逐，始终为 False。
         """
         with self._lock:
             entry = self._find_entry(alias)
@@ -317,26 +263,16 @@ class ModelPool:
             h.consecutive_failures += 1
             h.last_used_at = time.monotonic()
 
+            if h.consecutive_failures < FAILURE_THRESHOLD:
+                h.circuit_open_until = 0.0
+                return False
+
             if is_retry:
                 # 解禁后重试仍然失败 → 退避周期 +1，退避时间指数增长
                 h.retry_cycle_count += 1
 
-            if h.retry_cycle_count >= MAX_RETRY_CYCLES:
-                # 永久驱逐
-                h.permanently_evicted = True
-                h.circuit_open_until = float("inf")
-                evicted_model_id = entry.model_id
-                logger = __import__("logging").getLogger(__name__)
-                logger.warning(
-                    "模型 %s 已永久驱逐（%d 次退避周期后仍失败），"
-                    "将从 credentials.yaml 中删除",
-                    evicted_model_id, h.retry_cycle_count,
-                )
-                # 从 credentials.yaml 删除（文件 IO 在锁外执行）
-                _evict_from_credentials(evicted_model_id)
-                return True
-
             # 指数退避: COOLDOWN_BASE * 2^(retry_cycle_count)
+            h.retry_cycle_count = min(h.retry_cycle_count, MAX_RETRY_CYCLES)
             multiplier = 2 ** h.retry_cycle_count
             cooldown = min(COOLDOWN_BASE * multiplier, MAX_COOLDOWN)
             h.circuit_open_until = time.monotonic() + cooldown
@@ -451,10 +387,7 @@ class ModelPool:
         # Fallback: 全局搜索（所有健康模型）
         healthy = self.get_healthy()
         if not healthy:
-            with self._lock:
-                healthy = list(self._entries.values())
-            if not healthy:
-                return []
+            return []
 
         scored = [(self._score(e, profile), e) for e in healthy]
         scored.sort(key=lambda x: x[0], reverse=True)

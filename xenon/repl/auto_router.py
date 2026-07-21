@@ -14,7 +14,7 @@ import time
 from typing import Any
 
 from xenon.repl.difficulty_estimator import DifficultyEstimator, TaskProfile
-from xenon.repl.model_pool import ModelPool, FAILURE_THRESHOLD
+from xenon.repl.model_pool import ModelPool
 from xenon.repl.routing_history import RoutingHistory, RoutingRecord
 
 
@@ -202,9 +202,11 @@ class AutoRouter:
         h = entry.health
         if h.permanently_evicted:
             return False
-        if h.circuit_open_until and h.circuit_open_until > time.time():
+        if h.circuit_open_until and h.circuit_open_until > time.monotonic():
             return False
-        return h.consecutive_failures < FAILURE_THRESHOLD
+        # Cooldown expiry is the half-open probe: the model must be eligible
+        # for one call so that a success can reset consecutive_failures.
+        return True
 
     @staticmethod
     def _is_tool_flow(context_messages: list[dict] | None, profile: TaskProfile) -> bool:

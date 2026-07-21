@@ -110,9 +110,8 @@ class TestWorkStealing:
             _tier = 5
 
         best = pool.select_best(Tier5Task())
-        # No healthy models → fallback to all (broken) models
-        assert len(best) == 1
-        assert best[0].alias == "pro"  # fallback includes all
+        # No healthy models: never route work back to an open circuit.
+        assert best == []
 
 
 class TestFromConfig:

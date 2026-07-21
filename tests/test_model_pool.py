@@ -74,12 +74,56 @@ class TestHealthTracking:
         e = pool.get("y")
         assert e.health.circuit_open_until > 0
 
+    def test_first_failure_does_not_open_circuit(self):
+        pool = ModelPool()
+        pool.register("x/y", alias="y")
+
+        pool.record_failure("y")
+
+        entry = pool.get("y")
+        assert entry.health.consecutive_failures == 1
+        assert entry.health.circuit_open_until == 0
+        assert pool.get_healthy() == [entry]
+
+    def test_expired_cooldown_allows_half_open_probe(self):
+        import time
+
+        pool = ModelPool()
+        pool.register("x/y", alias="y")
+        for _ in range(FAILURE_THRESHOLD):
+            pool.record_failure("y")
+        pool.get("y").health.circuit_open_until = time.monotonic() - 1
+
+        assert pool.get_healthy() == [pool.get("y")]
+
+    def test_repeated_retry_failures_never_delete_or_permanently_evict(self):
+        pool = ModelPool()
+        pool.register("x/y", alias="y")
+        for _ in range(FAILURE_THRESHOLD):
+            pool.record_failure("y")
+
+        for _ in range(10):
+            pool.get("y").health.circuit_open_until = 0
+            assert pool.record_failure("y", is_retry=True) is False
+
+        entry = pool.get("y")
+        assert entry is not None
+        assert entry.health.permanently_evicted is False
+
     def test_circuit_broken_model_not_healthy(self):
         pool = ModelPool()
         pool.register("x/y", alias="y")
         for _ in range(FAILURE_THRESHOLD):
             pool.record_failure("y")
         assert len(pool.get_healthy()) == 0
+
+    def test_selection_never_falls_back_to_open_circuit_models(self):
+        pool = ModelPool()
+        pool.register("x/y", alias="y")
+        for _ in range(FAILURE_THRESHOLD):
+            pool.record_failure("y")
+
+        assert pool.select_best(None) == []
 
 
 class TestModelSelection:

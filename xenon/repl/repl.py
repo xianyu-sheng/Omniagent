@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -150,7 +151,8 @@ class REPL:
         self._pt_session: Any = None
         self._init_prompt_toolkit()
 
-        # v0.5.2: 会话内失败模型集合——一次失败后本会话不再重试
+        # 会话内明确不可恢复的模型（认证/模型名等终端错误）。网络抖动等
+        # 瞬时错误交给 ModelPool 阈值熔断，不在这里永久拉黑。
         self._failed_models: set[str] = set()
         self._preferred_model_ids: list[str] = []  # v0.5.3: 用户 -m 指定的模型
 
@@ -351,6 +353,10 @@ class REPL:
         StringIO handler。这样日志不会输出到 stderr，而是被收集供折叠/展开使用。
         """
         import io as _io
+        if getattr(self, "_log_capture_active", False):
+            # Defensive cleanup if a previous run was interrupted outside the
+            # normal Exception path.
+            self._captured_log = self._stop_log_capture()
         self._log_buffer = _io.StringIO()
         self._log_handler = logging.StreamHandler(self._log_buffer)
         self._log_handler.setFormatter(
@@ -363,6 +369,7 @@ class REPL:
         # 保存原有 handler 并清空，确保日志只进缓冲区
         # 关键：同时捕获 root logger（日志传播终点）+ 所有已注册子 logger
         self._saved_handlers: dict[str, list[logging.Handler]] = {}
+        self._saved_propagate: dict[str, bool] = {}
         _capture_names: list[str] = []
         # 遍历所有已注册的 logger，找到 xenon.* / httpx / openai / httpcore 及 root
         for _lg_name, _lg_obj in logging.root.manager.loggerDict.items():
@@ -370,16 +377,25 @@ class REPL:
                 if (_lg_name.startswith('xenon') or
                     _lg_name in ('httpx', 'openai', 'httpcore')):
                     _capture_names.append(_lg_name)
-        # root logger 也会接收传播来的日志
-        _capture_names.append('')
         for _name in _capture_names:
             _lg = logging.getLogger(_name)
             self._saved_handlers[_name] = list(_lg.handlers)
+            self._saved_propagate[_name] = _lg.propagate
             _lg.handlers.clear()
-            _lg.addHandler(self._log_handler)
+            # 子 logger 统一传播到 root，避免同一个 handler 在子级和 root
+            # 各执行一次造成重复日志。
+            _lg.propagate = True
+
+        root_logger = logging.getLogger()
+        self._saved_handlers[""] = list(root_logger.handlers)
+        root_logger.handlers.clear()
+        root_logger.addHandler(self._log_handler)
+        self._log_capture_active = True
 
     def _stop_log_capture(self) -> str:
         """v0.5.3: 恢复原有 handler，返回捕获的日志文本。"""
+        if not getattr(self, "_log_capture_active", False):
+            return ""
         _captured = ""
         try:
             for _name in self._saved_handlers:
@@ -394,7 +410,10 @@ class REPL:
                         _lg.addHandler(_h)
                     except Exception:
                         pass
+                if _name in self._saved_propagate:
+                    _lg.propagate = self._saved_propagate[_name]
         finally:
+            self._log_capture_active = False
             try:
                 self._log_handler.close()
             except Exception:
@@ -1779,6 +1798,8 @@ class REPL:
                 self._run_direct(optimized, model_ids, intent=intent)
         except KeyboardInterrupt:
             # B2: Ctrl+C 取消当前运行，返回提示符而非退出整个 REPL
+            if getattr(self, "_log_capture_active", False):
+                self._captured_log = self._stop_log_capture()
             console.print("\n[dim]· 已中断，返回提示符[/dim]")
 
     def _run_direct(self, user_input: str, model_ids: list[str], intent: str | None = None) -> None:
@@ -1821,12 +1842,23 @@ class REPL:
 
         last_error = None
         for model_id in effective_ids:
+            started_at = time.monotonic()
+            pool_entry = self.model_pool._find_entry(model_id)
+            is_retry_probe = bool(
+                pool_entry is not None
+                and pool_entry.health.circuit_open_until > 0
+                and pool_entry.health.circuit_open_until <= started_at
+            )
             try:
                 if self.streaming:
                     response_text = self._stream_response(model_id, messages)
                 else:
                     response_text = self._blocking_response(model_id, messages)
                 self.status_bar.set_last_model(model_id)
+                self.model_pool.record_success(
+                    model_id,
+                    time.monotonic() - started_at,
+                )
 
                 if response_text:
                     # ── 响应后验证 1：检测 LLM 直接输出工具调用 JSON ──
@@ -1893,10 +1925,45 @@ class REPL:
                 return
             except Exception as e:
                 last_error = e
-                self._failed_models.add(model_id)
-                console.print(f"[dim yellow]模型 {model_id} 失败: {e}，已标记不可用，尝试下一个...[/dim yellow]")
+                from xenon.engine.base import BaseEngine
+
+                if BaseEngine._is_transient_error(e):
+                    self.model_pool.record_failure(
+                        model_id,
+                        is_retry=is_retry_probe,
+                    )
+                    state = "瞬时失败，尝试备用模型"
+                elif self._is_terminal_model_error(e):
+                    self._failed_models.add(model_id)
+                    state = "配置型失败，本会话暂不重试"
+                else:
+                    # 未知异常先累计健康分，不因一次异常拉黑整个会话。
+                    self.model_pool.record_failure(
+                        model_id,
+                        is_retry=is_retry_probe,
+                    )
+                    state = "调用失败，尝试备用模型"
+                console.print(
+                    f"[dim yellow]模型 {model_id} {state}: {e}[/dim yellow]"
+                )
 
         console.print(f"[error]❌ 所有模型均调用失败: {last_error}[/error]")
+
+    @staticmethod
+    def _is_terminal_model_error(error: Exception) -> bool:
+        """Return True only for errors that retrying the same model cannot fix."""
+        import httpx
+
+        if isinstance(error, httpx.HTTPStatusError):
+            return error.response.status_code in {400, 401, 403, 404, 422}
+        text = str(error).lower()
+        return any(marker in text for marker in (
+            "invalid api key",
+            "authentication",
+            "unauthorized",
+            "unknown model",
+            "model not found",
+        ))
 
     def _inject_mcp_tools_into_engine(self, engine: object) -> None:
         """v0.5.4: 将可用 MCP 工具（或惰性描述）注入引擎的 system prompt。
@@ -1971,6 +2038,9 @@ class REPL:
                     self.ctx_mgr.trim_last_user()
                 except Exception:
                     pass
+        finally:
+            if getattr(self, "_log_capture_active", False):
+                self._captured_log = self._stop_log_capture()
 
     def _run_plan_execute_engine(self, user_input: str, model_ids: list[str]) -> None:
         """Plan-Execute 引擎模式。"""
@@ -2003,6 +2073,9 @@ class REPL:
             if self._captured_log:
                 console.print(Text(self._captured_log.rstrip(), style="dim"))
             console.print(f"[error]❌ Plan-Execute 引擎执行失败: {e}[/error]")
+        finally:
+            if getattr(self, "_log_capture_active", False):
+                self._captured_log = self._stop_log_capture()
 
     def _run_reflection_engine(self, user_input: str, model_ids: list[str]) -> None:
         """Reflection 引擎模式。"""
@@ -2035,6 +2108,9 @@ class REPL:
             if self._captured_log:
                 console.print(Text(self._captured_log.rstrip(), style="dim"))
             console.print(f"[error]❌ Reflection 引擎执行失败: {e}[/error]")
+        finally:
+            if getattr(self, "_log_capture_active", False):
+                self._captured_log = self._stop_log_capture()
 
     def _run_plan_react_engine(self, user_input: str, model_ids: list[str]) -> None:
         """Plan + React 组合引擎模式。"""
@@ -2068,6 +2144,9 @@ class REPL:
             if self._captured_log:
                 console.print(Text(self._captured_log.rstrip(), style="dim"))
             console.print(f"[error]❌ Plan+React 引擎执行失败: {e}[/error]")
+        finally:
+            if getattr(self, "_log_capture_active", False):
+                self._captured_log = self._stop_log_capture()
 
     def _run_plan_reflection_engine(self, user_input: str, model_ids: list[str]) -> None:
         """Plan + Reflection 组合引擎模式。"""
@@ -2101,6 +2180,9 @@ class REPL:
             if self._captured_log:
                 console.print(Text(self._captured_log.rstrip(), style="dim"))
             console.print(f"[error]❌ Plan+Reflection 引擎执行失败: {e}[/error]")
+        finally:
+            if getattr(self, "_log_capture_active", False):
+                self._captured_log = self._stop_log_capture()
 
     def _run_react_reflection_engine(self, user_input: str, model_ids: list[str]) -> None:
         """ReAct + Reflection 组合引擎模式。"""
@@ -2134,6 +2216,9 @@ class REPL:
             if self._captured_log:
                 console.print(Text(self._captured_log.rstrip(), style="dim"))
             console.print(f"[error]❌ React+Reflection 引擎执行失败: {e}[/error]")
+        finally:
+            if getattr(self, "_log_capture_active", False):
+                self._captured_log = self._stop_log_capture()
 
     def _run_novel_engine(self, user_input: str, model_ids: list[str]) -> None:
         """小说创作引擎模式（支持多小说隔离）。"""
@@ -2166,6 +2251,9 @@ class REPL:
             if self._captured_log:
                 console.print(Text(self._captured_log.rstrip(), style="dim"))
             console.print(f"[error]❌ 小说创作引擎执行失败: {e}[/error]")
+        finally:
+            if getattr(self, "_log_capture_active", False):
+                self._captured_log = self._stop_log_capture()
 
     def _stream_response(self, model_id: str, messages: list[dict[str, str]]) -> str:
         """流式输出模型回复，完成后 Markdown 渲染。返回完整响应文本。"""

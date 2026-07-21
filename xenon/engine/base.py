@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -228,6 +229,7 @@ class BaseEngine(ABC):
         tp = lambda msg: f"{prefix(self.run_id, call_id)} {msg}"
         last_error: Exception | None = None
         for model_id in (model_priority or self.model_priority):
+            started_at = time.monotonic()
             try:
                 if self.model_pool:
                     self.model_pool.acquire(model_id)  # P2: 并发计数+1(资源感知)
@@ -247,8 +249,10 @@ class BaseEngine(ABC):
                 )
                 # v0.4.0: record success to model pool
                 if self.model_pool:
-                    import time as _time
-                    self.model_pool.record_success(model_id, _time.monotonic())
+                    self.model_pool.record_success(
+                        model_id,
+                        time.monotonic() - started_at,
+                    )
                 return result
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
@@ -263,12 +267,7 @@ class BaseEngine(ABC):
                         f"模型 {model_id} 请求被拒 (400)，请检查参数/模型名") from e
                 # 429/5xx/其他 HTTP：瞬时，切下一个模型
                 if self.model_pool:
-                    entry = self.model_pool._find_entry(model_id)
-                    was_open = (
-                        entry is not None
-                        and entry.health.consecutive_failures >= FAILURE_THRESHOLD
-                    )
-                    self.model_pool.record_failure(model_id, is_retry=was_open)
+                    self._record_model_failure(model_id)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} HTTP {status} 失败: {e}，尝试下一个..."))
             except (
@@ -276,32 +275,17 @@ class BaseEngine(ABC):
                 httpx.RemoteProtocolError, httpx.WriteError, httpx.PoolTimeout,
             ) as e:
                 if self.model_pool:
-                    entry = self.model_pool._find_entry(model_id)
-                    was_open = (
-                        entry is not None
-                        and entry.health.consecutive_failures >= FAILURE_THRESHOLD
-                    )
-                    self.model_pool.record_failure(model_id, is_retry=was_open)
+                    self._record_model_failure(model_id)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} 网络错误 ({type(e).__name__}): {e}，尝试下一个..."))
             except ResponseTruncatedError as e:
                 if self.model_pool:
-                    entry = self.model_pool._find_entry(model_id)
-                    was_open = (
-                        entry is not None
-                        and entry.health.consecutive_failures >= FAILURE_THRESHOLD
-                    )
-                    self.model_pool.record_failure(model_id, is_retry=was_open)
+                    self._record_model_failure(model_id)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} 响应截断: {e}，尝试下一个..."))
             except Exception as e:
                 if self.model_pool:
-                    entry = self.model_pool._find_entry(model_id)
-                    was_open = (
-                        entry is not None
-                        and entry.health.consecutive_failures >= FAILURE_THRESHOLD
-                    )
-                    self.model_pool.record_failure(model_id, is_retry=was_open)
+                    self._record_model_failure(model_id)
                 last_error = e
                 logger.warning(tp(f"模型 {model_id} 失败: {e}，尝试下一个..."))
             finally:
@@ -324,6 +308,20 @@ class BaseEngine(ABC):
                 self._call_retry_depth -= 1
         self.callback.on_error(f"所有模型均调用失败: {last_error}")
         raise RuntimeError(f"所有模型均调用失败: {last_error}")
+
+    def _record_model_failure(self, model_id: str) -> None:
+        """Record a failed half-open probe without confusing it with a first failure."""
+        if not self.model_pool:
+            return
+        entry = self.model_pool._find_entry(model_id)
+        now = time.monotonic()
+        is_retry = bool(
+            entry is not None
+            and entry.health.consecutive_failures >= FAILURE_THRESHOLD
+            and entry.health.circuit_open_until > 0
+            and entry.health.circuit_open_until <= now
+        )
+        self.model_pool.record_failure(model_id, is_retry=is_retry)
 
     # ── P2: 限流退避辅助 ─────────────────────────────────
 
