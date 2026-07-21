@@ -219,8 +219,8 @@ BUILTIN_TOOLS = {
     },
     "github_fetch": {
         "name": "github_fetch",
-        "description": "GitHub 仓库专用操作工具。list_files: 列出仓库中所有文件路径（通过 GitHub API）；fetch_file: 获取指定文件的源码内容；fetch_readme: 自动查找并获取 README 文件。仅支持公开仓库。",
-        "params": {"repo": "仓库标识，格式为 owner/repo（如 facebook/react）", "github_action": "list_files（列出文件）| fetch_file（获取文件）| fetch_readme（获取README）", "github_path": "文件路径（仅 fetch_file 时需要，如 src/index.js）", "branch": "分支名（可选，默认 main，失败时自动尝试 master）"},
+        "description": "GitHub 专用读取工具。支持 owner/repo，以及仓库、blob、tree、issue、pull 和 raw 完整 URL；完整资源 URL 会自动选择对应动作。设置 GITHUB_TOKEN 或 GH_TOKEN 后支持私有仓库。",
+        "params": {"repo": "owner/repo 或完整 GitHub URL", "github_action": "list_files | fetch_file | fetch_readme | fetch_issue | fetch_pull", "github_path": "文件或目录路径", "branch": "分支名（可选；留空自动读取仓库默认分支）"},
     },
     "weather": {
         "name": "weather",
@@ -264,12 +264,12 @@ BUILTIN_TOOLS = {
         "description": (
             "将 GitHub 仓库克隆到本地缓存目录（~/.xenon/repos/），并自动分析："
             "目录结构、关键文件（README/配置/入口点）、代码统计。"
-            "重复克隆同一仓库不会重复下载。"
+            "命中本地缓存时会拉取远程更新，但不会覆盖缓存中的本地修改。"
             "克隆后可配合 list_files/read_file/search_files 深入分析代码。"
         ),
         "params": {
             "repo": "GitHub 仓库 URL 或 owner/repo 格式，如 'https://github.com/user/repo' 或 'user/repo'",
-            "branch": "分支名（可选，默认 main，失败时自动尝试 master）",
+            "branch": "分支名（可选；留空探测远程默认分支）",
         },
     },
     # v0.6.1: LSP 工具 — 基于 Jedi 的精确代码导航（Python）

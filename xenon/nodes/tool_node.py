@@ -32,6 +32,7 @@ from xenon.engine.context import AgentContext
 from xenon.utils.llm_client import _create_http_client
 from xenon.nodes.base import BaseNode
 from xenon.utils.atomic_write import atomic_write_bytes, atomic_write_text
+from xenon.utils.github_reference import parse_github_reference
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 # 存储通过 register_tool 注册的自定义工具
 # key: 工具名, value: {"handler": callable, "description": str, "params": dict}
 _DYNAMIC_TOOLS: dict[str, dict] = {}
+_GITHUB_DEFAULT_BRANCH_CACHE: dict[str, str] = {}
 
 
 def register_dynamic_tool(name: str, handler, description: str, params: dict) -> None:
@@ -365,7 +367,7 @@ class ToolNode(BaseNode):
         repo: str = "",
         github_action: str = "list_files",  # list_files | fetch_file | fetch_readme
         github_path: str = "",
-        branch: str = "main",
+        branch: str = "",
         # weather 参数
         city: str = "",
         lang: str = "zh",
@@ -1843,6 +1845,23 @@ class ToolNode(BaseNode):
         if not url:
             raise ValueError(f"[{self.id}] web_fetch 需要 url")
 
+        # A GitHub HTML/raw URL is repository data, not a generic webpage.
+        # Route it through the typed GitHub client so pasted links, private
+        # repositories and blob/issue/pull semantics work even if the model
+        # selected web_fetch.
+        host = (urlparse(url).hostname or "").lower()
+        if host in {"github.com", "www.github.com", "raw.githubusercontent.com"}:
+            github_node = ToolNode(
+                f"{self.id}:github",
+                action_type="github_fetch",
+                repo=url,
+                branch="",
+                timeout=self.timeout,
+                output_slot=self.output_slot,
+                security_enabled=self.security_enabled,
+            )
+            return github_node._github_fetch(context)
+
         # A5: SSRF 防护 — 校验起始 URL 的目标 IP（覆盖 IPv6/编码 IP/元数据地址/file://）
         ok, reason = _ssrf_check_url(url)
         if not ok:
@@ -1980,44 +1999,39 @@ class ToolNode(BaseNode):
         return result
 
     def _github_fetch(self, context: AgentContext) -> dict[str, Any]:
-        """GitHub 仓库操作：列出文件、获取文件内容、获取 README。
-
-        支持的 github_action:
-        - list_files: 列出仓库中所有文件路径
-        - fetch_file: 获取指定文件的内容
-        - fetch_readme: 获取 README 内容
-        """
-        import re
-
-        repo = self._resolve_template(self.repo, context)
-        if not repo:
+        """Fetch repository files, README, issues and pull requests via GitHub API."""
+        repo_input = self._resolve_template(self.repo, context)
+        if not repo_input:
             raise ValueError(f"[{self.id}] github_fetch 需要 repo 参数（格式: owner/repo）")
 
-        # 规范化 repo 格式：支持完整 URL 或 owner/repo
-        repo = repo.strip().rstrip("/")
-        # v0.6.1: 去掉 .git 后缀（git clone URL 常以 .git 结尾）
-        if repo.endswith(".git"):
-            repo = repo[:-4]
-        if "github.com" in repo:
-            # 从 URL 提取 owner/repo
-            m = re.search(r"github\.com/([^/]+/[^/]+)", repo)
-            if m:
-                repo = m.group(1)
-        repo = repo.rstrip("/")
-        # A12: 校验 repo 格式（owner/repo，仅允许字母数字._-），防 URL 注入
-        if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+        try:
+            reference = parse_github_reference(repo_input)
+        except ValueError as exc:
             return {
-                "action_type": "github_fetch", "repo": repo,
+                "action_type": "github_fetch", "repo": repo_input,
                 "content": "", "success": False,
-                "error": f"repo 格式非法（应为 owner/repo，仅允许字母数字._-）: {repo}",
+                "error": str(exc),
             }
+        repo = reference.slug
 
         action = self._resolve_template(self.github_action, context) or "list_files"
-        # A12: branch/github_path 做 URL 编码（保留 / 作为路径分隔），防注入
-        branch = quote(self._resolve_template(self.branch, context) or "main", safe="/")
-        github_path = quote(self._resolve_template(self.github_path, context) or "", safe="/")
+        branch_value = (self._resolve_template(self.branch, context) or "").strip()
+        path_value = (self._resolve_template(self.github_path, context) or "").strip("/")
 
-        logger.info(f"[{self.id}] GitHub {action}: {repo} (branch={branch}, path={github_path})")
+        # A pasted resource URL carries stronger semantics than the default
+        # list_files action, while explicit branch/path parameters still win.
+        if reference.kind == "blob":
+            action = "fetch_file"
+            branch_value = branch_value or reference.ref
+            path_value = path_value or reference.path
+        elif reference.kind == "tree":
+            action = "list_files"
+            branch_value = branch_value or reference.ref
+            path_value = path_value or reference.path
+        elif reference.kind == "issue":
+            action = "fetch_issue"
+        elif reference.kind == "pull":
+            action = "fetch_pull"
 
         try:
             import httpx
@@ -2028,101 +2042,137 @@ class ToolNode(BaseNode):
                 "error": "github_fetch 需要 httpx 库。请 pip install httpx",
             }
 
-        headers = {"User-Agent": "Xenon/0.2"}
+        headers = self._github_headers()
 
         try:
-            if action == "list_files":
-                # 使用 GitHub API 获取文件树
-                api_url = f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
-                with _create_http_client(timeout=self.timeout, follow_redirects=True) as client:
+            with _create_http_client(timeout=self.timeout, follow_redirects=True) as client:
+                if action in {"list_files", "fetch_file", "fetch_readme"}:
+                    branch_value = branch_value or self._github_default_branch(
+                        client, repo, headers,
+                    )
+                branch = quote(branch_value, safe="")
+                github_path = quote(path_value, safe="/")
+                logger.info(
+                    "[%s] GitHub %s: %s (branch=%s, path=%s)",
+                    self.id, action, repo, branch_value or "-", path_value or "-",
+                )
+
+                if action == "list_files":
+                    api_url = (
+                        f"https://api.github.com/repos/{repo}/git/trees/"
+                        f"{branch}?recursive=1"
+                    )
                     resp = client.get(api_url, headers=headers)
-                    if resp.status_code == 404:
-                        # 尝试 master 分支
-                        api_url = f"https://api.github.com/repos/{repo}/git/trees/master?recursive=1"
-                        resp = client.get(api_url, headers=headers)
                     resp.raise_for_status()
                     data = resp.json()
-
-                tree = data.get("tree", [])
-                # 只返回文件（不包括 tree 类型），过滤掉 .git 相关
-                files = [
-                    item["path"] for item in tree
-                    if item.get("type") == "blob" and not item["path"].startswith(".git/")
-                ]
-
-                result_text = f"仓库 {repo} 共 {len(files)} 个文件:\n" + "\n".join(files)
-                if len(result_text) > 10000:
-                    result_text = result_text[:10000] + f"\n\n... (共 {len(files)} 个文件，已截断)"
-
-                self._write_output(context, result_text[:5000])
-                return {
-                    "action_type": "github_fetch", "repo": repo,
-                    "action": action, "files": files, "file_count": len(files),
-                    "content": result_text, "success": True,
-                }
-
-            elif action == "fetch_file":
-                if not github_path:
+                    prefix = path_value.rstrip("/") + "/" if path_value else ""
+                    files = [
+                        item["path"] for item in data.get("tree", [])
+                        if item.get("type") == "blob"
+                        and not item.get("path", "").startswith(".git/")
+                        and (not prefix or item.get("path", "").startswith(prefix))
+                    ]
+                    result_text = (
+                        f"仓库 {repo}@{branch_value} 共 {len(files)} 个文件:\n"
+                        + "\n".join(files)
+                    )
+                    if len(result_text) > 10000:
+                        result_text = (
+                            result_text[:10000]
+                            + f"\n\n... (共 {len(files)} 个文件，已截断)"
+                        )
+                    self._write_output(context, result_text[:5000])
                     return {
                         "action_type": "github_fetch", "repo": repo,
-                        "action": action, "content": "", "success": False,
-                        "error": "fetch_file 需要 github_path 参数",
+                        "action": action, "branch": branch_value,
+                        "path": path_value, "files": files,
+                        "file_count": len(files), "content": result_text,
+                        "success": True,
                     }
 
-                raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{github_path}"
-                with _create_http_client(timeout=self.timeout, follow_redirects=True) as client:
-                    resp = client.get(raw_url, headers=headers)
-                    if resp.status_code == 404:
-                        # 尝试 master 分支
-                        raw_url = f"https://raw.githubusercontent.com/{repo}/master/{github_path}"
-                        resp = client.get(raw_url, headers=headers)
+                if action == "fetch_file":
+                    if not github_path:
+                        return {
+                            "action_type": "github_fetch", "repo": repo,
+                            "action": action, "content": "", "success": False,
+                            "error": "fetch_file 需要 github_path 参数",
+                        }
+                    api_url = (
+                        f"https://api.github.com/repos/{repo}/contents/"
+                        f"{github_path}?ref={branch}"
+                    )
+                    resp = client.get(api_url, headers=headers)
                     resp.raise_for_status()
-                    text = resp.text
+                    data = resp.json()
+                    text = self._decode_github_content(data)
+                    if len(text) > 50000:
+                        text = text[:50000] + "\n\n... (内容已截断，超过 50000 字符)"
+                    self._write_output(context, text[:5000])
+                    return {
+                        "action_type": "github_fetch", "repo": repo,
+                        "action": action, "branch": branch_value,
+                        "path": path_value, "content": text,
+                        "content_length": len(text), "success": True,
+                    }
 
-                if len(text) > 50000:
-                    text = text[:50000] + "\n\n... (内容已截断，超过 50000 字符)"
+                if action == "fetch_readme":
+                    api_url = f"https://api.github.com/repos/{repo}/readme?ref={branch}"
+                    resp = client.get(api_url, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    text = self._decode_github_content(data)
+                    if len(text) > 20000:
+                        text = text[:20000] + "\n\n... (已截断)"
+                    self._write_output(context, text[:5000])
+                    return {
+                        "action_type": "github_fetch", "repo": repo,
+                        "action": action, "branch": branch_value,
+                        "path": data.get("path", "README"),
+                        "content": text, "success": True,
+                    }
 
-                self._write_output(context, text[:5000])
-                return {
-                    "action_type": "github_fetch", "repo": repo,
-                    "action": action, "path": github_path,
-                    "content": text, "content_length": len(text), "success": True,
-                }
-
-            elif action == "fetch_readme":
-                for readme_name in ["README.md", "readme.md", "README.rst", "README"]:
-                    raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{readme_name}"
-                    with _create_http_client(timeout=self.timeout, follow_redirects=True) as client:
-                        resp = client.get(raw_url, headers=headers)
-                        if resp.status_code == 200:
-                            text = resp.text
-                            if len(text) > 20000:
-                                text = text[:20000] + "\n\n... (已截断)"
-                            self._write_output(context, text[:5000])
-                            return {
-                                "action_type": "github_fetch", "repo": repo,
-                                "action": action, "path": readme_name,
-                                "content": text, "success": True,
-                            }
+                if action in {"fetch_issue", "fetch_pull"}:
+                    number = reference.number
+                    if number is None:
+                        return {
+                            "action_type": "github_fetch", "repo": repo,
+                            "action": action, "content": "", "success": False,
+                            "error": f"{action} 需要 issues/pull URL 中的编号",
+                        }
+                    endpoint = "issues" if action == "fetch_issue" else "pulls"
+                    api_url = f"https://api.github.com/repos/{repo}/{endpoint}/{number}"
+                    resp = client.get(api_url, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = self._format_github_discussion(data, action, number)
+                    self._write_output(context, content[:5000])
+                    return {
+                        "action_type": "github_fetch", "repo": repo,
+                        "action": action, "number": number,
+                        "state": data.get("state", ""),
+                        "title": data.get("title", ""),
+                        "content": content, "success": True,
+                    }
 
                 return {
                     "action_type": "github_fetch", "repo": repo,
                     "action": action, "content": "", "success": False,
-                    "error": "未找到 README 文件",
-                }
-
-            else:
-                return {
-                    "action_type": "github_fetch", "repo": repo,
-                    "action": action, "content": "", "success": False,
-                    "error": f"不支持的 github_action: {action}（可选: list_files, fetch_file, fetch_readme）",
+                    "error": (
+                        f"不支持的 github_action: {action}（可选: list_files, "
+                        "fetch_file, fetch_readme, fetch_issue, fetch_pull）"
+                    ),
                 }
 
         except httpx.HTTPStatusError as e:
+            remaining = e.response.headers.get("x-ratelimit-remaining", "")
+            rate_hint = "（GitHub API 限流）" if remaining == "0" else ""
             return {
                 "action_type": "github_fetch", "repo": repo,
                 "action": action, "content": "", "success": False,
-                "error": f"GitHub API 错误: {e.response.status_code} {e.response.reason_phrase}",
+                "error": (
+                    f"GitHub API 错误: {e.response.status_code} "
+                    f"{e.response.reason_phrase}{rate_hint}"
+                ),
             }
         except Exception as e:
             return {
@@ -2130,6 +2180,58 @@ class ToolNode(BaseNode):
                 "action": action, "content": "", "success": False,
                 "error": f"GitHub 操作失败: {e}",
             }
+
+    @staticmethod
+    def _github_headers() -> dict[str, str]:
+        """Build GitHub API headers, supporting public and private repositories."""
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Xenon/0.6",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    @staticmethod
+    def _decode_github_content(data: dict[str, Any]) -> str:
+        """Decode the base64 payload returned by GitHub's Contents API."""
+        import base64
+
+        if data.get("encoding") != "base64" or not isinstance(data.get("content"), str):
+            raise ValueError("GitHub API 未返回可解码的文件内容")
+        raw = base64.b64decode(data["content"], validate=False)
+        return raw.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _format_github_discussion(
+        data: dict[str, Any], action: str, number: int,
+    ) -> str:
+        kind = "Pull Request" if action == "fetch_pull" else "Issue"
+        user = data.get("user") or {}
+        body = str(data.get("body") or "（无正文）")
+        return (
+            f"# {kind} #{number}: {data.get('title', '')}\n"
+            f"- 状态: {data.get('state', '')}\n"
+            f"- 作者: {user.get('login', '')}\n"
+            f"- 创建: {data.get('created_at', '')}\n"
+            f"- 更新: {data.get('updated_at', '')}\n\n"
+            f"{body[:30000]}"
+        )
+
+    @staticmethod
+    def _github_default_branch(client: Any, repo: str, headers: dict[str, str]) -> str:
+        cached = _GITHUB_DEFAULT_BRANCH_CACHE.get(repo)
+        if cached:
+            return cached
+        resp = client.get(f"https://api.github.com/repos/{repo}", headers=headers)
+        resp.raise_for_status()
+        branch = str(resp.json().get("default_branch") or "")
+        if not branch:
+            raise ValueError(f"GitHub 未返回 {repo} 的默认分支")
+        _GITHUB_DEFAULT_BRANCH_CACHE[repo] = branch
+        return branch
 
     def _clone_repo(self, context: AgentContext) -> dict[str, Any]:
         """将 GitHub 仓库克隆到本地缓存并返回结构化摘要。
@@ -2139,27 +2241,19 @@ class ToolNode(BaseNode):
         - 自动分析：目录结构、关键文件、代码统计
         """
         import subprocess
-        import re as _re
-
         repo_input = self._resolve_template(self.repo, context)
         if not repo_input:
             raise ValueError(f"[{self.id}] clone_repo 需要 repo 参数（格式: owner/repo 或完整 URL）")
 
-        # ── 规范化 repo 标识（同 github_fetch 逻辑，但 clone_repo 还支持 .git 后缀）──
-        repo = repo_input.strip().rstrip("/")
-        if repo.endswith(".git"):
-            repo = repo[:-4]
-        if "github.com" in repo:
-            m = _re.search(r"github\.com/([^/]+/[^/]+)", repo)
-            if m:
-                repo = m.group(1)
-        repo = repo.rstrip("/")
-        if not _re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+        try:
+            reference = parse_github_reference(repo_input)
+        except ValueError as exc:
             return {
                 "action_type": "clone_repo", "repo": repo_input,
                 "success": False,
-                "error": f"repo 格式非法（应为 owner/repo）: {repo_input}",
+                "error": str(exc),
             }
+        repo = reference.slug
 
         # ── 构建缓存路径 ──
         cache_root = Path.home() / ".xenon" / "repos"
@@ -2168,7 +2262,14 @@ class ToolNode(BaseNode):
 
         # ── 决议分支（前置：无论命中缓存与否都需要，供给 _analyze_cloned_repo）──
         clone_url = f"https://github.com/{repo}.git"
-        branch = self._resolve_branch_for_clone(clone_url, context)
+        branch = self._resolve_branch_for_clone(
+            clone_url,
+            context,
+            preferred_ref=reference.ref,
+        )
+        git_env = self._git_auth_env()
+        cache_updated = False
+        cache_warning = ""
 
         # ── 克隆（如果尚未缓存）──
         if not (target_dir / ".git").exists():
@@ -2180,7 +2281,7 @@ class ToolNode(BaseNode):
                 result = subprocess.run(
                     ["git", "clone", "--depth", "1", "--single-branch", "-b", branch,
                      clone_url, str(target_dir)],
-                    capture_output=True, text=True, timeout=self.timeout,
+                    capture_output=True, text=True, timeout=self.timeout, env=git_env,
                 )
                 if result.returncode != 0:
                     stderr = result.stderr.strip()
@@ -2192,6 +2293,7 @@ class ToolNode(BaseNode):
                             f"\n提示: 仓库可能不存在、已改名或需认证。可尝试用浏览器打开 {clone_url}"
                         ),
                     }
+                cache_updated = True
             except FileNotFoundError:
                 return {
                     "action_type": "clone_repo", "repo": repo,
@@ -2206,9 +2308,39 @@ class ToolNode(BaseNode):
                 }
         else:
             logger.info(f"[{self.id}] 仓库已缓存: {target_dir}")
+            # Refresh Xenon's cache without discarding local edits. A dirty or
+            # diverged cache remains usable, but the caller sees a warning.
+            try:
+                fetch = subprocess.run(
+                    ["git", "-C", str(target_dir), "fetch", "--depth", "1", "origin", branch],
+                    capture_output=True, text=True, timeout=self.timeout, env=git_env,
+                )
+                if fetch.returncode == 0:
+                    merge = subprocess.run(
+                        ["git", "-C", str(target_dir), "merge", "--ff-only", "FETCH_HEAD"],
+                        capture_output=True, text=True, timeout=self.timeout, env=git_env,
+                    )
+                    cache_updated = merge.returncode == 0
+                    if not cache_updated:
+                        cache_warning = (
+                            "缓存存在本地修改或分叉，未覆盖；继续分析现有缓存: "
+                            + _last_error_lines(merge.stderr)
+                        )
+                else:
+                    cache_warning = (
+                        "无法更新远程仓库，继续分析现有缓存: "
+                        + _last_error_lines(fetch.stderr)
+                    )
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                cache_warning = f"缓存更新失败，继续分析现有缓存: {exc}"
 
         # ── 分析克隆结果 ──
-        return self._analyze_cloned_repo(target_dir, repo, branch)
+        analysis = self._analyze_cloned_repo(target_dir, repo, branch)
+        analysis["cache_updated"] = cache_updated
+        if cache_warning:
+            analysis["cache_warning"] = cache_warning
+            analysis["content"] += f"\n\n- 缓存提示: {cache_warning}"
+        return analysis
 
     # ── clone_repo 辅助方法 ───────────────────────────────────
 
@@ -2232,7 +2364,31 @@ class ToolNode(BaseNode):
                 target_dir, e,
             )
 
-    def _resolve_branch_for_clone(self, clone_url: str, context: AgentContext) -> str:
+    @staticmethod
+    def _git_auth_env() -> dict[str, str]:
+        """Pass GitHub auth to git without embedding a token in the clone URL."""
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if token:
+            try:
+                config_index = int(env.get("GIT_CONFIG_COUNT", "0"))
+            except ValueError:
+                config_index = 0
+            env.update({
+                "GIT_CONFIG_COUNT": str(config_index + 1),
+                f"GIT_CONFIG_KEY_{config_index}": "http.extraHeader",
+                f"GIT_CONFIG_VALUE_{config_index}": f"Authorization: Bearer {token}",
+            })
+        return env
+
+    def _resolve_branch_for_clone(
+        self,
+        clone_url: str,
+        context: AgentContext,
+        *,
+        preferred_ref: str = "",
+    ) -> str:
         """决议 clone 使用的分支名。
 
         优先级：
@@ -2247,6 +2403,8 @@ class ToolNode(BaseNode):
         explicit = self._resolve_template(self.branch, context)
         if explicit and explicit.strip():
             return explicit.strip()
+        if preferred_ref:
+            return preferred_ref
 
         # 第 2 层：ls-remote 探测
         import subprocess
@@ -2254,6 +2412,7 @@ class ToolNode(BaseNode):
             result = subprocess.run(
                 ["git", "ls-remote", "--symref", clone_url, "HEAD"],
                 capture_output=True, text=True, timeout=10,
+                env=self._git_auth_env(),
             )
             if result.returncode == 0:
                 # 输出形如: ref: refs/heads/main	HEAD
