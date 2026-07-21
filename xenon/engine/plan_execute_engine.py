@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from xenon.engine.base import BaseEngine
@@ -16,7 +17,7 @@ from xenon.engine.callbacks import EngineCallback
 from xenon.engine.context import AgentContext
 from xenon.engine.plan_dag import PlanDAG, PlanDAGCycleError
 from xenon.engine.tool_tracker import ToolExecutionTracker
-from xenon.nodes.tool_executor import ToolExecutor
+from xenon.nodes.tool_executor import ToolExecuteResult, ToolExecutor
 from xenon.nodes.tool_node import ToolNode
 from xenon.utils.response_adapter import parse_plan, parse_react
 
@@ -24,6 +25,15 @@ if TYPE_CHECKING:
     from xenon.repl.context_manager import ContextManager
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StepOutcome:
+    """Structured execution state retained until dependency scheduling completes."""
+
+    content: str
+    success: bool
+    error: str | None = None
 
 PLAN_SYSTEM_PROMPT = """你是一个任务规划专家。将用户任务分解为可执行的原子步骤。
 
@@ -290,24 +300,27 @@ class PlanExecuteEngine(BaseEngine):
 
             if tool and tool != "null":
                 # 使用工具执行
-                result = self._execute_step_with_tool(tool, params, ctx, tracker)
+                raw_result = self._execute_step_with_tool(tool, params, ctx, tracker)
             else:
                 # 使用 LLM 执行 — §Q4 迷你 ReAct（会验证文件操作声明）
-                result = self._execute_step_with_llm(
+                raw_result = self._execute_step_with_llm(
                     step_id, len(steps), step_task, prev_results, user_input, tracker,
                     context=ctx,
                 )
+            outcome = self._step_outcome(raw_result)
 
             results.append({
                 "step_id": step_id,
                 "task": step_task,
-                "result": result,
+                "result": outcome.content,
+                "status": "ok" if outcome.success else "failed",
+                "error": outcome.error,
             })
 
-            ctx.set(f"step_{step_id}_result", result)
-            success = not result.startswith(("执行失败", "执行异常"))
-            self.callback.on_step_done(step_id, success, result[:200])
-            logger.debug(f"步骤 {step_id} 完成: {result[:100]}")
+            ctx.set(f"step_{step_id}_result", outcome.content)
+            ctx.set(f"step_{step_id}_status", "ok" if outcome.success else "failed")
+            self.callback.on_step_done(step_id, outcome.success, outcome.content[:200])
+            logger.debug(f"步骤 {step_id} 完成: {outcome.content[:100]}")
         return results
 
     # ── Phase 2: DAG 波次执行（P2-E2） ────────────────────────
@@ -354,8 +367,15 @@ class PlanExecuteEngine(BaseEngine):
                 step_task = step.get("task", "")
                 result = "⏭️ 步骤已跳过：前置依赖失败或被跳过"
                 self.callback.on_step(sid, total, step_task)
-                results.append({"step_id": sid, "task": step_task, "result": result})
+                results.append({
+                    "step_id": sid,
+                    "task": step_task,
+                    "result": result,
+                    "status": "skipped",
+                    "error": "前置依赖失败或被跳过",
+                })
                 ctx.set(f"step_{sid}_result", result)
+                ctx.set(f"step_{sid}_status", "skipped")
                 skipped_ids.add(sid)
                 self.callback.on_step_done(sid, False, result[:200])
 
@@ -376,16 +396,23 @@ class PlanExecuteEngine(BaseEngine):
                 )
 
             # 合并（主线程，单线程，无竞争）：追加结果 + 合并隔离 tracker
-            for sid, step_task, result, sub_tracker in wave_results:
-                results.append({"step_id": sid, "task": step_task, "result": result})
-                ctx.set(f"step_{sid}_result", result)
+            for sid, step_task, outcome, sub_tracker in wave_results:
+                status = "ok" if outcome.success else "failed"
+                results.append({
+                    "step_id": sid,
+                    "task": step_task,
+                    "result": outcome.content,
+                    "status": status,
+                    "error": outcome.error,
+                })
+                ctx.set(f"step_{sid}_result", outcome.content)
+                ctx.set(f"step_{sid}_status", status)
                 if sub_tracker is not None:
                     tracker.calls.extend(sub_tracker.calls)
-                success = not result.startswith(("执行失败", "执行异常", "⏭️"))
-                if not success:
+                if not outcome.success:
                     failed_ids.add(sid)
-                self.callback.on_step_done(sid, success, result[:200])
-                logger.debug(f"步骤 {sid} 完成: {result[:100]}")
+                self.callback.on_step_done(sid, outcome.success, outcome.content[:200])
+                logger.debug(f"步骤 {sid} 完成: {outcome.content[:100]}")
 
         return results
 
@@ -393,12 +420,12 @@ class PlanExecuteEngine(BaseEngine):
         self, to_run: list[Any], dag: PlanDAG, user_input: str,
         results: list[dict[str, Any]], ctx: AgentContext,
         tracker: ToolExecutionTracker, total: int,
-    ) -> list[tuple[Any, str, str, None]]:
+    ) -> list[tuple[Any, str, StepOutcome, None]]:
         """波内串行执行（共享主 ctx/tracker，无并发无竞争）。
 
         返回 [(sid, task, result, None)]，sub_tracker=None 表示已直接写入主 tracker。
         """
-        out: list[tuple[Any, str, str, None]] = []
+        out: list[tuple[Any, str, StepOutcome, None]] = []
         for sid in to_run:
             step = dag.step(sid)
             step_task = step.get("task", "")
@@ -406,19 +433,19 @@ class PlanExecuteEngine(BaseEngine):
             params = step.get("params", {})
             prev_results = self._build_prev_results(results)
             if tool and tool != "null":
-                result = self._execute_step_with_tool(tool, params, ctx, tracker)
+                raw_result = self._execute_step_with_tool(tool, params, ctx, tracker)
             else:
-                result = self._execute_step_with_llm(
+                raw_result = self._execute_step_with_llm(
                     sid, total, step_task, prev_results, user_input, tracker,
                     context=ctx,
                 )
-            out.append((sid, step_task, result, None))
+            out.append((sid, step_task, self._step_outcome(raw_result), None))
         return out
 
     def _exec_wave_parallel(
         self, to_run: list[Any], dag: PlanDAG, user_input: str,
         results: list[dict[str, Any]], ctx: AgentContext, total: int,
-    ) -> list[tuple[Any, str, str, ToolExecutionTracker]]:
+    ) -> list[tuple[Any, str, StepOutcome, ToolExecutionTracker]]:
         """波内并发执行（ThreadPoolExecutor 包同步调用）。
 
         每个步骤持有**独立的隔离 ctx + tracker**（镜像 combined_engines._isolated_ctx），
@@ -429,7 +456,7 @@ class PlanExecuteEngine(BaseEngine):
         # 主线程预先算好每步 prev_results 快照
         prev_map = {sid: self._build_prev_results(results) for sid in to_run}
 
-        def work(sid: Any) -> tuple[Any, str, str, ToolExecutionTracker]:
+        def work(sid: Any) -> tuple[Any, str, StepOutcome, ToolExecutionTracker]:
             step = dag.step(sid)
             step_task = step.get("task", "")
             tool = step.get("tool")
@@ -440,35 +467,56 @@ class PlanExecuteEngine(BaseEngine):
             iso_tracker = ToolExecutionTracker()
             try:
                 if tool and tool != "null":
-                    result = self._execute_step_with_tool(tool, params, iso_ctx, iso_tracker)
+                    raw_result = self._execute_step_with_tool(
+                        tool, params, iso_ctx, iso_tracker,
+                    )
                 else:
-                    result = self._execute_step_with_llm(
+                    raw_result = self._execute_step_with_llm(
                         sid, total, step_task, prev_map[sid], user_input, iso_tracker,
                         context=iso_ctx,
                     )
+                outcome = self._step_outcome(raw_result)
             except Exception as e:  # 单步异常不连坐整波
                 logger.exception("DAG 并发步骤 %r 执行异常", sid)
-                result = f"执行异常: {e}"
-            return (sid, step_task, result, iso_tracker)
+                outcome = StepOutcome(f"执行异常: {e}", False, str(e))
+            return (sid, step_task, outcome, iso_tracker)
 
         workers = min(len(to_run), self.max_parallel_workers)
-        collected: dict[Any, tuple[Any, str, str, ToolExecutionTracker]] = {}
+        collected: dict[Any, tuple[Any, str, StepOutcome, ToolExecutionTracker]] = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(work, sid) for sid in to_run]
             for fut in futures:
-                sid, task, result, iso_tracker = fut.result()
-                collected[sid] = (sid, task, result, iso_tracker)
+                sid, task, outcome, iso_tracker = fut.result()
+                collected[sid] = (sid, task, outcome, iso_tracker)
         return [collected[sid] for sid in to_run]
 
     @staticmethod
     def _build_prev_results(results: list[dict[str, Any]]) -> str:
-        """从已完成步骤构建前序结果上下文（最近 3 步）。"""
-        if not results:
+        """Build context from successful steps only, never from failure text."""
+        successful = [result for result in results if result.get("status", "ok") == "ok"]
+        if not successful:
             return "(无)"
         return "\n".join(
             f"步骤 {r['step_id']}: {r['result'][:200]}"
-            for r in results[-3:]
+            for r in successful[-3:]
         )
+
+    @staticmethod
+    def _step_outcome(value: Any) -> StepOutcome:
+        """Normalize native tool results while preserving legacy test/extensions."""
+        if isinstance(value, StepOutcome):
+            return value
+        if isinstance(value, ToolExecuteResult):
+            return StepOutcome(
+                value.format_observation(),
+                value.success,
+                value.error,
+            )
+        text = str(value or "")
+        # Compatibility for custom/monkeypatched executors that still return
+        # plain strings. Native ToolExecutor results never rely on this guess.
+        success = not text.startswith(("执行失败", "执行异常", "工具执行失败", "⏭️"))
+        return StepOutcome(text, success, None if success else text)
 
     def _plan(self, user_input: str, context: AgentContext | None = None) -> dict[str, Any]:
         """Phase 1: 生成执行计划。"""
@@ -504,10 +552,9 @@ class PlanExecuteEngine(BaseEngine):
     def _execute_step_with_tool(
         self, tool: str, params: dict, context: AgentContext,
         tracker: ToolExecutionTracker | None = None,
-    ) -> str:
+    ) -> ToolExecuteResult:
         """使用工具执行步骤（F1: 委托 ToolExecutor 7 阶段流水线）。"""
-        result = self._tool_executor.execute(tool, params, context, tracker=tracker)
-        return result.format_observation()
+        return self._tool_executor.execute(tool, params, context, tracker=tracker)
 
     def _execute_step_with_llm(
         self, step_id: int, total: int, task: str, prev_results: str, original: str,
@@ -550,7 +597,18 @@ class PlanExecuteEngine(BaseEngine):
                 action_input = parsed.get("action_input") or {}
                 self.callback.on_act(action, action_input)
                 try:
-                    observation = self._execute_step_with_tool(action, action_input, ctx, tracker)
+                    raw_observation = self._execute_step_with_tool(
+                        action, action_input, ctx, tracker,
+                    )
+                    tool_outcome = self._step_outcome(raw_observation)
+                    observation = tool_outcome.content
+                    if (
+                        not tool_outcome.success
+                        and isinstance(raw_observation, ToolExecuteResult)
+                    ):
+                        hint = raw_observation.next_hint()
+                        if hint:
+                            observation += f"\n{hint}"
                 except Exception as e:  # noqa: BLE001 — 工具失败转观察，不中断迷你 ReAct
                     observation = f"⚠️ 工具执行失败: {e}"
                     logger.warning("迷你 ReAct 工具 %s 异常: %s", action, e)
@@ -659,7 +717,8 @@ class PlanExecuteEngine(BaseEngine):
     ) -> str:
         """汇总所有步骤的结果。"""
         results_text = "\n".join(
-            f"步骤 {r['step_id']} ({r['task']}): {r['result'][:300]}"
+            f"步骤 {r['step_id']} [{r.get('status', 'ok').upper()}] "
+            f"({r['task']}): {r['result'][:300]}"
             for r in results
         )
 
@@ -671,6 +730,8 @@ class PlanExecuteEngine(BaseEngine):
         messages = [
             {"role": "system", "content": (
                 "请根据以下执行结果，给出简洁的最终总结。"
+                "必须按 status 区分成功、失败和跳过；不得把 FAILED/SKIPPED "
+                "步骤描述成已完成。"
                 "如果某些步骤声称创建了文件但没有对应的工具执行记录，"
                 "请在总结中明确指出这些文件可能并未实际创建。"
             )},
