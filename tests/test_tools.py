@@ -497,7 +497,7 @@ class TestBatchOperations:
         assert (tmp_path / "b.py").read_text() == "fresh content too"
 
     def test_batch_edit_partial_failure(self, tmp_path):
-        """批量编辑部分失败。"""
+        """批量编辑预检失败时不应留下部分修改。"""
         (tmp_path / "a.py").write_text("hello")
         # b.py 不存在
 
@@ -508,8 +508,8 @@ class TestBatchOperations:
         node = ToolNode("be", action_type="batch_edit", edits=edits)
         result = node.execute(AgentContext())
         assert result["success"] is False  # 有一个失败
-        assert result["success_count"] == 1
-        assert (tmp_path / "a.py").read_text() == "world"  # 第一个成功了
+        assert result["success_count"] == 0
+        assert (tmp_path / "a.py").read_text() == "hello"
 
     def test_batch_edit_empty_edits(self):
         """批量编辑空列表应失败。"""

@@ -31,6 +31,7 @@ from urllib.parse import urlparse, quote
 from xenon.engine.context import AgentContext
 from xenon.utils.llm_client import _create_http_client
 from xenon.nodes.base import BaseNode
+from xenon.utils.atomic_write import atomic_write_bytes, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -733,6 +734,34 @@ class ToolNode(BaseNode):
 
     # ── 文件写入 ──────────────────────────────────────────
 
+    @staticmethod
+    def _snapshot_path(path: Path) -> tuple[bytes, int] | None:
+        """Capture exact file bytes and permissions for transactional rollback."""
+        if not path.exists():
+            return None
+        if not path.is_file():
+            raise IsADirectoryError(f"目标不是普通文件: {path}")
+        return path.read_bytes(), path.stat().st_mode & 0o7777
+
+    @staticmethod
+    def _rollback_paths(
+        paths: list[Path],
+        snapshots: dict[Path, tuple[bytes, int] | None],
+    ) -> list[str]:
+        """Restore written paths in reverse order and report rollback failures."""
+        errors: list[str] = []
+        for path in reversed(paths):
+            try:
+                snapshot = snapshots[path]
+                if snapshot is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    content, mode = snapshot
+                    atomic_write_bytes(path, content, mode=mode)
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+        return errors
+
     def _write_file(self, context: AgentContext) -> dict[str, Any]:
         """将内容写入文件。"""
         file_path = self._resolve_template(self.file_path or "", context)
@@ -760,22 +789,44 @@ class ToolNode(BaseNode):
         # 创建父目录
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        mode = "a" if self.append else "w"
         logger.info(f"[{self.id}] {'追加' if self.append else '写入'}文件: {path}")
 
-        with open(path, mode, encoding=self.encoding) as f:
-            f.write(content)
+        snapshot = self._snapshot_path(path)
+        if self.append and snapshot is not None:
+            previous = snapshot[0].decode(self.encoding)
+            final_content = previous + content
+        else:
+            final_content = content
+
+        try:
+            atomic_write_text(
+                path,
+                final_content,
+                backup=snapshot is not None,
+                encoding=self.encoding,
+            )
+        except Exception as exc:
+            return {
+                "action_type": "write_file",
+                "file_path": str(path),
+                "bytes_written": 0,
+                "success": False,
+                "error": f"原子写入失败: {exc}",
+            }
 
         # ── 写入后验证 ──
         verify_error = self._verify_write(path, content, self.append)
         if verify_error:
             logger.error(f"[{self.id}] 写入验证失败: {verify_error}")
+            rollback_errors = self._rollback_paths([path], {path: snapshot})
             return {
                 "action_type": "write_file",
                 "file_path": str(path),
                 "bytes_written": 0,
                 "success": False,
                 "error": verify_error,
+                "rolled_back": not rollback_errors,
+                "rollback_errors": rollback_errors,
             }
 
         result = {
@@ -854,24 +905,44 @@ class ToolNode(BaseNode):
             return {"error": f"找到 {count} 处匹配，请提供更多上下文", "success": False}
 
         new_content = content.replace(old_text, new_text, 1)
-        path.write_text(new_content, encoding=self.encoding)
+        snapshot = self._snapshot_path(path)
+        try:
+            atomic_write_text(
+                path,
+                new_content,
+                backup=True,
+                encoding=self.encoding,
+            )
+        except Exception as exc:
+            return {
+                "file": str(path),
+                "replacements": 0,
+                "success": False,
+                "error": f"原子编辑失败: {exc}",
+            }
 
         # ── 编辑后验证 ──
         try:
             actual = path.read_text(encoding=self.encoding)
             if actual != new_content:
+                rollback_errors = self._rollback_paths([path], {path: snapshot})
                 return {
                     "file": str(path),
                     "replacements": 0,
                     "success": False,
-                    "error": f"编辑验证失败: 文件内容与预期不一致",
+                    "error": "编辑验证失败: 文件内容与预期不一致",
+                    "rolled_back": not rollback_errors,
+                    "rollback_errors": rollback_errors,
                 }
         except Exception as e:
+            rollback_errors = self._rollback_paths([path], {path: snapshot})
             return {
                 "file": str(path),
                 "replacements": 0,
                 "success": False,
                 "error": f"编辑后验证读取失败: {e}",
+                "rolled_back": not rollback_errors,
+                "rollback_errors": rollback_errors,
             }
 
         result = {
@@ -930,7 +1001,7 @@ class ToolNode(BaseNode):
     # ── 批量操作 ──────────────────────────────────────────
 
     def _batch_write(self, context: AgentContext) -> dict[str, Any]:
-        """批量写入多个文件。原子性：全部成功才返回成功。"""
+        """Atomically write a group of files with all-or-nothing rollback."""
         if not self.files:
             return {
                 "action_type": "batch_write",
@@ -938,67 +1009,117 @@ class ToolNode(BaseNode):
                 "error": "batch_write 需要 files 参数，格式: [{\"path\": \"...\", \"content\": \"...\"}]",
             }
 
-        results = []
-        written_paths = []
+        prepared: list[tuple[int, Path, str, int]] = []
+        results: list[dict[str, Any]] = []
+        seen_paths: set[Path] = set()
 
-        try:
-            for i, file_spec in enumerate(self.files):
+        # Validate and snapshot the whole transaction before touching disk.
+        for i, file_spec in enumerate(self.files):
+            error = ""
+            path: Path | None = None
+            content = ""
+            content_bytes = 0
+            if not isinstance(file_spec, dict):
+                error = "文件描述必须是对象"
+            else:
                 path_str = file_spec.get("path") or file_spec.get("file_path", "")
-                file_content = file_spec.get("content", "")
-
+                content = file_spec.get("content", "")
                 if not path_str:
-                    results.append({"index": i, "success": False, "error": "缺少 path"})
-                    continue
-
-                # 安全验证
-                path = self._validate_path(path_str, for_write=True)
-                content_bytes = len(file_content.encode(self.encoding))
-                if content_bytes > MAX_WRITE_SIZE:
-                    results.append({
-                        "index": i, "path": str(path), "success": False,
-                        "error": f"内容过大: {content_bytes} 字节",
-                    })
-                    continue
-
-                # 创建父目录并写入
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(file_content, encoding=self.encoding)
-                written_paths.append(path)
-
-                # 验证
-                verify_error = self._verify_write(path, file_content, False)
-                if verify_error:
-                    results.append({
-                        "index": i, "path": str(path), "success": False,
-                        "error": verify_error,
-                    })
+                    error = "缺少 path"
+                elif not isinstance(content, str):
+                    error = "content 必须是字符串"
                 else:
-                    results.append({
-                        "index": i, "path": str(path), "success": True,
-                        "bytes": content_bytes,
-                    })
+                    try:
+                        path = self._validate_path(str(path_str), for_write=True)
+                        content_bytes = len(content.encode(self.encoding))
+                        if path in seen_paths:
+                            error = f"同一事务中路径重复: {path}"
+                        elif content_bytes > MAX_WRITE_SIZE:
+                            error = f"内容过大: {content_bytes} 字节"
+                        else:
+                            seen_paths.add(path)
+                    except Exception as exc:
+                        error = str(exc)
 
-            all_ok = all(r.get("success") for r in results)
-            success_count = sum(1 for r in results if r.get("success"))
+            if error or path is None:
+                results.append({
+                    "index": i,
+                    "path": str(path) if path else "",
+                    "success": False,
+                    "error": error or "无效路径",
+                })
+            else:
+                prepared.append((i, path, content, content_bytes))
+                results.append({
+                    "index": i,
+                    "path": str(path),
+                    "success": False,
+                    "error": "事务尚未提交",
+                })
 
+        if len(prepared) != len(self.files):
+            for result in results:
+                if result.get("error") == "事务尚未提交":
+                    result["error"] = "事务包含无效操作，已整体取消"
             return {
                 "action_type": "batch_write",
                 "total": len(self.files),
-                "success_count": success_count,
-                "success": all_ok,
+                "success_count": 0,
+                "success": False,
+                "rolled_back": False,
+                "error": "批量写入预检失败，未修改任何文件",
                 "results": results,
             }
 
-        except Exception as e:
+        snapshots = {path: self._snapshot_path(path) for _, path, _, _ in prepared}
+        written_paths: list[Path] = []
+        try:
+            for i, path, content, content_bytes in prepared:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(
+                    path,
+                    content,
+                    # Transaction snapshots provide rollback; avoiding .bak
+                    # files here keeps a failed batch completely side-effect free.
+                    backup=False,
+                    encoding=self.encoding,
+                )
+                written_paths.append(path)
+                verify_error = self._verify_write(path, content, False)
+                if verify_error:
+                    raise OSError(verify_error)
+                results[i] = {
+                    "index": i,
+                    "path": str(path),
+                    "success": True,
+                    "bytes": content_bytes,
+                }
+        except Exception as exc:
+            rollback_errors = self._rollback_paths(written_paths, snapshots)
+            for result in results:
+                result["success"] = False
+                result["error"] = "事务执行失败，已回滚"
             return {
                 "action_type": "batch_write",
+                "total": len(self.files),
+                "success_count": 0,
                 "success": False,
-                "error": f"批量写入异常: {e}",
+                "rolled_back": not rollback_errors,
+                "rollback_errors": rollback_errors,
+                "error": f"批量写入失败: {exc}",
                 "results": results,
             }
 
+        return {
+            "action_type": "batch_write",
+            "total": len(self.files),
+            "success_count": len(prepared),
+            "success": True,
+            "results": results,
+        }
+
     def _batch_edit(self, context: AgentContext) -> dict[str, Any]:
-        """批量编辑多个文件。每个 edit 独立验证。"""
+        """Apply a group of exact edits as one transactional operation."""
         if not self.edits:
             return {
                 "action_type": "batch_edit",
@@ -1006,64 +1127,109 @@ class ToolNode(BaseNode):
                 "error": "batch_edit 需要 edits 参数，格式: [{\"file_path\": \"...\", \"old_text\": \"...\", \"new_text\": \"...\"}]",
             }
 
-        results = []
+        results: list[dict[str, Any]] = []
+        staged_content: dict[Path, str] = {}
+        path_order: list[Path] = []
 
+        # Stage edits in memory. Repeated edits to one file are applied in the
+        # declared order and the file is written only once at commit time.
         for i, edit_spec in enumerate(self.edits):
-            file_path = edit_spec.get("file_path", "")
-            old_text = edit_spec.get("old_text", "")
-            new_text = edit_spec.get("new_text", "")
+            error = ""
+            path: Path | None = None
+            if not isinstance(edit_spec, dict):
+                error = "编辑描述必须是对象"
+                old_text = ""
+                new_text = ""
+                file_path = ""
+            else:
+                file_path = edit_spec.get("file_path", "")
+                old_text = edit_spec.get("old_text", "")
+                new_text = edit_spec.get("new_text", "")
+                if not file_path or not old_text:
+                    error = "缺少 file_path 或 old_text"
+                elif not isinstance(old_text, str) or not isinstance(new_text, str):
+                    error = "old_text 和 new_text 必须是字符串"
 
-            if not file_path or not old_text:
-                results.append({
-                    "index": i, "success": False,
-                    "error": "缺少 file_path 或 old_text",
-                })
-                continue
+            if not error:
+                try:
+                    path = self._validate_path(str(file_path), for_write=True)
+                    if not path.exists():
+                        error = f"文件不存在: {path}"
+                    else:
+                        if path not in staged_content:
+                            staged_content[path] = path.read_text(encoding=self.encoding)
+                            path_order.append(path)
+                        count = staged_content[path].count(old_text)
+                        if count == 0:
+                            error = "未找到匹配文本"
+                        elif count > 1:
+                            error = f"找到 {count} 处匹配，请提供更多上下文"
+                        else:
+                            staged_content[path] = staged_content[path].replace(
+                                old_text, new_text, 1
+                            )
+                except Exception as exc:
+                    error = f"编辑预检异常: {exc}"
 
-            try:
-                path = self._validate_path(file_path, for_write=True)
-                if not path.exists():
-                    results.append({
-                        "index": i, "file": str(path), "success": False,
-                        "error": f"文件不存在: {path}",
-                    })
-                    continue
+            results.append({
+                "index": i,
+                "file": str(path) if path else str(file_path),
+                "success": False,
+                "error": error or "事务尚未提交",
+            })
 
-                content = path.read_text(encoding=self.encoding)
-                count = content.count(old_text)
+        if any(result["error"] != "事务尚未提交" for result in results):
+            for result in results:
+                if result["error"] == "事务尚未提交":
+                    result["error"] = "事务包含无效操作，已整体取消"
+            return {
+                "action_type": "batch_edit",
+                "total": len(self.edits),
+                "success_count": 0,
+                "success": False,
+                "rolled_back": False,
+                "error": "批量编辑预检失败，未修改任何文件",
+                "results": results,
+            }
 
-                if count == 0:
-                    results.append({
-                        "index": i, "file": str(path), "success": False,
-                        "error": "未找到匹配文本",
-                    })
-                elif count > 1:
-                    results.append({
-                        "index": i, "file": str(path), "success": False,
-                        "error": f"找到 {count} 处匹配，请提供更多上下文",
-                    })
-                else:
-                    new_content = content.replace(old_text, new_text, 1)
-                    path.write_text(new_content, encoding=self.encoding)
-                    results.append({
-                        "index": i, "file": str(path), "success": True,
-                        "replacements": 1,
-                    })
+        snapshots = {path: self._snapshot_path(path) for path in path_order}
+        written_paths: list[Path] = []
+        try:
+            for path in path_order:
+                atomic_write_text(
+                    path,
+                    staged_content[path],
+                    backup=False,
+                    encoding=self.encoding,
+                )
+                written_paths.append(path)
+                verify_error = self._verify_write(path, staged_content[path], False)
+                if verify_error:
+                    raise OSError(verify_error)
+        except Exception as exc:
+            rollback_errors = self._rollback_paths(written_paths, snapshots)
+            for result in results:
+                result["error"] = "事务执行失败，已回滚"
+            return {
+                "action_type": "batch_edit",
+                "total": len(self.edits),
+                "success_count": 0,
+                "success": False,
+                "rolled_back": not rollback_errors,
+                "rollback_errors": rollback_errors,
+                "error": f"批量编辑失败: {exc}",
+                "results": results,
+            }
 
-            except Exception as e:
-                results.append({
-                    "index": i, "success": False,
-                    "error": f"编辑异常: {e}",
-                })
-
-        all_ok = all(r.get("success") for r in results)
-        success_count = sum(1 for r in results if r.get("success"))
-
+        for result in results:
+            result["success"] = True
+            result.pop("error", None)
+            result["replacements"] = 1
         return {
             "action_type": "batch_edit",
             "total": len(self.edits),
-            "success_count": success_count,
-            "success": all_ok,
+            "success_count": len(self.edits),
+            "success": True,
             "results": results,
         }
 
