@@ -14,6 +14,7 @@ from xenon.engine.novel_engine import NovelEngine
 from xenon.engine.plan_execute_engine import PlanExecuteEngine
 from xenon.engine.react_engine import ReActEngine
 from xenon.engine.reflection_engine import ReflectionEngine
+from xenon.repl.repl import REPL
 
 
 class TestBaseEngineInheritance:
@@ -88,3 +89,16 @@ class TestBaseEngineIsAbstract:
 
         with pytest.raises(TypeError):
             BaseEngine(["openai/gpt-4o"])  # run 是 abstractmethod
+
+
+class TestActualModelReporting:
+    def test_repl_prefers_engine_actual_model(self):
+        engine = SimpleNamespace(last_model_used="deepseek/deepseek-v4-flash")
+        assert REPL._engine_model_used(
+            engine,
+            ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"],
+        ) == "deepseek/deepseek-v4-flash"
+
+    def test_repl_falls_back_when_engine_has_not_completed_a_call(self):
+        engine = SimpleNamespace(last_model_used=None)
+        assert REPL._engine_model_used(engine, ["openai/gpt-4o"]) == "openai/gpt-4o"

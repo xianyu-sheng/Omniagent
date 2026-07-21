@@ -13,7 +13,8 @@ class TestBuildEndpointBaseUrlOverride:
         assert ep.base_url == "https://custom.example.com/v1"
         assert ep.api_key == "sk-test"
 
-    def test_default_base_url_when_none(self):
+    def test_default_base_url_when_none(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         ep = lc.build_endpoint("openai/gpt-4o", credentials={"openai": "sk-test"})
         assert ep.base_url == "https://api.openai.com/v1"
 

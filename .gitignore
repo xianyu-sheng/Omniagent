@@ -28,6 +28,7 @@ ENV/
 .pytest_cache/
 .tox/
 .coverage
+coverage.xml
 htmlcov/
 .mypy_cache/
 evals/reports/mock_report.md

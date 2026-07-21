@@ -813,6 +813,19 @@ class REPL:
             self.ctx_mgr.trim_last_user()
 
     @staticmethod
+    def _engine_model_used(engine: object, model_ids: list[str]) -> str | None:
+        """Return the model that actually answered, falling back safely.
+
+        Engine calls can fail over from ``model_ids[0]`` to a later provider.
+        ``BaseEngine.last_model_used`` records that successful provider so the
+        transcript and fixed bottom toolbar do not advertise the wrong model.
+        """
+        actual = getattr(engine, "last_model_used", None)
+        if isinstance(actual, str) and actual:
+            return actual
+        return model_ids[0] if model_ids else None
+
+    @staticmethod
     def _default_system_prompt() -> str:
         from datetime import datetime
         now = datetime.now()
@@ -2125,9 +2138,11 @@ class REPL:
             )
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
-            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            model_used = self._engine_model_used(engine, model_ids)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_used)
             self._render_engine_result(callback, result, "ReAct 结果")
-            self.status_bar.set_last_model(model_ids[0])
+            if model_used:
+                self.status_bar.set_last_model(model_used)
         except Exception as e:
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
@@ -2175,9 +2190,11 @@ class REPL:
             result = engine.run(user_input, self.agent_context, ctx_mgr=self.ctx_mgr)
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
-            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            model_used = self._engine_model_used(engine, model_ids)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_used)
             self._render_engine_result(callback, result, "Plan-Execute 结果")
-            self.status_bar.set_last_model(model_ids[0])
+            if model_used:
+                self.status_bar.set_last_model(model_used)
         except Exception as e:
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
@@ -2214,9 +2231,11 @@ class REPL:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
-            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            model_used = self._engine_model_used(engine, model_ids)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_used)
             self._render_engine_result(callback, result, "Reflection 结果")
-            self.status_bar.set_last_model(model_ids[0])
+            if model_used:
+                self.status_bar.set_last_model(model_used)
         except Exception as e:
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
@@ -2254,9 +2273,11 @@ class REPL:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
-            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            model_used = self._engine_model_used(engine, model_ids)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_used)
             self._render_engine_result(callback, result, "Plan+React 结果")
-            self.status_bar.set_last_model(model_ids[0])
+            if model_used:
+                self.status_bar.set_last_model(model_used)
         except Exception as e:
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
@@ -2294,9 +2315,11 @@ class REPL:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
-            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            model_used = self._engine_model_used(engine, model_ids)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_used)
             self._render_engine_result(callback, result, "Plan+Reflection 结果")
-            self.status_bar.set_last_model(model_ids[0])
+            if model_used:
+                self.status_bar.set_last_model(model_used)
         except Exception as e:
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
@@ -2334,9 +2357,11 @@ class REPL:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
-            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            model_used = self._engine_model_used(engine, model_ids)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_used)
             self._render_engine_result(callback, result, "React+Reflection 结果")
-            self.status_bar.set_last_model(model_ids[0])
+            if model_used:
+                self.status_bar.set_last_model(model_used)
         except Exception as e:
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
@@ -2373,9 +2398,11 @@ class REPL:
             result = engine.run(user_input, context=self.agent_context, ctx_mgr=self.ctx_mgr)
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)
-            self.ctx_mgr.add_assistant_message(result, model_used=model_ids[0])
+            model_used = self._engine_model_used(engine, model_ids)
+            self.ctx_mgr.add_assistant_message(result, model_used=model_used)
             self._render_engine_result(callback, result, "Novel 创作结果", border_style="magenta")
-            self.status_bar.set_last_model(model_ids[0])
+            if model_used:
+                self.status_bar.set_last_model(model_used)
         except Exception as e:
             self._captured_log = self._stop_log_capture()
             self._persist_engine_trace(engine)

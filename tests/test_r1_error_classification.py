@@ -85,6 +85,7 @@ class TestTransientErrorsSwitchModel:
         monkeypatch.setattr(base_mod, "chat_completion", fake)
         out = eng._call_llm([{"role": "user", "content": "hi"}])
         assert out == '{"final_answer":"ok"}'
+        assert eng.last_model_used == "anthropic/b"
 
     def test_500_switches_to_next(self, monkeypatch):
         eng, _ = _engine(["openai/a", "anthropic/b"])

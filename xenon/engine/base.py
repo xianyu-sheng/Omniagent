@@ -77,6 +77,10 @@ class BaseEngine(ABC):
         # last_provider_messages 供 REPL 按原协议持久到后续用户轮次。
         self._pending_native_response: Any = None
         self._last_provider_messages: list[dict[str, Any]] = []
+        # The provider that actually completed the most recent request.  This
+        # must not be inferred from model_priority[0]: fallback may succeed on
+        # a later model and the REPL/status bar should report the real model.
+        self.last_model_used: str | None = None
 
     def _begin_run(self) -> str:
         """P3-Q2: run() 起点调用——生成 run_id 并记日志，返回 run_id。
@@ -86,6 +90,7 @@ class BaseEngine(ABC):
         """
         from xenon.engine.trace import new_run_id, prefix
         self.run_id = new_run_id()
+        self.last_model_used = None
         self._pending_native_response = None
         self._last_provider_messages = []
         logging.getLogger("xenon.engine").info(
@@ -302,6 +307,7 @@ class BaseEngine(ABC):
                         model_id,
                         time.monotonic() - started_at,
                     )
+                self.last_model_used = model_id
                 return result
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
@@ -432,11 +438,13 @@ class BaseEngine(ABC):
                     mk = getattr(mc, "api_key", "") or ""
                     if mk and "/" in model_id:
                         creds = {model_id.split("/", 1)[0].lower(): mk}
-                return chat_completion_with_tools(
+                response = chat_completion_with_tools(
                     model_id, messages, tools=tools, response_format=response_format,
                     credentials=creds, base_url=base, max_tokens=mt,
                     temperature=self.temperature,
                 )
+                self.last_model_used = model_id
+                return response
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
                 if status in (401, 403):
