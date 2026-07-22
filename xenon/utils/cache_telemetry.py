@@ -317,6 +317,65 @@ class CacheEventStore:
         os.replace(temporary, self.path)
 
 
+class CacheSettingsStore:
+    """Small private store for reversible cache optimization preferences.
+
+    The file contains feature switches only.  Prompt text, tool definitions,
+    credentials and provider responses never enter this store.
+    """
+
+    def __init__(self, directory: str | Path | None = None) -> None:
+        configured = os.getenv("XENON_CACHE_DIR")
+        self.directory = Path(directory or configured or (Path.home() / ".xenon" / "cache"))
+        self.path = self.directory / "settings.json"
+        self._lock = threading.Lock()
+
+    def load(self) -> dict[str, Any]:
+        defaults: dict[str, Any] = {
+            "schema_version": _SCHEMA_VERSION,
+            "cache_affinity_enabled": True,
+        }
+        with self._lock:
+            try:
+                value = json.loads(self.path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                return defaults
+        if not isinstance(value, dict):
+            return defaults
+        enabled = value.get("cache_affinity_enabled")
+        if isinstance(enabled, bool):
+            defaults["cache_affinity_enabled"] = enabled
+        return defaults
+
+    def save_cache_affinity(self, enabled: bool) -> None:
+        payload = _canonical_json({
+            "schema_version": _SCHEMA_VERSION,
+            "cache_affinity_enabled": bool(enabled),
+        }) + "\n"
+        with self._lock:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(
+                f".{self.path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+            )
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path)
+                self.path.chmod(0o600)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+
+
 def build_cache_event(
     manifest: Mapping[str, Any] | None,
     *,

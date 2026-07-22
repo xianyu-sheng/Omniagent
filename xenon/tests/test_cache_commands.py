@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from rich.console import Console
 
-from xenon.repl.commands import COMMANDS, _cmd_cache, _cmd_cost
+from xenon.repl.commands import COMMANDS, _cmd_cache, _cmd_cost, _cmd_fix_cache
 from xenon.repl.context_manager import ContextManager
 from xenon.repl.model_registry import ModelRegistry
 from xenon.repl.status_bar import StatusBar
@@ -122,3 +122,37 @@ def test_toolbar_shows_cold_na_and_actual_rate() -> None:
     tracker.record_response("deepseek-v4-flash", _response(hit=80, miss=20))
     assert "cache 80%" in "".join(text for _style, text in bar.get_toolbar_fragments())
     tracker.close()
+
+
+def test_cache_optimize_dry_run_is_read_only_and_fix_cache_is_real_alias(tmp_path) -> None:
+    tracker = CacheTracker(event_store=CacheEventStore(tmp_path))
+    state = _state(tracker)
+
+    dry_run = _cmd_cache(args="optimize --dry-run", session_state=state)
+    alias = _cmd_fix_cache(args="", session_state=state)
+
+    assert "/fix-cache" in COMMANDS
+    assert "Dry run" in dry_run
+    assert "没有修改任何设置" in dry_run
+    assert "Dry run" in alias
+    assert tracker.cache_settings_path is not None
+    assert not tracker.cache_settings_path.exists()
+    tracker.close()
+
+
+def test_cache_optimize_apply_and_disable_are_persisted(tmp_path) -> None:
+    tracker = CacheTracker(event_store=CacheEventStore(tmp_path))
+    state = _state(tracker)
+
+    disabled = _cmd_cache(args="optimize --disable", session_state=state)
+    assert "已关闭" in disabled
+    assert tracker.cache_affinity_enabled is False
+
+    applied = _cmd_cache(args="optimize --apply", session_state=state)
+    assert "已启用" in applied
+    assert tracker.cache_affinity_enabled is True
+    tracker.close()
+
+    restored = CacheTracker(event_store=CacheEventStore(tmp_path))
+    assert restored.cache_affinity_enabled is True
+    restored.close()

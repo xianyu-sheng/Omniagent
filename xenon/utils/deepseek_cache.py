@@ -33,7 +33,9 @@ from xenon.utils.cache_telemetry import (
     MANIFEST_RESPONSE_KEY,
     CacheEvent,
     CacheEventStore,
+    CacheSettingsStore,
     build_cache_event,
+    canonical_model_id,
     configure_persistent_secret,
 )
 
@@ -142,6 +144,7 @@ class CacheTracker:
     DROP_THRESHOLD = 0.40   # 相较近期平均值下降 40% 以上触发告警
     MIN_WINDOW_SIZE = 5     # 滚动窗口至少 5 次调用才开始检测
     NORMAL_HIT_RATE = 0.70  # "正常"命中率下限
+    AFFINITY_MAX_AGE_SECONDS = 30 * 60
 
     def __init__(
         self,
@@ -156,6 +159,14 @@ class CacheTracker:
         self._events: deque[CacheEvent] = deque(maxlen=200)
         self._family_calls: dict[str, int] = {}
         self._event_store = event_store or (CacheEventStore() if persist else None)
+        self._settings_store = (
+            CacheSettingsStore(self._event_store.directory)
+            if self._event_store is not None else None
+        )
+        settings = self._settings_store.load() if self._settings_store else {}
+        self._cache_affinity_enabled = bool(
+            settings.get("cache_affinity_enabled", True)
+        )
         if self._event_store is not None:
             try:
                 configure_persistent_secret(self._event_store.directory)
@@ -542,6 +553,91 @@ class CacheTracker:
             "state": events[-1].state,
             "cause": events[-1].cause,
             "cache_hit_rate": hit / total if total else None,
+        }
+
+    @property
+    def cache_affinity_enabled(self) -> bool:
+        """Whether equivalent-model routing may use recent cache evidence."""
+        return self._cache_affinity_enabled
+
+    @property
+    def cache_settings_path(self) -> Path | None:
+        return self._settings_store.path if self._settings_store else None
+
+    def set_cache_affinity_enabled(self, enabled: bool, *, persist: bool = True) -> bool:
+        """Set the reversible local routing preference.
+
+        Returns whether the preference was persisted.  In-memory trackers have
+        no settings file, so changing them is still successful but returns
+        ``False``.
+        """
+        previous = self._cache_affinity_enabled
+        self._cache_affinity_enabled = bool(enabled)
+        if not persist or self._settings_store is None:
+            return False
+        try:
+            self._settings_store.save_cache_affinity(self._cache_affinity_enabled)
+        except OSError:
+            self._cache_affinity_enabled = previous
+            raise
+        return True
+
+    def model_cache_affinity(self, model_id: str) -> dict[str, Any]:
+        """Return conservative, provider-backed affinity for one model.
+
+        Only the model's latest observed cache family is considered, it must
+        have an actual provider-reported hit, and the evidence expires after
+        30 minutes.  The router uses this only as a tie-breaker between peers.
+        """
+        canonical = canonical_model_id(model_id)
+        events = self.stored_events(200)
+        relevant = [
+            event for event in events
+            if canonical_model_id(str(event.get("model_id", ""))) == canonical
+            and bool(event.get("cache_fields_present"))
+        ]
+        if not relevant:
+            return {
+                "eligible": False,
+                "score": 0.0,
+                "reason": "no_provider_evidence",
+            }
+
+        latest = relevant[-1]
+        age = max(0.0, time.time() - float(latest.get("timestamp", 0.0) or 0.0))
+        if age > self.AFFINITY_MAX_AGE_SECONDS:
+            return {
+                "eligible": False,
+                "score": 0.0,
+                "reason": "stale_provider_evidence",
+                "age_seconds": round(age, 1),
+            }
+        if latest.get("state") != "warm" or int(latest.get("cache_hit_tokens", 0)) <= 0:
+            return {
+                "eligible": False,
+                "score": 0.0,
+                "reason": "latest_family_not_warm",
+                "age_seconds": round(age, 1),
+            }
+
+        family = str(latest.get("cache_family", ""))
+        family_events = [
+            event for event in relevant[-20:]
+            if str(event.get("cache_family", "")) == family
+        ][-8:]
+        hit = sum(max(0, int(event.get("cache_hit_tokens", 0))) for event in family_events)
+        miss = sum(max(0, int(event.get("cache_miss_tokens", 0))) for event in family_events)
+        total = hit + miss
+        hit_rate = hit / total if total else 0.0
+        confidence = min(1.0, len(family_events) / 2.0)
+        return {
+            "eligible": hit > 0,
+            "score": round(hit_rate * confidence, 4),
+            "reason": "recent_provider_hit",
+            "cache_family": family,
+            "calls": len(family_events),
+            "hit_rate": round(hit_rate, 4),
+            "age_seconds": round(age, 1),
         }
 
     # ── 命中率骤降检测 ─────────────────────────────────────

@@ -15,6 +15,8 @@
 - 状态栏使用 cold/warming/n/a/实际命中率语义；`/cost` 与退出报告不再把未提供缓存字段错误显示为 0%。
 - 普通文本、流式与原生工具请求统一经过五层 Prompt Compiler：STATIC、SESSION_STABLE、HISTORY、VOLATILE、CURRENT；编译器保持消息与工具协议语义顺序不变。
 - 工具 schema 和 response format 递归规范化并按工具名稳定排序，注册顺序变化不再制造新的工具前缀；动态 system 内容会进入 `/cache doctor` 告警而不会被静默改写。
+- AutoRouter 新增保守缓存亲和：只接受 30 分钟内厂商真实 hit 证据，并只在同 tier、健康、基础分差不超过 0.25 的模型间打破平局；显式模型、会话锁、能力和健康始终优先。
+- 新增 `/cache optimize --dry-run|--apply|--disable` 与真实 `/fix-cache` 别名；设置以私有本地 JSON 原子保存，可逆且不会改写 Prompt、工具协议或制造付费预热请求。
 
 ### 缓存前缀稳定性与本地版本一致性
 
@@ -33,7 +35,7 @@
 
 ### 验证
 
-- 离线回归：`1474 passed, 35 deselected`。
+- 离线回归：`1484 passed, 35 deselected`。
 - Ruff、`compileall`、SVG XML 校验、`git diff --check`、wheel 与 sdist 构建通过。
 
 ## [0.7.0] — 2026-07-22

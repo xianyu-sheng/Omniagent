@@ -170,8 +170,9 @@ Or add models permanently in `/setup`:
 The v0.7.0 work hardens the existing components, adds user-governed memory, and refreshes the TUI; it does
 not replace Xenon's top-level architecture. The three pillars remain:
 
-1. **Cache-aware cost loop** — DeepSeek cache usage, estimated CNY cost, and
-   prompt-prefix alignment are observable without an extra model call.
+1. **Cache-aware cost loop** — DeepSeek cache usage, request-family evidence,
+   deterministic prompt-prefix compilation, and conservative peer-model cache
+   affinity are observable and controllable without an extra model call.
 2. **8-engine auto-router** — From simple Q&A to plan-execute-reflect chains,
    each engine is a standalone module with pluggable callbacks.
 3. **7-stage tool pipeline** — Parameter normalization, hallucination checks,

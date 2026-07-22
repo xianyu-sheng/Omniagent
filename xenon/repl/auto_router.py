@@ -30,11 +30,18 @@ class AutoRouter:
         estimator: DifficultyEstimator | None = None,
         history: RoutingHistory | None = None,
         context_manager: Any = None,
+        cache_tracker: Any = None,
     ):
         self.pool = model_pool or ModelPool()
         self.estimator = estimator or DifficultyEstimator()
         self.history = history or RoutingHistory()
         self.ctx_mgr = context_manager  # v0.5.0：分层上下文管理
+        self.cache_tracker = cache_tracker
+        self.cache_affinity_max_score_gap = 0.25
+        self.last_cache_affinity_decision: dict[str, Any] = {
+            "applied": False,
+            "reason": "not_evaluated",
+        }
         # P1-B SAAR: 会话感知路由(粘性锁,防止 ReAct/Plan-Execute 中途切模型
         # 致上下文漂移 + prompt cache 失效)
         from xenon.repl.session_lock import SessionLock
@@ -76,6 +83,7 @@ class AutoRouter:
             return locked_ids
 
         entries = self.pool.select_best(profile, count=count)
+        entries = self._apply_cache_affinity(entries, profile)
 
         result_ids: list[str]
         if entries:
@@ -91,17 +99,12 @@ class AutoRouter:
 
         # v0.5.3: 用户显式指定的模型（-m）总是排在最前面
         if preferred_models:
-            preferred_set = set(preferred_models)
-            # 把 preferred_models 中在结果集里的放到最前面
-            prioritized = [m for m in preferred_models if m in result_ids]
-            # 追加其他模型（排除已添加的）
+            # Explicit choices may be outside ``select_best(count)``.  Start
+            # with them rather than appending them after an already-full
+            # fallback list, otherwise slicing would silently discard ``-m``.
+            prioritized = list(dict.fromkeys(preferred_models))
             for m in result_ids:
-                if m not in prioritized and m not in preferred_set:
-                    prioritized.append(m)
-            # 如果 preferred_models 全不在结果里，也确保它们排在前面
-            for m in preferred_models:
                 if m not in prioritized:
-                    # 模型可能不在 pool 中（通过 alias 注册的），直接加
                     prioritized.append(m)
             result_ids = prioritized[:count]
 
@@ -128,6 +131,90 @@ class AutoRouter:
         self.history.record(record)
 
         return result_ids
+
+    def _apply_cache_affinity(self, entries: list[Any], profile: TaskProfile) -> list[Any]:
+        """Use cache warmth only to break a near-tie between equivalent models.
+
+        Capability tier, base routing score, health, explicit preferences and
+        the session lock remain authoritative.  In particular, a warm lower
+        tier model can never outrank the leading tier through this method.
+        """
+        tracker = self.cache_tracker
+        enabled = bool(tracker and getattr(tracker, "cache_affinity_enabled", False))
+        before = [entry.model_id for entry in entries]
+        if not enabled:
+            self.last_cache_affinity_decision = {
+                "applied": False,
+                "reason": "disabled" if tracker else "tracker_unavailable",
+                "before": before,
+                "after": before,
+            }
+            return entries
+        if len(entries) < 2:
+            self.last_cache_affinity_decision = {
+                "applied": False,
+                "reason": "no_peer_candidate",
+                "before": before,
+                "after": before,
+            }
+            return entries
+
+        leader = entries[0]
+        leader_score = self.pool.score_for_profile(leader, profile)
+        peer_indexes: list[int] = []
+        evidence: dict[str, dict[str, Any]] = {}
+        for index, entry in enumerate(entries):
+            base_score = self.pool.score_for_profile(entry, profile)
+            if entry.capability.tier != leader.capability.tier:
+                continue
+            if leader_score - base_score > self.cache_affinity_max_score_gap:
+                continue
+            try:
+                affinity = tracker.model_cache_affinity(entry.model_id)
+            except Exception:
+                affinity = {"eligible": False, "score": 0.0, "reason": "tracker_error"}
+            peer_indexes.append(index)
+            evidence[entry.model_id] = {
+                **affinity,
+                "base_score": round(base_score, 4),
+                "tier": entry.capability.tier,
+            }
+
+        warm_peers = [
+            entries[index] for index in peer_indexes
+            if evidence[entries[index].model_id].get("eligible")
+        ]
+        if not warm_peers:
+            self.last_cache_affinity_decision = {
+                "applied": False,
+                "reason": "no_warm_equivalent_peer",
+                "before": before,
+                "after": before,
+                "evidence": evidence,
+            }
+            return entries
+
+        peers = [entries[index] for index in peer_indexes]
+        peers.sort(
+            key=lambda entry: (
+                float(evidence[entry.model_id].get("score", 0.0)),
+                float(evidence[entry.model_id]["base_score"]),
+            ),
+            reverse=True,
+        )
+        reordered = list(entries)
+        for index, entry in zip(peer_indexes, peers):
+            reordered[index] = entry
+        after = [entry.model_id for entry in reordered]
+        self.last_cache_affinity_decision = {
+            "applied": after != before,
+            "reason": "warm_equivalent_peer" if after != before else "leader_already_preferred",
+            "before": before,
+            "after": after,
+            "score_gap_limit": self.cache_affinity_max_score_gap,
+            "evidence": evidence,
+        }
+        return reordered
 
     def get_active_model_id(self) -> str | None:
         """Return the 'active' model display name for status bar."""
@@ -173,6 +260,12 @@ class AutoRouter:
         entries = self.pool.select_best(profile, count=count)
         fallback = [e.model_id for e in entries if e.model_id != locked_id]
         result_ids = ([locked_id] + fallback)[:count]
+        self.last_cache_affinity_decision = {
+            "applied": False,
+            "reason": "session_lock_precedence",
+            "before": result_ids,
+            "after": result_ids,
+        }
         scores = [self.pool.score_for_profile(e, profile) for e in entries] if entries else []
         self.history.record(RoutingRecord(
             timestamp=time.time(),

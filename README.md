@@ -54,15 +54,16 @@ v0.7.0 在新版 TUI、多模型、8 引擎和工具管线之上加入 User-Gove
 
 *缓存感知的费用闭环。全部本地计算，零额外 LLM 消费。*
 
-按 DeepSeek 2026-07-21 官方价格，V4 上下文缓存命中/未命中价差最高 **120 倍**。Xenon 内置三层监控，让缓存效益**可见、可量化、可优化**。
+按 DeepSeek 2026-07-21 官方价格，V4 上下文缓存命中/未命中价差最高 **120 倍**。Xenon 将缓存效益做成可观测、可解释且可安全调优的闭环。
 
 ```
 L1 · StatusBar   ● deepseek · context 3.1% · cache 99% · <¥0.01
-L2 · /cost       按模型拆分命中/未命中 token + 费用 breakdown + 节省
-L3 · 退出报告    /exit 时自动打印总账单
+L2 · /cache      status · explain · history · doctor · optimize
+L3 · /cost       按模型拆分命中/未命中 token + 费用 breakdown + 节省
+L4 · 退出报告    /exit 时自动打印总账单
 ```
 
-SHA256 去重 + 本地版本化定价快照 + PromptOptimizer 自动对齐前缀匹配窗口。
+五层 Prompt Compiler 稳定前缀，Prompt Manifest 用私有 HMAC 归因请求族；缓存亲和只在同能力层、基础分近似的健康模型之间打破平局，绝不以缓存换模型质量。
 
 📖 **[DeepSeek 缓存最佳实践指南 →](docs/deepseek-guide.md)** · 📐 **[架构 §Pillar 1 →](docs/ARCHITECTURE.md#-pillar-1--cache-aware-cost-loop缓存感知的费用闭环)**
 
@@ -150,7 +151,7 @@ xenon                                                     # 启动 REPL
 | **推理范式** | 8 种（direct · react · plan-execute · reflection · novel + 4 组合） |
 | **模型商** | 11 家预设 · 3 Tier 分级 · 故障自动转移 |
 | **MCP 生态** | Smithery 社区服务器 · 双传输 · 惰性加载 · `/mcp browse` 安装 |
-| **DeepSeek 缓存** | toolbar 实时 + `/cost` 面板 + 退出报告 + 命中率骤降告警 |
+| **DeepSeek 缓存** | 逐请求真实 usage + `/cache` 解释/诊断/历史 + 五层前缀编译 + 保守缓存亲和路由 |
 | **视觉桥接** | `Ctrl+Alt+V` 粘贴 → 多模态转录 → DeepSeek 推理 · SHA256 去重 |
 | **工程可靠性** | 断路器 · 三阶段预算 · 空洞检测 · 6 步上下文压缩 |
 | **透明记忆** | 四层作用域 · 写入确认/回执 · 自动容量治理 · 可恢复归档 · 安全导入 |
@@ -195,6 +196,8 @@ pip install -e ".[dev]"
 |----------|--|
 | `/setup` `/model <n>` `/models` | 配置与模型管理 |
 | `/mode [name]` `Shift+Tab` | 范式切换 |
+| `/cache status` `/cache explain` `/cache doctor` | 缓存状态、直接证据与确定性诊断 |
+| `/cache optimize --dry-run` `/fix-cache --apply` | 只读优化报告 · 启用可逆的同能力缓存亲和 |
 | `/cost` `/vision on\|off` | 费用追踪 · 视觉模式 |
 | `/mcp browse` `/mcp install` | MCP 生态 |
 | `/memory status` `/memory inspect` `/memory doctor` | 查看位置、单条元数据与系统健康状态 |

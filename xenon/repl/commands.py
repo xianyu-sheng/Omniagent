@@ -3333,7 +3333,12 @@ def _cmd_cost(*, args: str = "", session_state: dict = None, **kwargs: Any) -> s
 register_command(
     "/cache",
     "解释缓存状态与命中原因（完全本地，不调用 API）",
-    "/cache [status|explain|history [数量]|doctor]",
+    "/cache [status|explain|history [数量]|doctor|optimize --dry-run|--apply|--disable]",
+)
+register_command(
+    "/fix-cache",
+    "检查或启用安全的缓存优化（/cache optimize 的别名）",
+    "/fix-cache [--dry-run|--apply|--disable]",
 )
 
 _CACHE_CAUSE_LABELS = {
@@ -3439,6 +3444,73 @@ def _cache_doctor(tracker) -> str:
     return "\n".join(lines)
 
 
+def _cache_optimize(tracker, repl, mode: str) -> str:
+    """Inspect or toggle safe cache-aware routing without model calls."""
+    normalized = mode.strip().lower() or "--dry-run"
+    if normalized not in {"--dry-run", "--apply", "--disable", "--off"}:
+        return "用法: /cache optimize [--dry-run|--apply|--disable]"
+
+    if normalized == "--apply":
+        try:
+            persisted = tracker.set_cache_affinity_enabled(True, persist=True)
+        except OSError as exc:
+            return f"❌ 无法保存缓存优化设置，原设置保持不变: {exc}"
+        action = "✅ 已启用同能力模型缓存亲和"
+        persistence = "已持久化" if persisted else "仅当前会话"
+    elif normalized in {"--disable", "--off"}:
+        try:
+            persisted = tracker.set_cache_affinity_enabled(False, persist=True)
+        except OSError as exc:
+            return f"❌ 无法保存缓存优化设置，原设置保持不变: {exc}"
+        action = "⏸️ 已关闭同能力模型缓存亲和"
+        persistence = "已持久化" if persisted else "仅当前会话"
+    else:
+        action = "🔎 Dry run：没有修改任何设置"
+        persistence = "只读检查"
+
+    enabled = tracker.cache_affinity_enabled
+    lines = [
+        "[bold]Cache Optimize[/bold]",
+        f"  {action}（{persistence}）",
+        "",
+        "  ✅ 五层 Prompt Compiler：已启用",
+        "  ✅ 工具 schema 确定性排序：已启用",
+        f"  {'✅' if enabled else '⏸️'} 同能力模型缓存亲和：{'开启' if enabled else '关闭'}",
+        "  🛡️ 硬边界：只重排同 tier、健康且基础分差 ≤ 0.25 的模型",
+        "  🛡️ 优先级：显式 -m / 会话锁 / 能力与健康分 > 缓存信号",
+        "  🚫 不会改写 Prompt、改变工具协议或制造付费预热请求",
+    ]
+    settings_path = tracker.cache_settings_path
+    if settings_path is not None:
+        lines.append(f"  🔒 本地设置：{settings_path}（不含 Prompt 或凭据）")
+
+    decision = getattr(repl, "auto_router", None) if repl else None
+    decision = getattr(decision, "last_cache_affinity_decision", None)
+    if isinstance(decision, dict) and decision.get("reason") != "not_evaluated":
+        before = decision.get("before") or []
+        after = decision.get("after") or []
+        lines.append(
+            "  最近路由："
+            f"{decision.get('reason', 'unknown')} · "
+            f"{' → '.join(before[:1]) or '无候选'}"
+            f"{' → ' + str(after[0]) if after and after != before else ''}"
+        )
+
+    warnings = [
+        check for check in tracker.diagnostics()
+        if check.get("level") == "warn"
+    ]
+    if warnings:
+        lines.append("\n  需要人工判断（不会自动修改）：")
+        for check in warnings:
+            lines.append(f"    ⚠️ {check['name']}：{check['detail']}")
+    elif not tracker.latest_event:
+        lines.append("\n  ℹ️ 尚无响应样本；当前不能证明命中或未命中。")
+    else:
+        lines.append("\n  ✅ 当前未发现需要修改的稳定前缀问题。")
+    return "\n".join(lines)
+
+
 @_handler("/cache")
 def _cmd_cache(*, args: str = "", session_state: dict = None, **kwargs: Any) -> str:
     tracker = _cache_tracker(session_state)
@@ -3452,13 +3524,27 @@ def _cmd_cache(*, args: str = "", session_state: dict = None, **kwargs: Any) -> 
         return _cache_explain(tracker)
     if action == "doctor":
         return _cache_doctor(tracker)
+    if action == "optimize":
+        mode = parts[1] if len(parts) > 1 else "--dry-run"
+        repl = session_state.get("_repl") if session_state else None
+        return _cache_optimize(tracker, repl, mode)
     if action == "history":
         try:
             limit = min(100, max(1, int(parts[1]))) if len(parts) > 1 else 10
         except ValueError:
             return "用法: /cache history [1-100]"
         return _cache_history(tracker, limit)
-    return "用法: /cache [status|explain|history [数量]|doctor]"
+    return (
+        "用法: /cache [status|explain|history [数量]|doctor|"
+        "optimize --dry-run|--apply|--disable]"
+    )
+
+
+@_handler("/fix-cache")
+def _cmd_fix_cache(*, args: str = "", session_state: dict = None, **kwargs: Any) -> str:
+    """Compatibility entry point backed by the real cache optimizer."""
+    mode = args.strip() or "--dry-run"
+    return _cmd_cache(args=f"optimize {mode}", session_state=session_state)
 
 
 # ══════════════════════════════════════════════════════════════
