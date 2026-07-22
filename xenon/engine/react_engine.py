@@ -222,8 +222,8 @@ BUILTIN_TOOLS = {
     },
     "github_fetch": {
         "name": "github_fetch",
-        "description": "GitHub 专用读取工具。支持 owner/repo，以及仓库、blob、tree、issue、pull 和 raw 完整 URL；完整资源 URL 会自动选择对应动作。设置 GITHUB_TOKEN 或 GH_TOKEN 后支持私有仓库。",
-        "params": {"repo": "owner/repo 或完整 GitHub URL", "github_action": "list_files | fetch_file | fetch_readme | fetch_issue | fetch_pull", "github_path": "文件或目录路径", "branch": "分支名（可选；留空自动读取仓库默认分支）"},
+        "description": "GitHub 专用只读工具。支持 owner/repo，以及仓库、blob、tree、issue、pull 和 raw 完整 URL；repo_activity 可直接获取最近 push、PR 抽样和合并耗时等维护信号，无需克隆仓库。API 限流时会尝试公开 HTML 降级。设置 GITHUB_TOKEN 或 GH_TOKEN 后支持私有仓库。",
+        "params": {"repo": "owner/repo 或完整 GitHub URL", "github_action": "list_files | fetch_file | fetch_readme | fetch_issue | fetch_pull | repo_activity", "github_path": "文件或目录路径", "branch": "分支名（可选；留空自动读取仓库默认分支）"},
     },
     "weather": {
         "name": "weather",
@@ -399,6 +399,7 @@ class ReActEngine(BaseEngine):
         # v0.7.0: 重复工具调用检测 —— 记录最近 N 次 (tool_name, params_sig, turn)
         self._recent_calls: list[tuple[str, str, int]] = []
         self._max_recent_calls: int = 8
+        self._max_consecutive_tool_failures: int = 3
 
     def _params_signature(self, params: dict[str, Any]) -> str:
         """提取工具参数的特征签名，用于重复检测。
@@ -865,6 +866,17 @@ class ReActEngine(BaseEngine):
                     messages.append({"role": "user", "content": obs_msg})
                 logger.debug(f"ReAct 观察: {observation[:200]}")
                 no_tool_streak = 0
+                consecutive_failures = tracker.consecutive_failures()
+                if consecutive_failures >= self._max_consecutive_tool_failures:
+                    warning = (
+                        f"外部工具已连续失败 {consecutive_failures} 次，"
+                        "停止继续探索并基于现有证据生成回答"
+                    )
+                    logger.warning("ReAct: %s", warning)
+                    self.callback.on_warning(warning)
+                    result = self._mercy_compile(user_input, tracker, messages)
+                    self.callback.on_finish(result)
+                    return result
                 # F4: 每 5 轮压缩 in-run messages，抑制 O(n²) 增长；
                 # F2: 压缩成功时奖励预算（on_compression）
                 before_len = len(messages)

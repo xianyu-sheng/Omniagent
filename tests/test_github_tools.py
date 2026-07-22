@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import xenon.nodes.tool_node as tool_module
@@ -102,6 +103,19 @@ def test_parser_rejects_extra_segments_in_owner_repo_shorthand():
         parse_github_reference("owner/repo/extra")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/orgs/zhipuai/repositories",
+        "https://github.com/topics/agents",
+        "https://github.com/users/example/projects",
+    ],
+)
+def test_parser_rejects_non_repository_github_routes(url):
+    with pytest.raises(ValueError, match="站点页面"):
+        parse_github_reference(url)
+
+
 def test_list_files_resolves_real_default_branch_and_uses_token(monkeypatch):
     client = FakeClient([
         FakeResponse({"default_branch": "trunk"}),
@@ -156,6 +170,107 @@ def test_web_fetch_delegates_pasted_github_url(monkeypatch):
     assert result["success"] is True
     assert result["action_type"] == "github_fetch"
     assert result["content"] == "# project\n"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/zhipuai",
+        "https://github.com/orgs/zhipuai/repositories",
+        "https://github.com/topics/agents",
+    ],
+)
+def test_web_fetch_treats_github_organization_as_public_html(monkeypatch, url):
+    response = httpx.Response(
+        200,
+        text="<html><body><h1>Zhipu AI</h1><p>Repositories</p></body></html>",
+        request=httpx.Request("GET", url),
+    )
+    client = FakeClient([response])
+    monkeypatch.setattr(tool_module, "_create_http_client", lambda **kwargs: client)
+    monkeypatch.setattr(tool_module, "_ssrf_check_url", lambda _url: (True, ""))
+
+    result = ToolNode(
+        "web",
+        action_type="web_fetch",
+        url=url,
+    ).execute(AgentContext())
+
+    assert result["success"] is True
+    assert result["action_type"] == "web_fetch"
+    assert "Zhipu AI" in result["content"]
+
+
+def test_github_rate_limit_falls_back_to_public_html(monkeypatch):
+    limited = httpx.Response(
+        403,
+        headers={"x-ratelimit-remaining": "0"},
+        request=httpx.Request("GET", "https://api.github.com/repos/owner/repo"),
+    )
+    public = httpx.Response(
+        200,
+        text="<html><body><h1>owner/repo</h1><p>Public README</p></body></html>",
+        request=httpx.Request("GET", "https://github.com/owner/repo"),
+    )
+    clients = iter((FakeClient([limited]), FakeClient([public])))
+    monkeypatch.setattr(
+        tool_module,
+        "_create_http_client",
+        lambda **kwargs: next(clients),
+    )
+
+    result = ToolNode(
+        "gh",
+        action_type="github_fetch",
+        repo="owner/repo",
+        github_action="fetch_readme",
+    ).execute(AgentContext())
+
+    assert result["success"] is True
+    assert result["degraded"] is True
+    assert result["retryable"] is False
+    assert "API 限流" in result["content"]
+    assert "Public README" in result["content"]
+
+
+def test_repo_activity_returns_comparable_maintenance_signals(monkeypatch):
+    client = FakeClient([
+        FakeResponse({
+            "default_branch": "main",
+            "pushed_at": "2026-07-20T00:00:00Z",
+            "updated_at": "2026-07-21T00:00:00Z",
+            "open_issues_count": 12,
+        }),
+        FakeResponse([
+            {
+                "state": "closed",
+                "created_at": "2026-07-01T00:00:00Z",
+                "updated_at": "2026-07-03T00:00:00Z",
+                "merged_at": "2026-07-03T00:00:00Z",
+            },
+            {
+                "state": "open",
+                "created_at": "2026-07-10T00:00:00Z",
+                "updated_at": "2026-07-21T00:00:00Z",
+                "merged_at": None,
+            },
+        ]),
+    ])
+    monkeypatch.setattr(tool_module, "_create_http_client", lambda **kwargs: client)
+
+    result = ToolNode(
+        "gh",
+        action_type="github_fetch",
+        repo="owner/repo",
+        github_action="repo_activity",
+    ).execute(AgentContext())
+
+    assert result["success"] is True
+    assert result["sample_size"] == 2
+    assert result["open_pull_count"] == 1
+    assert result["merged_pull_count"] == 1
+    assert result["median_merge_hours"] == 48.0
+    assert "不能等同于官方 SLA" in result["content"]
 
 
 def test_tree_url_filters_to_requested_directory(monkeypatch):

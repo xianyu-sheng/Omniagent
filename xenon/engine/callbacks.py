@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import shutil
 import sys
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -291,11 +293,27 @@ class ConsoleCallback(EngineCallback):
     verbose 模式仍逐条输出调试信息。
     """
 
-    def __init__(self, *, verbose: bool = False) -> None:
+    _LONG_TOOL_TIMEOUTS = {
+        "clone_repo": 60,
+        "command": 60,
+        "git": 60,
+    }
+
+    def __init__(
+        self,
+        *,
+        verbose: bool = False,
+        progress_interval: float = 1.0,
+    ) -> None:
         self.verbose = verbose
         self._panel = ThinkingPanel()
         self._tool_seq: int = 0  # 工具调用序号
         self._activity_visible = False
+        self._activity_lock = threading.RLock()
+        self._progress_interval = max(0.05, float(progress_interval))
+        self._progress_stop: threading.Event | None = None
+        self._progress_thread: threading.Thread | None = None
+        self._progress_action = ""
 
     def _update_activity(self, text: str) -> None:
         """在同一终端行刷新活动摘要；非交互输出保持干净。"""
@@ -305,16 +323,66 @@ class ConsoleCallback(EngineCallback):
         clean = text.replace("\n", " ").strip()
         if len(clean) > width - 4:
             clean = clean[:width - 5] + "…"
-        sys.stdout.write(f"\r\033[2K  {clean}")
-        sys.stdout.flush()
-        self._activity_visible = True
+        with self._activity_lock:
+            sys.stdout.write(f"\r\033[2K  {clean}")
+            sys.stdout.flush()
+            self._activity_visible = True
+
+    def _start_progress(self, action: str, action_input: dict) -> None:
+        timeout = self._LONG_TOOL_TIMEOUTS.get(action)
+        if (
+            timeout is None
+            or self.verbose
+            or not getattr(sys.stdout, "isatty", lambda: False)()
+        ):
+            return
+        self._stop_progress()
+        stop = threading.Event()
+        self._progress_stop = stop
+        self._progress_action = action
+        brief = self._brief_params(action_input)
+        started = time.monotonic()
+
+        def heartbeat() -> None:
+            while not stop.wait(self._progress_interval):
+                elapsed = int(time.monotonic() - started)
+                suffix = f" · {brief}" if brief else ""
+                self._update_activity(
+                    f"⠿ {action}{suffix} · {elapsed}s/{timeout}s · Ctrl+C 取消"
+                )
+
+        self._progress_thread = threading.Thread(
+            target=heartbeat,
+            name=f"xenon-progress-{action}",
+            daemon=True,
+        )
+        self._progress_thread.start()
+
+    def _stop_progress(self, action: str | None = None) -> None:
+        if action is not None and action != self._progress_action:
+            return
+        stop = self._progress_stop
+        thread = self._progress_thread
+        self._progress_stop = None
+        self._progress_thread = None
+        self._progress_action = ""
+        if stop is not None:
+            stop.set()
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+        ):
+            thread.join(timeout=max(0.1, self._progress_interval * 2))
 
     def finish_activity(self) -> None:
         """清除瞬时活动行，不把探索细节留在滚动历史中。"""
-        if self._activity_visible:
-            sys.stdout.write("\r\033[2K")
-            sys.stdout.flush()
-            self._activity_visible = False
+        self._stop_progress()
+        with self._activity_lock:
+            if self._activity_visible:
+                sys.stdout.write("\r\033[2K")
+                sys.stdout.flush()
+                self._activity_visible = False
 
     # ── 辅助 ──
     @staticmethod
@@ -371,9 +439,11 @@ class ConsoleCallback(EngineCallback):
         else:
             suffix = f" · {brief}" if brief else ""
             self._update_activity(f"⠿ exploring  {action}{suffix}  ·  Ctrl+O details")
+            self._start_progress(action, action_input)
 
     def on_observe(self, observation: str) -> None:
         step = self._panel.add_observation(observation)
+        self._stop_progress(step.action)
         brief = self._brief_observation(observation)
         if self.verbose and brief:
             # 根据内容判断成功/失败

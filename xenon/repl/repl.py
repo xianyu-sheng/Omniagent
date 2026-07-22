@@ -2452,6 +2452,8 @@ class REPL:
                 except Exception:
                     pass
         finally:
+            if hasattr(callback, "finish_activity"):
+                callback.finish_activity()
             self._persist_engine_trace(engine)
             if getattr(self, "_log_capture_active", False):
                 self._captured_log = self._stop_log_capture()

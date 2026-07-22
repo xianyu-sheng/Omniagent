@@ -442,7 +442,13 @@ class ToolExecutor:
         last_error: str | None = None
         attempts = 0
         raw: dict[str, Any] | None = None
-        for attempt in range(1, self.retry_attempts + 1):
+        # A stateful or executing tool may have partially completed before a
+        # timeout.  Replaying it automatically can duplicate writes, commands,
+        # commits or long clones.  Only read-only INFO tools are retryable, and
+        # an individual tool result can explicitly opt out after doing its own
+        # fallback (for example GitHub API -> public HTML).
+        max_attempts = self.retry_attempts if tool_class == "INFO" else 1
+        for attempt in range(1, max_attempts + 1):
             attempts = attempt
             try:
                 node = ToolNode(f"exec_{tool_name}", action_type=tool_name, **params)
@@ -460,6 +466,8 @@ class ToolExecutor:
                 # 执行返回失败
                 last_error = str(result.get("error") or result)
                 breaker.record_failure()
+                if result.get("retryable") is False:
+                    break
                 if is_terminal_error(last_error):
                     break  # 终端错误不重试
                 logger.debug(f"工具 {tool_name} 第 {attempt} 次失败（瞬时）: {last_error[:120]}")

@@ -365,7 +365,7 @@ class ToolNode(BaseNode):
         mcp_server: str = "",
         # github_fetch / clone_repo 参数
         repo: str = "",
-        github_action: str = "list_files",  # list_files | fetch_file | fetch_readme
+        github_action: str = "list_files",  # list_files | fetch_file | fetch_readme | repo_activity
         github_path: str = "",
         branch: str = "",
         # weather 参数
@@ -1850,16 +1850,30 @@ class ToolNode(BaseNode):
         # selected web_fetch.
         host = (urlparse(url).hostname or "").lower()
         if host in {"github.com", "www.github.com", "raw.githubusercontent.com"}:
-            github_node = ToolNode(
-                f"{self.id}:github",
-                action_type="github_fetch",
-                repo=url,
-                branch="",
-                timeout=self.timeout,
-                output_slot=self.output_slot,
-                security_enabled=self.security_enabled,
-            )
-            return github_node._github_fetch(context)
+            try:
+                parse_github_reference(url)
+            except ValueError:
+                # Organization/user/search pages are ordinary public HTML, not
+                # repository references.  Keep them on the generic fetch path
+                # instead of returning the misleading "owner/repo" error.
+                if host == "raw.githubusercontent.com":
+                    return {
+                        "action_type": "web_fetch", "url": url,
+                        "content": "", "success": False,
+                        "retryable": False,
+                        "error": "无效的 GitHub raw 文件 URL",
+                    }
+            else:
+                github_node = ToolNode(
+                    f"{self.id}:github",
+                    action_type="github_fetch",
+                    repo=url,
+                    branch="",
+                    timeout=self.timeout,
+                    output_slot=self.output_slot,
+                    security_enabled=self.security_enabled,
+                )
+                return github_node._github_fetch(context)
 
         # A5: SSRF 防护 — 校验起始 URL 的目标 IP（覆盖 IPv6/编码 IP/元数据地址/file://）
         ok, reason = _ssrf_check_url(url)
@@ -2152,31 +2166,213 @@ class ToolNode(BaseNode):
                         "content": content, "success": True,
                     }
 
+                if action == "repo_activity":
+                    return self._github_repo_activity(
+                        client,
+                        context,
+                        repo,
+                        headers,
+                    )
+
                 return {
                     "action_type": "github_fetch", "repo": repo,
                     "action": action, "content": "", "success": False,
                     "error": (
                         f"不支持的 github_action: {action}（可选: list_files, "
-                        "fetch_file, fetch_readme, fetch_issue, fetch_pull）"
+                        "fetch_file, fetch_readme, fetch_issue, fetch_pull, "
+                        "repo_activity）"
                     ),
                 }
 
         except httpx.HTTPStatusError as e:
             remaining = e.response.headers.get("x-ratelimit-remaining", "")
             rate_hint = "（GitHub API 限流）" if remaining == "0" else ""
+            if e.response.status_code in {403, 429, 500, 502, 503, 504}:
+                fallback = self._github_html_fallback(
+                    context,
+                    repo,
+                    action,
+                    reference=reference,
+                    reason=f"HTTP {e.response.status_code}{rate_hint}",
+                )
+                if fallback.get("success"):
+                    return fallback
             return {
                 "action_type": "github_fetch", "repo": repo,
                 "action": action, "content": "", "success": False,
+                "retryable": False,
                 "error": (
                     f"GitHub API 错误: {e.response.status_code} "
                     f"{e.response.reason_phrase}{rate_hint}"
                 ),
             }
         except Exception as e:
+            fallback = self._github_html_fallback(
+                context,
+                repo,
+                action,
+                reference=reference,
+                reason=type(e).__name__,
+            )
+            if fallback.get("success"):
+                return fallback
             return {
                 "action_type": "github_fetch", "repo": repo,
                 "action": action, "content": "", "success": False,
+                "retryable": False,
                 "error": f"GitHub 操作失败: {e}",
+            }
+
+    def _github_repo_activity(
+        self,
+        client: Any,
+        context: AgentContext,
+        repo: str,
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        """Return compact public maintenance signals without cloning a repo."""
+        from datetime import datetime, timezone
+        from statistics import median
+
+        repo_resp = client.get(f"https://api.github.com/repos/{repo}", headers=headers)
+        repo_resp.raise_for_status()
+        repo_data = repo_resp.json()
+        pulls_resp = client.get(
+            f"https://api.github.com/repos/{repo}/pulls"
+            "?state=all&sort=updated&direction=desc&per_page=30",
+            headers=headers,
+        )
+        pulls_resp.raise_for_status()
+        pulls = pulls_resp.json()
+        if not isinstance(pulls, list):
+            pulls = []
+
+        merge_hours: list[float] = []
+        merged_count = 0
+        open_count = 0
+        now = datetime.now(timezone.utc)
+        recent_updates = 0
+        for pull in pulls:
+            if not isinstance(pull, dict):
+                continue
+            if pull.get("state") == "open":
+                open_count += 1
+            updated_at = self._parse_github_timestamp(pull.get("updated_at"))
+            if updated_at and (now - updated_at).days <= 90:
+                recent_updates += 1
+            created_at = self._parse_github_timestamp(pull.get("created_at"))
+            merged_at = self._parse_github_timestamp(pull.get("merged_at"))
+            if created_at and merged_at and merged_at >= created_at:
+                merged_count += 1
+                merge_hours.append((merged_at - created_at).total_seconds() / 3600)
+
+        median_merge = median(merge_hours) if merge_hours else None
+        lines = [
+            f"# GitHub 维护信号: {repo}",
+            f"- 默认分支: {repo_data.get('default_branch') or '-'}",
+            f"- 最近 push: {repo_data.get('pushed_at') or '-'}",
+            f"- 仓库更新时间: {repo_data.get('updated_at') or '-'}",
+            f"- Open issues/PR 汇总字段: {repo_data.get('open_issues_count', 0)}",
+            f"- 最近抽样 PR: {len(pulls)} 条；open {open_count}；merged {merged_count}",
+            f"- 90 天内有更新的抽样 PR: {recent_updates}",
+        ]
+        if median_merge is not None:
+            lines.append(f"- 已合并抽样 PR 的中位合并耗时: {median_merge:.1f} 小时")
+        lines.extend([
+            "",
+            "说明：以上是公开 API 的最近 30 条 PR 抽样信号，不能等同于官方 SLA；",
+            "比较多个项目时应使用相同时间窗口，并结合 CONTRIBUTING/提交入口核验。",
+        ])
+        content = "\n".join(lines)
+        self._write_output(context, content)
+        return {
+            "action_type": "github_fetch",
+            "repo": repo,
+            "action": "repo_activity",
+            "success": True,
+            "content": content,
+            "sample_size": len(pulls),
+            "open_pull_count": open_count,
+            "merged_pull_count": merged_count,
+            "recent_pull_updates": recent_updates,
+            "median_merge_hours": median_merge,
+        }
+
+    @staticmethod
+    def _parse_github_timestamp(value: Any):
+        from datetime import datetime
+
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def _github_html_fallback(
+        self,
+        context: AgentContext,
+        repo: str,
+        action: str,
+        *,
+        reference: Any,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Fall back to a public GitHub HTML page after API/network failure."""
+        if action == "fetch_issue" and reference.number is not None:
+            url = f"https://github.com/{repo}/issues/{reference.number}"
+        elif action == "fetch_pull" and reference.number is not None:
+            url = f"https://github.com/{repo}/pull/{reference.number}"
+        elif action == "repo_activity":
+            url = f"https://github.com/{repo}/pulls?q=is%3Apr"
+        else:
+            url = f"https://github.com/{repo}"
+
+        try:
+            with _create_http_client(
+                timeout=min(self.timeout, 20),
+                follow_redirects=False,
+            ) as client:
+                resp = _fetch_with_redirect_check(
+                    client,
+                    url,
+                    headers={"User-Agent": "Xenon/0.7"},
+                )
+                resp.raise_for_status()
+                text = self._html_to_text(resp.text)
+                if not text:
+                    raise ValueError("公开页面没有可读内容")
+                text = text[:30000]
+                content = (
+                    f"[GitHub API 不可用，已降级读取公开网页：{reason}]\n"
+                    f"来源: {url}\n\n{text}"
+                )
+                self._write_output(context, content[:5000])
+                return {
+                    "action_type": "github_fetch",
+                    "repo": repo,
+                    "action": action,
+                    "url": url,
+                    "content": content,
+                    "success": True,
+                    "degraded": True,
+                    "retryable": False,
+                }
+        except Exception as fallback_error:
+            logger.debug(
+                "[%s] GitHub HTML 降级失败 (%s): %s",
+                self.id,
+                reason,
+                fallback_error,
+            )
+            return {
+                "action_type": "github_fetch",
+                "repo": repo,
+                "action": action,
+                "content": "",
+                "success": False,
+                "retryable": False,
+                "error": f"GitHub HTML 降级失败: {fallback_error}",
             }
 
     @staticmethod
@@ -2299,10 +2495,15 @@ class ToolNode(BaseNode):
                     "error": "本机未安装 git，无法克隆仓库。请先安装 git。",
                 }
             except subprocess.TimeoutExpired:
+                self._rmtree_cleanup(target_dir)
                 return {
                     "action_type": "clone_repo", "repo": repo,
                     "success": False,
-                    "error": f"git clone 超时（>{self.timeout}s）",
+                    "retryable": False,
+                    "error": (
+                        f"git clone 超时（>{self.timeout}s），已停止并清理不完整缓存；"
+                        "为避免重复长任务，本次不会自动重试"
+                    ),
                 }
         else:
             logger.info(f"[{self.id}] 仓库已缓存: {target_dir}")

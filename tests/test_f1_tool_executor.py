@@ -1,10 +1,9 @@
 """F1 验收：ToolExecutor 7 阶段门面 + 参数幻觉校验 + 断路器 + 重试 + 结果封装。"""
-from xenon.engine.circuit_breaker import BreakerRegistry, CircuitBreaker
+from xenon.engine.circuit_breaker import CircuitBreaker
 from xenon.engine.context import AgentContext
 from xenon.engine.tool_tracker import ToolExecutionTracker
 from xenon.nodes import tool_executor as te_mod
 from xenon.nodes.tool_executor import (
-    ToolExecuteResult,
     ToolExecutor,
     classify_tool,
     is_terminal_error,
@@ -80,10 +79,14 @@ class TestValidateToolParams:
 class TestCircuitBreaker:
     def test_opens_after_threshold(self):
         t = {"v": 0}
-        clock = lambda: t["v"]
+
+        def clock():
+            return t["v"]
+
         b = CircuitBreaker(failure_threshold=3, cooldown=30, clock=clock)
         assert b.allow() is True
-        b.record_failure(); b.record_failure()
+        b.record_failure()
+        b.record_failure()
         assert b.state == "closed"  # 2 < 3
         b.record_failure()
         assert b.state == "open"
@@ -91,9 +94,13 @@ class TestCircuitBreaker:
 
     def test_half_open_after_cooldown(self):
         t = {"v": 0}
-        clock = lambda: t["v"]
+
+        def clock():
+            return t["v"]
+
         b = CircuitBreaker(failure_threshold=2, cooldown=10, clock=clock)
-        b.record_failure(); b.record_failure()
+        b.record_failure()
+        b.record_failure()
         assert b.state == "open"
         assert b.allow() is False  # 未冷却
         t["v"] = 10  # 冷却到期
@@ -102,9 +109,13 @@ class TestCircuitBreaker:
 
     def test_half_open_success_closes(self):
         t = {"v": 0}
-        clock = lambda: t["v"]
+
+        def clock():
+            return t["v"]
+
         b = CircuitBreaker(failure_threshold=2, cooldown=10, clock=clock)
-        b.record_failure(); b.record_failure()
+        b.record_failure()
+        b.record_failure()
         t["v"] = 10
         b.allow()  # half_open
         b.record_success()
@@ -113,9 +124,13 @@ class TestCircuitBreaker:
 
     def test_half_open_failure_doubles_cooldown(self):
         t = {"v": 0}
-        clock = lambda: t["v"]
+
+        def clock():
+            return t["v"]
+
         b = CircuitBreaker(failure_threshold=2, cooldown=10, clock=clock)
-        b.record_failure(); b.record_failure()
+        b.record_failure()
+        b.record_failure()
         assert b.cooldown == 10
         t["v"] = 10
         b.allow()  # half_open
@@ -184,6 +199,46 @@ class TestToolExecutorPipeline:
         r = ex.execute("read_file", {"file_path": "/x"}, AgentContext(), tools={"read_file": {}})
         assert r.success is True
         assert r.attempts == 3
+
+    def test_stateful_tool_is_never_replayed_after_timeout(self, monkeypatch):
+        _FakeNode.script = [
+            {"success": False, "error": "git clone timeout"},
+            {"success": True, "content": "would duplicate the operation"},
+        ]
+        ex = _executor(monkeypatch, retry_attempts=3)
+
+        result = ex.execute(
+            "clone_repo",
+            {"repo": "owner/repo"},
+            AgentContext(),
+            tools={"clone_repo": {}},
+        )
+
+        assert result.success is False
+        assert result.attempts == 1
+        assert len(_FakeNode.script) == 1
+
+    def test_tool_owned_fallback_can_disable_executor_retry(self, monkeypatch):
+        _FakeNode.script = [
+            {
+                "success": False,
+                "error": "GitHub API rate limit",
+                "retryable": False,
+            },
+            {"success": True, "content": "unexpected retry"},
+        ]
+        ex = _executor(monkeypatch, retry_attempts=3)
+
+        result = ex.execute(
+            "github_fetch",
+            {"repo": "owner/repo"},
+            AgentContext(),
+            tools={"github_fetch": {}},
+        )
+
+        assert result.success is False
+        assert result.attempts == 1
+        assert len(_FakeNode.script) == 1
 
     def test_terminal_error_no_retry(self, monkeypatch):
         _FakeNode.script = [{"success": False, "error": "文件不存在"}]

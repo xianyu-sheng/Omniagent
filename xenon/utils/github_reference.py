@@ -7,6 +7,21 @@ from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
 _PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_NON_REPOSITORY_ROUTES = frozenset({
+    "collections",
+    "enterprise",
+    "explore",
+    "features",
+    "marketplace",
+    "notifications",
+    "organizations",
+    "orgs",
+    "search",
+    "settings",
+    "sponsors",
+    "topics",
+    "users",
+})
 
 
 @dataclass(frozen=True)
@@ -60,6 +75,9 @@ def parse_github_reference(value: str) -> GitHubReference:
 
     if len(parts) < 2:
         raise ValueError("GitHub 仓库格式应为 owner/repo")
+
+    if host in {"github.com", "www.github.com"} and parts[0].lower() in _NON_REPOSITORY_ROUTES:
+        raise ValueError("GitHub URL 指向站点页面而不是 owner/repo 仓库")
 
     owner, repo = parts[0], parts[1]
     if repo.endswith(".git"):

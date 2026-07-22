@@ -4,6 +4,8 @@ Engine Callback 测试。
 
 from __future__ import annotations
 
+import time
+
 from xenon.engine.callbacks import ConsoleCallback, EngineCallback, SilentCallback
 
 
@@ -134,6 +136,38 @@ class TestConsoleCallback:
         assert [step.action for step in panel.steps] == ["datetime", "weather"]
         assert panel.steps[0].observation.startswith("[datetime]")
         assert panel.steps[1].observation.startswith("[weather]")
+
+    def test_long_tool_shows_elapsed_timeout_and_cancel_hint(self, monkeypatch):
+        class TTYBuffer:
+            def __init__(self):
+                self.parts: list[str] = []
+
+            @staticmethod
+            def isatty():
+                return True
+
+            def write(self, value):
+                self.parts.append(value)
+
+            @staticmethod
+            def flush():
+                return None
+
+        stream = TTYBuffer()
+        monkeypatch.setattr("xenon.engine.callbacks.sys.stdout", stream)
+        callback = ConsoleCallback(verbose=False, progress_interval=0.01)
+
+        callback.on_act("clone_repo", {"repo": "owner/repo"})
+        deadline = time.monotonic() + 1
+        while "Ctrl+C 取消" not in "".join(stream.parts) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        callback.on_observe("克隆完成")
+        rendered = "".join(stream.parts)
+
+        assert "clone_repo" in rendered
+        assert "/60s" in rendered
+        assert "Ctrl+C 取消" in rendered
+        assert callback._progress_thread is None
 
     def test_step_hidden_non_verbose(self, capsys):
         cb = ConsoleCallback()

@@ -73,6 +73,15 @@ class ToolExecutionTracker:
         """返回失败的工具名称列表。"""
         return [c.tool_name for c in self.calls if not c.success]
 
+    def consecutive_failures(self) -> int:
+        """Return the number of failures since the most recent success."""
+        count = 0
+        for call in reversed(self.calls):
+            if call.success:
+                break
+            count += 1
+        return count
+
     def execution_summary(self) -> str:
         """生成人类可读的执行摘要。"""
         if not self.calls:
