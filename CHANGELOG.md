@@ -5,6 +5,13 @@
 
 ## [Unreleased]
 
+### 缓存观测核心层
+
+- 为普通、流式和原生工具调用统一生成隐私安全的 Prompt Manifest，按模型、引擎、阶段、稳定前缀、工具模式和上下文压缩代次划分缓存族。
+- 新增逐请求缓存事件：记录厂商真实 hit/miss token、字段覆盖率、预期可缓存比例、前缀效率以及 cold/warming/warm/unavailable 状态；不持久化原始 Prompt 或工具内容。
+- 本地 JSONL 历史采用有界滚动存储；明确区分“厂商返回 0 命中”和“厂商未提供缓存字段”，避免把未知错误显示为 0%。
+- Reflection、Plan、ReAct、Novel、组合引擎与 Direct 对话均标注独立调用阶段；上下文 compact、clear、undo 会开启新的缓存代次。
+
 ### 缓存前缀稳定性与本地版本一致性
 
 - 上下文注入拆分为稳定层与易变层：固定引擎指令和项目上下文前置，已有对话历史保持连续，工作记忆与按轮检索记忆靠近当前用户请求。
@@ -22,7 +29,7 @@
 
 ### 验证
 
-- 离线回归：`1443 passed, 35 deselected`。
+- 离线回归：`1460 passed, 35 deselected`。
 - Ruff、`compileall`、SVG XML 校验、`git diff --check`、wheel 与 sdist 构建通过。
 
 ## [0.7.0] — 2026-07-22

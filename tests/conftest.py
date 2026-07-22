@@ -39,6 +39,13 @@ def _disable_security_for_tests():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_cache_telemetry(tmp_path, monkeypatch):
+    """Never let mocked REPL calls write telemetry into the user's home."""
+    monkeypatch.setenv("XENON_CACHE_DIR", str(tmp_path / "cache-telemetry"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _auto_confirm_destructive(monkeypatch):
     """P3-Q8：测试中破坏性操作的 Confirm.ask 自动确认，避免阻塞 stdin。
 

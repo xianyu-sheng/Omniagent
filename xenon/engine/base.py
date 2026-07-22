@@ -88,6 +88,7 @@ class BaseEngine(ABC):
         # must not be inferred from model_priority[0]: fallback may succeed on
         # a later model and the REPL/status bar should report the real model.
         self.last_model_used: str | None = None
+        self._active_cache_phase: str = "request"
 
     def _begin_run(self) -> str:
         """P3-Q2: run() 起点调用——生成 run_id 并记日志，返回 run_id。
@@ -292,6 +293,7 @@ class BaseEngine(ABC):
         max_tokens: int | None = None,
         *,
         model_priority: list[str] | None = None,
+        cache_phase: str | None = None,
     ) -> str:
         """调用 LLM，支持多模型 fallback。
 
@@ -311,6 +313,7 @@ class BaseEngine(ABC):
         """
         from xenon.engine.trace import new_call_id, prefix
         call_id = new_call_id()
+        effective_cache_phase = cache_phase or self._active_cache_phase
 
         def tp(message: str) -> str:
             return f"{prefix(self.run_id, call_id)} {message}"
@@ -335,6 +338,7 @@ class BaseEngine(ABC):
                     "temperature": self.temperature,
                     "credentials": creds,
                     "base_url": base,
+                    "cache_context": self._cache_context(effective_cache_phase),
                 }
                 effort = getattr(mc, "reasoning_effort", "") if mc else ""
                 if effort:
@@ -397,7 +401,12 @@ class BaseEngine(ABC):
                     f"退避 {wait:.1f}s 后重试(depth {self._call_retry_depth}/2)"))
                 import time as _t
                 _t.sleep(wait)
-                return self._call_llm(messages, max_tokens, model_priority=model_priority)
+                return self._call_llm(
+                    messages,
+                    max_tokens,
+                    model_priority=model_priority,
+                    cache_phase=effective_cache_phase,
+                )
             finally:
                 self._call_retry_depth -= 1
         self.callback.on_error(f"所有模型均调用失败: {last_error}")
@@ -454,6 +463,7 @@ class BaseEngine(ABC):
         tools: list[dict[str, Any]] | None,
         response_format: dict[str, Any] | None,
         max_tokens: int | None = None,
+        cache_phase: str | None = None,
     ) -> Any:
         """单层 native FC 调用，遍历 ``model_priority``。
 
@@ -484,6 +494,9 @@ class BaseEngine(ABC):
                     "base_url": base,
                     "max_tokens": mt,
                     "temperature": self.temperature,
+                    "cache_context": self._cache_context(
+                        cache_phase or self._active_cache_phase
+                    ),
                 }
                 effort = getattr(mc, "reasoning_effort", "") if mc else ""
                 if effort:
@@ -617,6 +630,8 @@ class BaseEngine(ABC):
         tools_schema: list[dict[str, Any]] | None = None,
         response_format: dict[str, Any] | None = None,
         max_tokens: int | None = None,
+        *,
+        cache_phase: str | None = None,
     ) -> str:
         """F5: 三层 LLM 降级（依赖 R3 ``chat_completion_with_tools``）。
 
@@ -634,6 +649,8 @@ class BaseEngine(ABC):
         """
         self._pending_native_response = None
         if not tools_schema and not response_format:
+            if max_tokens is None:
+                return self._call_llm(messages)
             return self._call_llm(messages, max_tokens=max_tokens)
 
         tiers = [
@@ -645,7 +662,12 @@ class BaseEngine(ABC):
         tiers = [(n, t, f) for n, t, f in tiers if (t or f)]
 
         for tier_name, tools, fmt in tiers:
-            resp = self._call_with_tools_once(messages, tools, fmt, max_tokens)
+            resp = self._call_with_tools_once(
+                messages,
+                tools,
+                fmt,
+                max_tokens,
+            )
             if resp is None:
                 continue  # 本层降级，试下一层
             if resp.has_tool_calls:
@@ -658,7 +680,74 @@ class BaseEngine(ABC):
             logger.warning(f"_call_llm_native {tier_name} 返回空，降级下一层")
 
         logger.warning("_call_llm_native 三层全败，回退 _call_llm")
+        if max_tokens is None:
+            return self._call_llm(messages)
         return self._call_llm(messages, max_tokens=max_tokens)
+
+    def _cache_context(self, phase: str) -> dict[str, Any]:
+        """Return stable request attribution shared by all engine call paths."""
+        epoch = getattr(self._ctx_mgr, "cache_epoch", 0) if self._ctx_mgr else 0
+        return {
+            "engine": type(self).__name__.removesuffix("Engine").lower(),
+            "phase": str(phase or "request").lower(),
+            "context_epoch": epoch,
+        }
+
+    def _call_llm_for_phase(
+        self,
+        phase: str,
+        messages: list[dict[str, str]],
+        max_tokens: int | None = None,
+        *,
+        model_priority: list[str] | None = None,
+    ) -> str:
+        """Tag a call phase without changing the replaceable ``_call_llm`` API."""
+        previous = self._active_cache_phase
+        self._active_cache_phase = phase
+        try:
+            if model_priority is None and max_tokens is None:
+                return self._call_llm(messages)
+            if model_priority is None:
+                return self._call_llm(messages, max_tokens=max_tokens)
+            if max_tokens is None:
+                return self._call_llm(
+                    messages,
+                    model_priority=model_priority,
+                )
+            return self._call_llm(
+                messages,
+                max_tokens=max_tokens,
+                model_priority=model_priority,
+            )
+        finally:
+            self._active_cache_phase = previous
+
+    def _call_llm_native_for_phase(
+        self,
+        phase: str,
+        messages: list[dict[str, str]],
+        tools_schema: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Tag a native-tool phase while preserving its public test seam."""
+        previous = self._active_cache_phase
+        self._active_cache_phase = phase
+        try:
+            if max_tokens is None:
+                return self._call_llm_native(
+                    messages,
+                    tools_schema,
+                    response_format,
+                )
+            return self._call_llm_native(
+                messages,
+                tools_schema,
+                response_format,
+                max_tokens,
+            )
+        finally:
+            self._active_cache_phase = previous
 
     def _has_pending_native_tool_calls(self) -> bool:
         """当前响应是否包含尚未写回历史的原生工具调用。"""
@@ -854,7 +943,7 @@ class BaseEngine(ABC):
         # ① 备选模型合成（有工具数据才值得合成）
         if tracker and tracker.has_executions():
             try:
-                answer = self._call_llm([
+                answer = self._call_llm_for_phase("synthesis", [
                     {"role": "system",
                      "content": "你是 Agent 的收尾合成器，直接输出最终回答，不要 JSON/ReAct 格式。"},
                     {"role": "user", "content": self._synthesis_prompt(user_input, tracker)},

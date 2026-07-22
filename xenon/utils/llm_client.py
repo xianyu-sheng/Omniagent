@@ -21,6 +21,11 @@ import logging
 import httpx
 import yaml
 
+from xenon.utils.cache_telemetry import (
+    MANIFEST_RESPONSE_KEY,
+    build_prompt_manifest,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -179,6 +184,38 @@ def _emit_response(model_id: str, data: dict[str, Any]) -> None:
             logger.warning("响应回调执行异常（已隔离）", exc_info=True)
 
 
+def _set_cache_manifest(
+    model_id: str,
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    request_shape: dict[str, Any] | None = None,
+    cache_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe the current request without retaining its original content."""
+    manifest = build_prompt_manifest(
+        model_id,
+        messages,
+        tools=tools,
+        request_shape=request_shape,
+        cache_context=cache_context,
+    ).as_dict()
+    _usage_tl.cache_manifest = manifest
+    return manifest
+
+
+def _response_with_manifest(
+    data: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach local-only attribution metadata to a callback copy."""
+    payload = dict(data)
+    current = manifest or getattr(_usage_tl, "cache_manifest", None)
+    if current:
+        payload[MANIFEST_RESPONSE_KEY] = dict(current)
+    return payload
+
+
 def register_usage_callback(cb) -> Any:
     """注册 usage 回调 ``cb(model_id, usage: LLMUsage, latency: float)``。
 
@@ -214,7 +251,7 @@ def _acc_usage(provider: str, data: dict[str, Any] | None, model_id: str = "") -
         acc.add(_extract_usage(data, provider))
     # 发出响应回调（供 CacheTracker 等订阅原始 API 响应）
     if isinstance(data, dict):
-        _emit_response(model_id, data)
+        _emit_response(model_id, _response_with_manifest(data))
 
 
 @dataclass
@@ -557,6 +594,7 @@ def chat_completion(
     max_tokens: int = 4096,
     temperature: float = 0.7,
     reasoning_effort: str | None = None,
+    cache_context: dict[str, Any] | None = None,
     timeout: float = 120.0,
     max_retries: int = 3,
 ) -> str:
@@ -574,6 +612,7 @@ def chat_completion(
     import time
 
     endpoint = build_endpoint(model_id, credentials, base_url)
+    _set_cache_manifest(model_id, messages, cache_context=cache_context)
     reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     # B4: 按厂商输出上限钳制 max_tokens，防止 131072 等超限值引发 400 级联失败
     provider_cap = _PROVIDER_DEFAULTS.get(endpoint.provider, {}).get("max_output_tokens")
@@ -942,6 +981,7 @@ def chat_completion_with_tools(
     max_tokens: int = 4096,
     temperature: float = 0.7,
     reasoning_effort: str | None = None,
+    cache_context: dict[str, Any] | None = None,
     timeout: float = 120.0,
     max_retries: int = 3,
 ) -> LLMResponse:
@@ -960,6 +1000,16 @@ def chat_completion_with_tools(
     import time
 
     endpoint = build_endpoint(model_id, credentials, base_url)
+    _set_cache_manifest(
+        model_id,
+        messages,
+        tools=tools,
+        request_shape={
+            "response_format": response_format,
+            "tool_choice": tool_choice,
+        },
+        cache_context=cache_context,
+    )
     reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     provider_cap = _PROVIDER_DEFAULTS.get(endpoint.provider, {}).get("max_output_tokens")
     if provider_cap and max_tokens > provider_cap:
@@ -1128,6 +1178,7 @@ def _call_anthropic_with_tools(
     resp = client.post(url, json=payload, headers=headers, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
+    _acc_usage(endpoint.provider, data, endpoint.model_name)
     blocks = data.get("content", []) or []
     text, tool_calls, _ = _parse_anthropic_tool_calls(blocks)
     # Anthropic stop_reason → OpenAI 风格 finish_reason
@@ -1170,6 +1221,7 @@ def chat_completion_stream(
     max_tokens: int = 4096,
     temperature: float = 0.7,
     reasoning_effort: str | None = None,
+    cache_context: dict[str, Any] | None = None,
     timeout: float = 300.0,
 ) -> Generator[str, None, None]:
     """
@@ -1179,14 +1231,18 @@ def chat_completion_stream(
         逐步生成的文本片段（delta）。
     """
     endpoint = build_endpoint(model_id, credentials, base_url)
+    manifest = _set_cache_manifest(model_id, messages, cache_context=cache_context)
     reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
     if endpoint.provider == "anthropic":
-        yield from _stream_anthropic(endpoint, messages, max_tokens, temperature, timeout, model_id)
+        yield from _stream_anthropic(
+            endpoint, messages, max_tokens, temperature, timeout, model_id, manifest,
+        )
     else:
         yield from _stream_openai_compat(
             endpoint, messages, max_tokens, temperature, timeout, model_id,
             reasoning_effort=reasoning_effort,
+            manifest=manifest,
         )
 
 
@@ -1199,6 +1255,7 @@ def _stream_openai_compat(
     model_id: str,
     *,
     reasoning_effort: str | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> Generator[str, None, None]:
     """OpenAI 兼容格式流式调用。
 
@@ -1248,7 +1305,7 @@ def _stream_openai_compat(
     if usage_data is not None:
         _emit_usage(model_id, _extract_usage(usage_data, endpoint.provider), time.time() - t0)
         # 发出响应回调（供 CacheTracker 等订阅原始 API 响应）
-        _emit_response(model_id, usage_data)
+        _emit_response(model_id, _response_with_manifest(usage_data, manifest))
 
 
 def _stream_anthropic(
@@ -1258,6 +1315,7 @@ def _stream_anthropic(
     temperature: float,
     timeout: float,
     model_id: str,
+    manifest: dict[str, Any] | None = None,
 ) -> Generator[str, None, None]:
     """Anthropic 原生格式流式调用。
 
@@ -1317,4 +1375,14 @@ def _stream_anthropic(
             model_id,
             LLMUsage(input_tokens, output_tokens, input_tokens + output_tokens),
             time.time() - t0,
+        )
+        _emit_response(
+            model_id,
+            _response_with_manifest(
+                {"usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                }},
+                manifest,
+            ),
         )

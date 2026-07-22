@@ -206,7 +206,7 @@ class ReflectionEngine(BaseEngine):
         else:
             messages.append({"role": "user", "content": user_input})
 
-        return self._call_llm(messages)
+        return self._call_llm_for_phase("execute", messages)
 
     def _review(self, user_input: str, output: str) -> dict[str, Any]:
         """审查阶段: LLM 审查输出。
@@ -219,7 +219,11 @@ class ReflectionEngine(BaseEngine):
             {"role": "user", "content": f"用户需求:\n{user_input}\n\n执行者输出:\n{output}"},
         ]
 
-        response = self._call_llm(messages, model_priority=self.reviewer_model_priority)
+        response = self._call_llm_for_phase(
+            "review",
+            messages,
+            model_priority=self.reviewer_model_priority,
+        )
         return self._parse_review(response)
 
     def _parse_review(self, response: str) -> dict[str, Any]:

@@ -29,6 +29,14 @@ from typing import Any
 
 import yaml
 
+from xenon.utils.cache_telemetry import (
+    MANIFEST_RESPONSE_KEY,
+    CacheEvent,
+    CacheEventStore,
+    build_cache_event,
+    configure_persistent_secret,
+)
+
 
 # ══════════════════════════════════════════════════════════════
 # DeepSeek 定价表（核对日期：2026-07-21，来自官方中文 API 文档）
@@ -112,6 +120,7 @@ class _ModelTotals:
     completion_tokens: int = 0
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
+    cache_reported_calls: int = 0
     # 费用
     input_cache_hit_cost: float = 0.0
     input_cache_miss_cost: float = 0.0
@@ -134,10 +143,26 @@ class CacheTracker:
     MIN_WINDOW_SIZE = 5     # 滚动窗口至少 5 次调用才开始检测
     NORMAL_HIT_RATE = 0.70  # "正常"命中率下限
 
-    def __init__(self, config_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        *,
+        persist: bool = False,
+        event_store: CacheEventStore | None = None,
+    ) -> None:
         # per-model 累计
         self._models: dict[str, _ModelTotals] = {}
         self._lock = threading.Lock()
+        self._events: deque[CacheEvent] = deque(maxlen=200)
+        self._family_calls: dict[str, int] = {}
+        self._event_store = event_store or (CacheEventStore() if persist else None)
+        if self._event_store is not None:
+            try:
+                configure_persistent_secret(self._event_store.directory)
+            except (OSError, ValueError):
+                # Continue with the process-local key when private storage is
+                # unavailable or a user-managed key is malformed.
+                pass
 
         # system prompt 变更跟踪
         self._system_hash: str = ""
@@ -201,6 +226,15 @@ class CacheTracker:
         if not isinstance(usage_data, dict):
             return
 
+        # 区分“厂商明确返回 0”与“厂商完全没有缓存字段”。后者不能展示成 0%。
+        cache_field_names = {
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+            "cache_hit_tokens",
+            "cache_miss_tokens",
+        }
+        cache_fields_present = any(name in usage_data for name in cache_field_names)
+
         # 提取缓存 token
         cache_hit = int(usage_data.get("prompt_cache_hit_tokens", 0)
                         or usage_data.get("cache_hit_tokens", 0)
@@ -210,9 +244,18 @@ class CacheTracker:
                          or 0)
 
         # 基础 token 数
-        prompt = int(usage_data.get("prompt_tokens", 0) or 0)
-        completion = int(usage_data.get("completion_tokens", 0) or 0)
+        prompt = int(usage_data.get("prompt_tokens", 0)
+                     or usage_data.get("input_tokens", 0)
+                     or 0)
+        completion = int(usage_data.get("completion_tokens", 0)
+                         or usage_data.get("output_tokens", 0)
+                         or 0)
         model_id = _canonical_model_id(model_id)
+
+        manifest = response_data.get(MANIFEST_RESPONSE_KEY)
+        if not isinstance(manifest, dict):
+            manifest = None
+        family = str((manifest or {}).get("cache_family") or f"legacy:{model_id}")
 
         # system prompt hash
         sys_hash = _hash_system_prompt(system_prompt) if system_prompt else ""
@@ -224,6 +267,11 @@ class CacheTracker:
             t.completion_tokens += completion
             t.cache_hit_tokens += cache_hit
             t.cache_miss_tokens += cache_miss
+            if cache_fields_present:
+                t.cache_reported_calls += 1
+
+            family_call = self._family_calls.get(family, 0) + 1
+            self._family_calls[family] = family_call
 
             # 费用计算（纯本地乘法）
             pricing = self.get_pricing(model_id)
@@ -242,6 +290,25 @@ class CacheTracker:
                 system_hash=sys_hash,
             )
             t.window.append(snap)
+
+            event = build_cache_event(
+                manifest,
+                model_id=model_id,
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                cache_hit_tokens=cache_hit,
+                cache_miss_tokens=cache_miss,
+                cache_fields_present=cache_fields_present,
+                family_call=family_call,
+            )
+            self._events.append(event)
+
+        if self._event_store is not None:
+            try:
+                self._event_store.append(event)
+            except OSError:
+                # Telemetry must never make an otherwise valid model call fail.
+                pass
 
         # 跟踪 system hash 变化
         if sys_hash and sys_hash != self._system_hash:
@@ -339,6 +406,10 @@ class CacheTracker:
                 "cache_hit_tokens": t.cache_hit_tokens,
                 "cache_miss_tokens": t.cache_miss_tokens,
                 "cache_hit_rate": hit_rate,
+                "cache_reported_calls": t.cache_reported_calls,
+                "cache_field_coverage": (
+                    t.cache_reported_calls / t.calls if t.calls else 0.0
+                ),
                 "cost_yuan": round(total_cost, 4),
                 "saved_yuan": round(max(0, saved), 4),
             }
@@ -347,6 +418,31 @@ class CacheTracker:
     def all_models(self) -> list[str]:
         with self._lock:
             return list(self._models.keys())
+
+    def recent_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return recent privacy-safe per-request telemetry, newest last."""
+        with self._lock:
+            return [event.as_dict() for event in list(self._events)[-max(0, limit):]]
+
+    def family_snapshot(self, cache_family: str) -> dict[str, Any]:
+        """Summarize the current session's observations for one cache family."""
+        with self._lock:
+            events = [event for event in self._events if event.cache_family == cache_family]
+        if not events:
+            return {}
+        hit = sum(event.cache_hit_tokens for event in events)
+        miss = sum(event.cache_miss_tokens for event in events)
+        total = hit + miss
+        return {
+            "cache_family": cache_family,
+            "calls": len(events),
+            "model_id": events[-1].model_id,
+            "engine": events[-1].engine,
+            "phase": events[-1].phase,
+            "state": events[-1].state,
+            "cause": events[-1].cause,
+            "cache_hit_rate": hit / total if total else None,
+        }
 
     # ── 命中率骤降检测 ─────────────────────────────────────
 

@@ -177,6 +177,9 @@ class ContextManager:
         # other per-turn state) are kept near the current user request so a
         # change cannot invalidate the reusable conversation prefix.
         self._context_messages: dict[str, tuple[str, bool]] = {}
+        # Structural rewrites start a new cache family. Appending ordinary
+        # conversation turns deliberately keeps the same epoch.
+        self.cache_epoch: int = 0
         if track_real_usage:
             self._subscribe_usage()
 
@@ -566,6 +569,7 @@ class ContextManager:
         if not self._undo_stack:
             return False
         self.history = self._undo_stack.pop()
+        self.cache_epoch += 1
         # P3-Q1 续：回退到旧快照后，记录的真实 usage 已不对应当前 history → 失效
         self._real_usage = None
         return True
@@ -775,6 +779,7 @@ class ContextManager:
             self._suppress_usage = prev_suppress
 
         self.history = new_history
+        self.cache_epoch += 1
         # 压缩后 history 结构性变更，旧真实 usage 不再对应 → 失效，下次调用重新填充
         self._real_usage = None
         self._persist_compact_md(summary, session_id)
@@ -1147,6 +1152,7 @@ class ContextManager:
         self.save_snapshot()
         self.history.clear()
         self._working_memory.clear()
+        self.cache_epoch += 1
         # P3-Q1 续：清空后真实 usage 不再对应 → 失效
         self._real_usage = None
 

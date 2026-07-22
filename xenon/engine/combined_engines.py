@@ -220,7 +220,16 @@ class PlanReactEngine:
         try:
             for model_id in self.model_priority:
                 try:
-                    result = chat_completion(model_id, messages, max_tokens=4096, temperature=0.5)
+                    result = chat_completion(
+                        model_id,
+                        messages,
+                        max_tokens=4096,
+                        temperature=0.5,
+                        cache_context={
+                            "engine": "plan_react",
+                            "phase": "summarize",
+                        },
+                    )
                     if result and result.strip():
                         return result
                 except Exception:

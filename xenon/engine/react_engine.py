@@ -586,10 +586,14 @@ class ReActEngine(BaseEngine):
 
             # 调用 LLM（F5: native_fc 开启时走三层降级，否则纯文本 _call_llm）
             if self.native_fc and tools_schema is not None:
-                response = self._call_llm_native(
-                    messages, tools_schema, response_format)
+                response = self._call_llm_native_for_phase(
+                    "reason_act",
+                    messages,
+                    tools_schema,
+                    response_format,
+                )
             else:
-                response = self._call_llm(messages)
+                response = self._call_llm_for_phase("reason_act", messages)
             # 原生工具调用必须等工具执行完后，与 reasoning_content、tool_call_id
             # 和 tool result 一起按协议写回；普通文本响应仍立即写入。
             if not self._has_pending_native_tool_calls():

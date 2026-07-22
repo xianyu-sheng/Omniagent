@@ -117,7 +117,7 @@ class REPL:
 
         # 状态栏
         from xenon.utils.deepseek_cache import CacheTracker
-        self._cache_tracker = CacheTracker()
+        self._cache_tracker = CacheTracker(persist=True)
         self.status_bar = StatusBar(console, self.ctx_mgr, self.registry,
                                     cache_tracker=self._cache_tracker)
 
@@ -2508,7 +2508,13 @@ class REPL:
 
         full_response = []
         model_config = self.registry.get_model_by_id(model_id)
-        request_options: dict[str, Any] = {}
+        request_options: dict[str, Any] = {
+            "cache_context": {
+                "engine": "direct",
+                "phase": "chat",
+                "context_epoch": self.ctx_mgr.cache_epoch,
+            },
+        }
         if model_config and model_config.reasoning_effort:
             request_options["reasoning_effort"] = model_config.reasoning_effort
 
@@ -2536,7 +2542,13 @@ class REPL:
 
         console.print(f"[dim]· 调用 {model_id}…[/dim]")
         model_config = self.registry.get_model_by_id(model_id)
-        request_options: dict[str, Any] = {}
+        request_options: dict[str, Any] = {
+            "cache_context": {
+                "engine": "direct",
+                "phase": "chat",
+                "context_epoch": self.ctx_mgr.cache_epoch,
+            },
+        }
         if model_config and model_config.reasoning_effort:
             request_options["reasoning_effort"] = model_config.reasoning_effort
         response = chat_completion(model_id, messages, **request_options)

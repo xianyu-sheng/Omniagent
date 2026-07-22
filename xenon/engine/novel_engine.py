@@ -341,7 +341,7 @@ class NovelEngine(BaseEngine):
                 break
             logger.debug(f"Novel 迭代 {i + 1}/{self.max_iterations}")
 
-            response = self._call_llm(messages)
+            response = self._call_llm_for_phase("create", messages)
             messages.append({"role": "assistant", "content": response})
 
             parsed = self._parse_response(response)

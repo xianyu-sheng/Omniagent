@@ -536,7 +536,7 @@ class PlanExecuteEngine(BaseEngine):
         # 关键：将当前用户输入加入消息列表
         messages.append({"role": "user", "content": user_input})
 
-        response = self._call_llm(messages)
+        response = self._call_llm_for_phase("plan", messages)
         if not response or not response.strip():
             logger.warning("LLM 返回了空响应！请检查 API 配置和模型是否支持。")
         else:
@@ -580,7 +580,11 @@ class PlanExecuteEngine(BaseEngine):
         final_answer: str | None = None
         last_response = ""
         for rnd in range(1, self.max_mini_react_rounds + 1):
-            last_response = self._call_llm(messages, model_priority=self.executor_model_priority)
+            last_response = self._call_llm_for_phase(
+                "execute_step",
+                messages,
+                model_priority=self.executor_model_priority,
+            )
             parsed = parse_react(last_response)
 
             if parsed.get("final_answer"):
@@ -737,7 +741,11 @@ class PlanExecuteEngine(BaseEngine):
             )},
         ]
         # P2-E2 双模型：总结阶段用 executor_model_priority
-        return self._call_llm(messages, model_priority=self.executor_model_priority)
+        return self._call_llm_for_phase(
+            "summarize",
+            messages,
+            model_priority=self.executor_model_priority,
+        )
 
     def _parse_json(self, text: str) -> dict[str, Any]:
         """从 LLM 输出中提取 JSON（委托给 response_adapter 中间件）。"""
