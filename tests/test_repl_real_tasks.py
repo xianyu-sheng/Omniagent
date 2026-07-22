@@ -243,10 +243,10 @@ class TestExplainIntent:
         assert not seen_in_engine, f"explain '{text}' 不应走 ReAct"
 
 
-# ── E. write_code 编程（应路由） ─────────────────────────
+# ── E. write_code 编程（默认仅输出到对话） ───────────────
 
 class TestWriteCodeIntent:
-    """write_code：detect_intent='write_code'，_detect_tool_need=True（无 intent 也命中 _TOOL_PATTERNS）。"""
+    """write_code 不隐式授权写盘或执行。"""
 
     WRITE_CODE_CASES = [
         "帮我写一个快速排序函数",
@@ -260,18 +260,21 @@ class TestWriteCodeIntent:
         assert detect_intent(text) == "write_code", f"意图: {text} → {detect_intent(text)}"
 
     @pytest.mark.parametrize("text", WRITE_CODE_CASES)
-    def test_write_code_routes_to_react(self, text, monkeypatch):
+    def test_write_code_routes_to_direct(self, text, monkeypatch):
         seen_in_engine: list[str] = []
+        seen_in_util: list[str] = []
         def responder(ctx):
             kind, model_id, messages = ctx
             if kind == "engine":
                 seen_in_engine.append(model_id)
                 return _final_answer_json("code")
-            return "direct"
+            seen_in_util.append(model_id)
+            return "```python\ndef quick_sort(values):\n    return values\n```"
         _patch_chat_all(monkeypatch, responder)
         repl = _make_repl(optimize_prompts=True)
         repl._handle_chat(text)
-        assert seen_in_engine, f"write_code '{text}' 应走 ReAct"
+        assert not seen_in_engine, f"write_code '{text}' 未授权副作用，不应走 ReAct"
+        assert seen_in_util, f"write_code '{text}' 应走 Direct"
 
 
 # ── F. 文件路径触发 ─────────────────────────────────────
@@ -424,14 +427,13 @@ class TestMixedIntent:
     def test_write_code_with_query_ambiguous(self, monkeypatch):
         """"写一个 Python 脚本查询天气" — write_code 模板有"脚本"关键词。
         TEMPLATES 顺序: write_code (line 142) 在 query (line 222) 之前。
-        预期: detect_intent='write_code' → 仍路由 ReAct（write_code 意图 + 无需 query 检测）。"""
+        预期: detect_intent='write_code' → 只生成脚本，不查询天气或写盘。"""
         text = "我想写一个 Python 脚本查询天气"
         # detect_intent 应先匹配 write_code
         intent = detect_intent(text)
         # 写代码脚本类会先触发 write_code 模板
-        # _detect_tool_need 走 _TOOL_PATTERNS，命中"写"+"脚本" → True
-        assert REPL._detect_tool_need(text, intent=intent) is True, (
-            f"写脚本查天气应路由工具: intent={intent}"
+        assert REPL._detect_tool_need(text, intent=intent) is False, (
+            f"仅生成脚本不应路由工具: intent={intent}"
         )
 
     def test_query_with_file_path(self, monkeypatch):
@@ -473,7 +475,7 @@ class TestModeSwitch:
     """/mode 切换后再输入 query。"""
 
     def test_mode_react_then_chat(self, monkeypatch):
-        """/mode react + "你好" — 应走 _run_react_engine（不再走 _run_direct）。"""
+        """/mode react 保留推理范式，但本轮执行策略仍禁止副作用。"""
         seen_in_engine: list[str] = []
         seen_in_util: list[str] = []
         def responder(ctx):
@@ -486,7 +488,7 @@ class TestModeSwitch:
         _patch_chat_all(monkeypatch, responder)
         repl = _make_repl(optimize_prompts=True, mode="react")
         repl._handle_chat("你好")
-        assert seen_in_engine, "react 模式下应走 ReAct 引擎"
+        assert seen_in_engine, "用户选择 react 后应保留 ReAct 引擎"
         assert not seen_in_util, "react 模式下不应走 direct LLM"
 
     def test_mode_plan_execute_then_query(self, monkeypatch):

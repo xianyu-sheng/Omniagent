@@ -124,10 +124,9 @@ class DifficultyEstimator:
 
     @staticmethod
     def _needs_tools(text: str, intent: str | None) -> bool:
-        if intent in ("query", "write_code"):
-            return True
-        from xenon.repl.repl import REPL
-        return REPL._detect_tool_need(text, intent=intent)
+        from xenon.repl.execution_policy import classify_execution_policy
+
+        return classify_execution_policy(text, intent=intent).requires_tools
 
     @staticmethod
     def _estimate_tokens(

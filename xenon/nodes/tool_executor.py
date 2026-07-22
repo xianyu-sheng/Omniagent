@@ -56,6 +56,81 @@ def classify_tool(tool_name: str) -> str:
     return "INFO"
 
 
+_MUTATING_MCP_NAME = re.compile(
+    r"(?:^|[:/_.-])(?:create|write|save|edit|update|delete|remove|insert|"
+    r"append|set|add|send|post|put|publish|deploy|commit|merge|execute|run)"
+    r"(?:$|[:/_.-])",
+    re.IGNORECASE,
+)
+_EXECUTING_MCP_NAME = re.compile(
+    r"(?:^|[:/_.-])(?:execute|run|command|shell|terminal|deploy)"
+    r"(?:$|[:/_.-])",
+    re.IGNORECASE,
+)
+_READ_ONLY_MCP_NAME = re.compile(
+    r"(?:^|[:/_.-])(?:get|list|search|read|fetch|query|find|lookup|inspect|"
+    r"view|show|browse|navigate|open|weather|time|date|status|describe)"
+    r"(?:$|[:/_.-])",
+    re.IGNORECASE,
+)
+
+
+def required_execution_level(tool_name: str, params: dict[str, Any]) -> int:
+    """Return the minimum per-turn execution level required by a tool.
+
+    Values intentionally match ``ExecutionLevel`` without importing the REPL
+    package into the low-level executor: 1=read, 2=write, 3=execute.
+    """
+
+    if tool_name == "mcp_call":
+        remote_name = str(params.get("tool_name", ""))
+        if not remote_name:
+            # Schema construction has no call parameters yet. Keep the MCP
+            # transport visible; the concrete remote name is checked again at
+            # execution time before any request is sent.
+            return 1
+        if _EXECUTING_MCP_NAME.search(remote_name):
+            return 3
+        if _MUTATING_MCP_NAME.search(remote_name):
+            return 2
+        if _READ_ONLY_MCP_NAME.search(remote_name):
+            return 1
+        # Unknown remote tools are not assumed to be read-only merely because
+        # they travel through a generic MCP transport.
+        return 3
+    if tool_name in _SENSITIVE_TOOLS or tool_name in _DYNAMIC_TOOLS:
+        return 3
+    if tool_name in _WRITE_TOOLS or tool_name == "create_skill":
+        return 2
+    if tool_name == "spawn_agent":
+        # A delegated agent could otherwise bypass the parent turn's boundary.
+        return 3
+    return 1
+
+
+def execution_policy_denial(
+    tool_name: str,
+    params: dict[str, Any],
+    context: AgentContext,
+) -> str | None:
+    """Return a hard-denial reason when a tool exceeds this turn's policy."""
+
+    authorized = context.get("_execution_level")
+    if authorized is None:
+        # Backward compatibility for direct engine/library users that have not
+        # opted into REPL-level policy classification.
+        return None
+    required = required_execution_level(tool_name, params)
+    if int(authorized) >= required:
+        return None
+    labels = {0: "仅回答", 1: "只读", 2: "可写入", 3: "可执行"}
+    return (
+        f"本轮执行策略为“{labels.get(int(authorized), str(authorized))}”，"
+        f"不允许工具 {tool_name} 所需的“{labels[required]}”权限。"
+        "如需扩大范围，请由用户在新指令中明确提出。"
+    )
+
+
 # ── 参数幻觉校验（7 类正则，组合判定） ─────────────────────
 _RE_FUNC_SIG = re.compile(r"\)\s*->\s*:|def\s+\w+\s*\([^)]*\)\s*:")
 _RE_WIN_ILLEGAL = re.compile(r"[<>|*?\"]")
@@ -296,6 +371,26 @@ class ToolExecutor:
             return ToolExecuteResult(tool_name, False, msg, error=msg, tool_class=tool_class)
 
         logger.debug(f"执行工具: {tool_name}, 参数: {mask_sensitive_params(params)}")
+
+        # ── Stage 1.5: 本轮执行策略硬边界 ──
+        policy_reason = execution_policy_denial(tool_name, params, context)
+        if policy_reason:
+            logger.info(f"执行策略拒绝: {tool_name} — {policy_reason}")
+            if tracker:
+                tracker.record(
+                    tool_name,
+                    params,
+                    False,
+                    policy_reason,
+                    error=policy_reason,
+                )
+            return ToolExecuteResult(
+                tool_name,
+                False,
+                f"⛔ {policy_reason}",
+                error=policy_reason,
+                tool_class=tool_class,
+            )
 
         # ── Stage 2: 参数幻觉校验 ──
         ok, reason = validate_tool_params(params)

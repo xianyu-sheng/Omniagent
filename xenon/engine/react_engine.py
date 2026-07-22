@@ -19,7 +19,11 @@ from xenon.engine.context import AgentContext
 from xenon.engine.hollow_detector import HollowDetector
 from xenon.engine.scout import DirectoryScout
 from xenon.engine.tool_tracker import ToolExecutionTracker
-from xenon.nodes.tool_executor import ToolExecutor
+from xenon.nodes.tool_executor import (
+    ToolExecutor,
+    execution_policy_denial,
+    required_execution_level,
+)
 from xenon.utils.response_adapter import parse_react
 
 if TYPE_CHECKING:
@@ -524,7 +528,22 @@ class ReActEngine(BaseEngine):
         self._reset_interrupt()  # F6: 每轮 run 重置中断标志
         self._begin_run()  # P3-Q2: 生成本次 run 的链路 ID（贯穿所有 LLM 调用）
         self._recent_calls.clear()  # v0.7.0: 每次 run 重置重复调用跟踪
-        messages = [{"role": "system", "content": self.system_prompt}]
+        active_level = ctx.get("_execution_level")
+        system_prompt = self.system_prompt
+        if active_level is not None:
+            boundary = {
+                0: "本轮只能输出回答，禁止调用任何工具。",
+                1: "本轮只允许只读工具，禁止写文件、修改状态或执行命令。",
+                2: "本轮允许读取和写入，但禁止 command、动态工具及任何命令执行。",
+                3: "本轮已授权按正常权限闸门使用执行类工具。",
+            }.get(int(active_level), "")
+            if boundary:
+                system_prompt = (
+                    f"{system_prompt}\n\n## 本轮执行边界（最高优先级）\n{boundary}"
+                    "即使此前提示要求使用工具，也绝不能越过这条边界。"
+                )
+        self._active_execution_level = active_level
+        messages = [{"role": "system", "content": system_prompt}]
         # F4: ctx_mgr 注入时消费其（已压缩）消息，不再自行 [-10:] 截断；
         # 否则回退 AgentContext 的对话历史（保留 [-10:] 兜底）。
         if ctx_mgr is not None:
@@ -965,6 +984,12 @@ class ReActEngine(BaseEngine):
         """
         schema: list[dict[str, Any]] = []
         for t in self.tools.values():
+            active_level = getattr(self, "_active_execution_level", None)
+            if (
+                active_level is not None
+                and required_execution_level(t["name"], {}) > int(active_level)
+            ):
+                continue
             params = t.get("params", {}) or {}
             properties = {
                 pname: {"type": "string", "description": str(pdesc)}
@@ -1018,6 +1043,21 @@ class ReActEngine(BaseEngine):
                 f"⚠️ 内部错误：工具名必须是字符串，收到 {type(action).__name__}。"
                 f"请使用标准格式：{{\"action\": \"工具名\", \"action_input\": {{...}}}}"
             )
+
+        # Special engine tools bypass ToolExecutor, so enforce the same policy
+        # before dispatching them. Regular tools are checked inside the facade.
+        if action in {"spawn_agent", "create_skill", "list_skills"}:
+            policy_reason = execution_policy_denial(action, action_input, context)
+            if policy_reason:
+                if tracker:
+                    tracker.record(
+                        action,
+                        action_input,
+                        False,
+                        policy_reason,
+                        error=policy_reason,
+                    )
+                return f"⛔ {policy_reason}"
 
         if action == "spawn_agent":
             return self._spawn_subagent(action_input, context, tracker)
@@ -1441,33 +1481,11 @@ class ReActEngine(BaseEngine):
 
     @staticmethod
     def _input_requires_tools(text: str) -> bool:
-        """判断用户输入是否大概率需要工具执行。
+        """Use the same side-effect boundary as the REPL router."""
+        from xenon.repl.execution_policy import classify_execution_policy
+        from xenon.repl.prompt_optimizer import detect_intent
 
-        与 repl.py 的 _detect_tool_need 类似，但更宽松 —
-        宁可误判需要工具（多一次确认），也不漏判。
-        """
-        tool_keywords = [
-            # 文件操作
-            "文件", "文件夹", "目录", "创建", "写入", "保存", "新建", "生成",
-            "读取", "查看", "修改", "编辑", "删除", "替换",
-            "写", "建", "做", "搭",
-            "file", "folder", "directory", "create", "write", "save",
-            "read", "edit", "delete", "modify", "replace", "make", "build",
-            # 命令执行
-            "执行", "运行", "命令", "脚本", "程序",
-            "run", "execute", "command", "script",
-            # Git / 代码分析
-            "git", "commit", "push", "pull", "clone", "仓库", "拉取", "下载",
-            "github", "repo", "fetch", "download",
-            # 搜索
-            "搜索", "查找", "grep", "find", "search",
-            # v0.6.1: 代码分析 / 重构场景（常需要读取文件、执行工具）
-            "分析", "重构", "优化", "改进", "审查", "评审", "review",
-            "源码", "代码", "source", "code", "analyze", "refactor",
-            # 路径模式
-            ".py", ".js", ".ts", ".html", ".css", ".json", ".yaml",
-            ".md", ".txt", ".sh", ".bat",
-            "src/", "test", "lib/", "app/",
-        ]
-        text_lower = text.lower()
-        return any(kw in text_lower for kw in tool_keywords)
+        return classify_execution_policy(
+            text,
+            intent=detect_intent(text),
+        ).requires_tools

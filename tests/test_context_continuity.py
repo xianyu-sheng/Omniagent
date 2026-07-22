@@ -144,7 +144,7 @@ def test_repl_binds_turn_hint_to_user_prompt_not_system_overlay(monkeypatch):
     monkeypatch.setattr(
         repl,
         "_run_direct",
-        lambda prompt, model_ids, intent=None: captured.append(prompt),
+        lambda prompt, model_ids, intent=None, execution_policy=None: captured.append(prompt),
     )
 
     repl._handle_chat("帮我写一个快速排序算法")

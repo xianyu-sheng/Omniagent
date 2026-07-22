@@ -31,6 +31,11 @@ from rich.theme import Theme
 from xenon.engine.context import AgentContext
 from xenon.repl.commands import COMMANDS, dispatch_command
 from xenon.repl.context_manager import ContextManager
+from xenon.repl.execution_policy import (
+    ExecutionLevel,
+    ExecutionPolicy,
+    classify_execution_policy,
+)
 from xenon.repl.model_registry import ModelRegistry
 from xenon.repl.project_context import ProjectContext
 from xenon.repl.prompt_optimizer import get_intent_display, optimize_prompt
@@ -1849,6 +1854,17 @@ class REPL:
             console.print("[dim]· 空输入已忽略[/dim]")
             return
 
+        # Side effects are authorized by the original request, never by the
+        # optimizer's generated wording or by the selected reasoning mode.
+        execution_policy = classify_execution_policy(
+            user_input,
+            intent=self._detect_intent(user_input),
+        )
+        self.agent_context.update({
+            "_execution_level": int(execution_policy.level),
+            "_execution_reason": execution_policy.reason,
+        })
+
         # Resolve the project before a memory command so the default
         # project-local destination is deterministic and visible in its receipt.
         self._inject_project_context()
@@ -1956,7 +1972,22 @@ class REPL:
         mode = self.registry.current_mode
 
         try:
-            if mode == "react":
+            if (
+                execution_policy.level is ExecutionLevel.ANSWER_ONLY
+                and intent == "write_code"
+            ):
+                if mode != "direct":
+                    console.print(
+                        "[dim cyan]💬 本轮未授权文件或命令操作，"
+                        "使用仅回答模式...[/dim cyan]"
+                    )
+                self._run_direct(
+                    turn_prompt,
+                    model_ids,
+                    intent=intent,
+                    execution_policy=execution_policy,
+                )
+            elif mode == "react":
                 self._run_react_engine(turn_prompt, model_ids)
             elif mode == "plan-execute":
                 self._run_plan_execute_engine(turn_prompt, model_ids)
@@ -1972,7 +2003,12 @@ class REPL:
                 self._run_novel_engine(turn_prompt, model_ids)
             else:
                 # direct 模式 — 直接调 LLM
-                self._run_direct(turn_prompt, model_ids, intent=intent)
+                self._run_direct(
+                    turn_prompt,
+                    model_ids,
+                    intent=intent,
+                    execution_policy=execution_policy,
+                )
         except KeyboardInterrupt:
             # B2: Ctrl+C 取消当前运行，返回提示符而非退出整个 REPL
             if getattr(self, "_log_capture_active", False):
@@ -1993,18 +2029,34 @@ class REPL:
         # must never become consent for long-term memory.
         self._maybe_suggest_memory(user_input)
 
-    def _run_direct(self, user_input: str, model_ids: list[str], intent: str | None = None) -> None:
+    def _run_direct(
+        self,
+        user_input: str,
+        model_ids: list[str],
+        intent: str | None = None,
+        execution_policy: ExecutionPolicy | None = None,
+    ) -> None:
         """直接对话模式。自动检测工具需求并委派给 ReAct 引擎。
 
         路由决策优先级（通用设计，不枚举具体领域）：
-        1. 明确的编程/文件/命令任务 → ReAct（_TOOL_PATTERNS 正则）
-        2. 已识别的 query/write_code 意图 → ReAct
-        3. MCP 工具可用 + 输入具有"外部信息查询"特征 → ReAct
+        1. 用户明确要求只回答/不写入/不执行 → direct
+        2. 明确的读取、文件变更或命令任务 → ReAct
+        3. 已识别的 query 意图 → ReAct；write_code 默认仅回答
+        4. MCP 工具可用 + 输入具有"外部信息查询"特征 → ReAct
            （通用语言结构判断，不枚举天气/高铁/酒店等具体领域）
-        4. 其他 → direct 模式（纯对话/解释/闲聊）
+        5. 其他 → direct 模式（纯对话/解释/闲聊）
         """
-        # 检测是否需要工具执行（编程/文件/命令任务，或 query 意图实时数据查询）
-        if self._detect_tool_need(user_input, intent=intent):
+        policy = execution_policy or classify_execution_policy(
+            user_input,
+            intent=intent,
+        )
+        self.agent_context.update({
+            "_execution_level": int(policy.level),
+            "_execution_reason": policy.reason,
+        })
+
+        # 检测是否需要工具执行（文件/命令任务，或 query 意图实时数据查询）
+        if policy.requires_tools:
             if intent == "query":
                 console.print("[dim cyan]🔧 检测到信息查询（需实时数据），自动切换到 ReAct 模式...[/dim cyan]")
             else:
@@ -2014,7 +2066,18 @@ class REPL:
 
         # v0.5.3: MCP 工具可用时，通用判断——任何具有"信息查询"特征的输入都走 ReAct，
         # 让 LLM 自行决定是否调用 mcp_call。不枚举具体查询领域（天气/高铁/酒店等）。
-        if self._has_mcp_tools() and _looks_like_external_query(user_input):
+        if (
+            self._has_mcp_tools()
+            and _looks_like_external_query(user_input)
+            and not policy.locks_answer_only
+        ):
+            # Some short external questions do not match a prompt template.
+            # MCP availability is enough to infer a read-only boundary, never
+            # a write/execute authorization.
+            self.agent_context.update({
+                "_execution_level": int(ExecutionLevel.READ_ONLY),
+                "_execution_reason": "外部信息查询仅授权只读 MCP 工具",
+            })
             console.print("[dim cyan]🔧 检测到可用 MCP 工具，自动切换到 ReAct 模式...[/dim cyan]")
             self._run_react_engine(user_input, model_ids)
             return
@@ -2063,12 +2126,6 @@ class REPL:
                     if captured:
                         direct_log_chunks.append(captured)
                     self._captured_log = "\n".join(direct_log_chunks)
-                self.status_bar.set_last_model(model_id)
-                self.model_pool.record_success(
-                    model_id,
-                    time.monotonic() - started_at,
-                )
-
                 if not response_text or not response_text.strip():
                     raise RuntimeError(f"模型 {model_id} 返回空响应")
 
@@ -2077,6 +2134,10 @@ class REPL:
                     # v0.6.1: direct 模式不传工具定义，但 LLM 训练数据中常含
                     # {"tool": "list_files", ...} 格式。检测到后自动切 ReAct。
                     if self._detect_tool_call_json(response_text):
+                        if policy.locks_answer_only:
+                            raise RuntimeError(
+                                "模型违反仅回答约束，返回了未执行的工具协议"
+                            )
                         console.print()
                         console.print(
                             "[dim cyan]🔧 检测到 LLM 尝试调用工具但 direct 模式不可用，"
@@ -2097,25 +2158,35 @@ class REPL:
 
                     # ── 响应后验证 2：检测 LLM 是否声称执行了文件操作 ──
                     if self._detect_file_claim(response_text):
-                        console.print()
-                        console.print("[dim cyan]🔧 检测到 LLM 声称执行了操作但未使用工具，自动切换到 ReAct 模式重新执行...[/dim cyan]")
-                        # P2-修复6 (观察项-1)：防御性 catch ——
-                        # _run_react_engine 内部已加占位（修复5），但万一占位也失败
-                        # （如 ctx_mgr 内部异常），这里再兜底一次防 user-only 序列。
-                        try:
-                            self._run_react_engine(user_input, model_ids)
-                        except Exception as e:
-                            console.print(f"[error]❌ ReAct 重试失败: {e}[/error]")
-                            try:
-                                self.ctx_mgr.add_assistant_message(
-                                    f"[错误] ReAct 重试失败: {e}", model_used=model_ids[0],
+                        if not (
+                            policy.level is ExecutionLevel.ANSWER_ONLY
+                            and intent == "write_code"
+                        ):
+                            if policy.locks_answer_only:
+                                raise RuntimeError(
+                                    "模型违反仅回答约束，声称执行了文件操作"
                                 )
-                            except Exception:
-                                pass
-                        return
+                            console.print()
+                            console.print("[dim cyan]🔧 检测到 LLM 声称执行了操作但未使用工具，自动切换到 ReAct 模式重新执行...[/dim cyan]")
+                            # P2-修复6 (观察项-1)：防御性 catch ——
+                            # _run_react_engine 内部已加占位（修复5），但万一占位也失败
+                            # （如 ctx_mgr 内部异常），这里再兜底一次防 user-only 序列。
+                            try:
+                                self._run_react_engine(user_input, model_ids)
+                            except Exception as e:
+                                console.print(f"[error]❌ ReAct 重试失败: {e}[/error]")
+                                try:
+                                    self.ctx_mgr.add_assistant_message(
+                                        f"[错误] ReAct 重试失败: {e}", model_used=model_ids[0],
+                                    )
+                                except Exception:
+                                    pass
+                            return
 
                     # ── 响应后验证 2：检测 LLM 是否回复了拒绝性内容 ──
                     if self._detect_denial(response_text):
+                        if policy.level is ExecutionLevel.ANSWER_ONLY:
+                            raise RuntimeError("模型拒绝了无需工具即可完成的请求")
                         console.print()
                         console.print("[dim]· LLM 无法完成任务 → ReAct 模式重试[/dim]")
                         # P2-修复6 (观察项-1)：与 file_claim 同根问题，同样防御性 catch
@@ -2130,6 +2201,57 @@ class REPL:
                             except Exception:
                                 pass
                         return
+
+                if intent == "write_code" and policy.level is ExecutionLevel.ANSWER_ONLY:
+                    from xenon.repl.code_response import validate_code_response
+
+                    checked = validate_code_response(user_input, response_text)
+                    if not checked.valid:
+                        console.print(
+                            f"[dim yellow]· 代码完整性校验未通过：{checked.reason}；"
+                            "正在请求同一模型重新生成[/dim yellow]"
+                        )
+                        retry_messages = [
+                            *messages,
+                            {"role": "assistant", "content": response_text},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "刚才的代码未通过完整性校验。请重新输出一份完整、"
+                                    "可运行的代码；只输出一个带语言标识且闭合的 Markdown "
+                                    "代码块，不要调用工具，不要声称写入文件或执行命令。"
+                                ),
+                            },
+                        ]
+                        self._start_log_capture()
+                        try:
+                            if self.streaming:
+                                response_text = self._stream_response(
+                                    model_id,
+                                    retry_messages,
+                                )
+                            else:
+                                response_text = self._blocking_response(
+                                    model_id,
+                                    retry_messages,
+                                )
+                        finally:
+                            captured = self._stop_log_capture()
+                            if captured:
+                                direct_log_chunks.append(captured)
+                            self._captured_log = "\n".join(direct_log_chunks)
+                        checked = validate_code_response(user_input, response_text)
+                        if not checked.valid:
+                            raise RuntimeError(
+                                f"模型重试后代码仍不完整：{checked.reason}"
+                            )
+                    response_text = checked.content
+
+                self.status_bar.set_last_model(model_id)
+                self.model_pool.record_success(
+                    model_id,
+                    time.monotonic() - started_at,
+                )
 
                 # 验证完成后再持久化和渲染，避免把 DSML/JSON 伪工具调用
                 # 短暂显示给用户后才切 ReAct。
@@ -2571,7 +2693,8 @@ class REPL:
         return detect_intent(text)
 
     # ── 工具需求检测 ──────────────────────────────────────────
-    # 只匹配明确的编程/文件/命令任务，不再枚举各种查询类型
+    # Deprecated pattern inventory retained for compatibility and diagnostics.
+    # The authoritative decision is ``classify_execution_policy`` below.
     _TOOL_PATTERNS: list[re.Pattern[str]] = [
         # 文件写入/创建/保存
         re.compile(r"(?:写入|创建|保存|新建|生成|输出).{0,20}(?:文件|到|至|为)", re.I),
@@ -2631,21 +2754,14 @@ class REPL:
     def _detect_tool_need(cls, text: str, intent: str | None = None) -> bool:
         """检测用户输入是否明确需要工具执行。
 
-        - ``query`` 意图（天气/价格/汇率/新闻等实时数据）：必然需要工具。direct 模式
-          不向 API 传工具，而 prompt_optimizer 会向其注入"使用工具获取实时数据"指令，
-          LLM 无工具可调时只能给出前言式回复（如"我来帮你查询…"）而非真实数据，
-          故 query 意图直接判 True，路由到 ReAct。
-        - 其余意图：仅匹配编程/文件/命令类正则（``_TOOL_PATTERNS``）。
+        ``query`` 和明确的读取/写入/执行请求需要工具；``write_code`` 只描述
+        产物类型，默认在对话中返回，不能被当作写盘或执行授权。显式的“不写入”
+        “不要运行”“只输出到对话”始终具有最高优先级。
         """
-        # P2-修复1: write_code 意图同样必然需要工具（写代码到文件 / 落盘执行），
-        # 与 query 同根：_TOOL_PATTERNS 中编程类正则要求"帮我/请/给"前缀，
-        # 无法覆盖"写一个 X"/"用 Y 写一个 Z"等自然语序。
-        if intent in ("query", "write_code"):
-            return True
-        for pattern in cls._TOOL_PATTERNS:
-            if pattern.search(text):
-                return True
-        return False
+        # Intent does not authorize side effects.  In particular, write_code
+        # defaults to returning code in chat unless the user explicitly asks
+        # Xenon to persist or execute it.
+        return classify_execution_policy(text, intent=intent).requires_tools
 
     def _has_mcp_tools(self) -> bool:
         """检查是否有 MCP 服务器可用（含已连接和惰性）。"""
