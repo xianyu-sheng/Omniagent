@@ -456,7 +456,10 @@ class ToolExecutor:
                 raw = result
                 if result.get("success", False):
                     breaker.record_success()
-                    summary = _extract_summary(result)
+                    summary = _extract_summary(
+                        result,
+                        str_cap=12000 if tool_name == "docs_fetch" else 3000,
+                    )
                     if tracker:
                         tracker.record(tool_name, params, True, summary[:200])
                     return ToolExecuteResult(

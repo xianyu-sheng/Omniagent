@@ -5,7 +5,7 @@
 - **EXPLORE**（前 25%）：鼓励探索，信息型工具不受限；
 - **EXECUTE**（中段 50%）：正常执行；
 - **CONVERGE**（末 25%）：收束阶段，禁用纯探索型工具（list_files/search_files/
-  code_index/ast_analyze/diff_preview/web_fetch/github_fetch），强制 LLM 走向
+  code_index/ast_analyze/diff_preview/web_fetch/docs_fetch/github_fetch），强制 LLM 走向
   合成与 final_answer。``read_file`` 不在禁用之列——收束阶段仍允许最终验证。
 
 奖励机制（规范 Q2 核心，"软预算"）：良好行为换额外轮次——
@@ -39,7 +39,7 @@ class BudgetPhase(str, Enum):
 # read_file 显式豁免——收束阶段仍允许"读一次验证"，只拦"反复 list/search 探索"。
 CONVERGE_BLOCKED_TOOLS = frozenset({
     "list_files", "search_files", "code_index", "ast_analyze",
-    "diff_preview", "web_fetch", "github_fetch",
+    "diff_preview", "web_fetch", "docs_fetch", "github_fetch",
 })
 
 

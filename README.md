@@ -157,6 +157,7 @@ xenon                                                     # 启动 REPL
 | **MCP 生态** | Smithery 社区服务器 · 双传输 · 惰性加载 · `/mcp browse` 安装 |
 | **Agent Skills** | 标准 `SKILL.md` · 用户/项目四层覆盖 · 正文与资源按需加载 · 兼容旧 YAML |
 | **外部集成 CLI** | `integrations describe --json` · 原子 Skill 安装 · MCP env/header 安全注入 |
+| **官方文档检索** | `docs_fetch` · llms.txt/llms-full.txt 优先 · 关键词选页 · HTML 透明降级 |
 | **DeepSeek 缓存** | 逐请求真实 usage + `/cache` 解释/诊断/历史 + 五层前缀编译 + 保守缓存亲和路由 |
 | **视觉桥接** | `Ctrl+Alt+V` 粘贴 → 多模态转录 → DeepSeek 推理 · SHA256 去重 |
 | **工程可靠性** | 断路器 · 三阶段预算 · 空洞检测 · 6 步上下文压缩 |

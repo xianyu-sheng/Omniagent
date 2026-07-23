@@ -3009,8 +3009,8 @@ class REPL:
         import re as _re
         # JSON 格式
         patterns = [
-            r'"tool"\s*:\s*"(?:list_files|read_file|write_file|command|web_fetch|git|search_files|edit_file|clone_repo|github_fetch)"',
-            r'"action"\s*:\s*"(?:list_files|read_file|write_file|command|web_fetch|git|search_files|edit_file|clone_repo|github_fetch)"',
+            r'"tool"\s*:\s*"(?:list_files|read_file|write_file|command|web_fetch|docs_fetch|git|search_files|edit_file|clone_repo|github_fetch)"',
+            r'"action"\s*:\s*"(?:list_files|read_file|write_file|command|web_fetch|docs_fetch|git|search_files|edit_file|clone_repo|github_fetch)"',
             r'"arguments"\s*:\s*\{',
             r'"action_input"\s*:\s*\{',
         ]

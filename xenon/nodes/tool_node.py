@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, quote
 
+import httpx
+
 from xenon.engine.context import AgentContext
 from xenon.utils.llm_client import _create_http_client
 from xenon.nodes.base import BaseNode
@@ -344,6 +346,9 @@ class ToolNode(BaseNode):
         git_command: str = "status",
         # web_fetch 参数
         url: str = "",
+        # docs_fetch 参数（query 复用下方通用 query）
+        max_pages: int = 4,
+        max_chars: int = 12000,
         # edit_file 参数
         old_text: str = "",
         new_text: str = "",
@@ -400,6 +405,8 @@ class ToolNode(BaseNode):
         self.file_filter = file_filter
         self.git_command = git_command
         self.url = url
+        self.max_pages = max_pages
+        self.max_chars = max_chars
         self.old_text = old_text
         self.new_text = new_text
         self.files = files or []
@@ -463,6 +470,7 @@ class ToolNode(BaseNode):
         "cwd", "timeout", "default_next", "encoding", "append",
         "pattern", "max_depth", "search_pattern", "file_filter",
         "git_command", "url", "old_text", "new_text",
+        "max_pages", "max_chars",
         "files", "edits", "symbol", "query",
         "old_name", "new_name", "refactor_action",
         "tool_name", "tool_args", "mcp_server",
@@ -654,6 +662,7 @@ class ToolNode(BaseNode):
             "search_files": self._search_files,
             "git": self._git,
             "web_fetch": self._web_fetch,
+            "docs_fetch": self._docs_fetch,
             "edit_file": self._edit_file,
             "create_directory": self._create_directory,
             "batch_write": self._batch_write,
@@ -1931,6 +1940,179 @@ class ToolNode(BaseNode):
                 "content": "", "success": False, "error": str(e),
             }
             self._write_output(context, f"抓取失败: {e}")
+            return result
+
+    def _docs_fetch(self, context: AgentContext) -> dict[str, Any]:
+        """Discover llms.txt and retrieve a bounded, query-relevant doc bundle."""
+        from xenon.utils.llms_txt import (
+            llms_candidate_urls,
+            parse_llms_txt,
+            select_llms_links,
+        )
+
+        url = self._resolve_template(self.url, context)
+        if not url:
+            url = self._resolve_template(self.action, context)
+        if not url:
+            raise ValueError(f"[{self.id}] docs_fetch 需要 url")
+        # ToolExecutor historically normalizes "query" to search_pattern.
+        query = self._resolve_template(
+            self.query or self.search_pattern, context
+        )
+        max_pages = max(0, min(int(self.max_pages), 8))
+        max_chars = max(1000, min(int(self.max_chars), 30000))
+        discovery_urls = llms_candidate_urls(url)
+        attempts: list[dict[str, Any]] = []
+
+        def fetch_text(client, target: str) -> tuple[str, str, int]:
+            ok, reason = _ssrf_check_url(target)
+            if not ok:
+                raise SecurityError(f"SSRF 拦截: {reason}")
+            response = _fetch_with_redirect_check(client, target)
+            if response.status_code == 404:
+                return "", str(response.url), 404
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            text = (
+                self._html_to_text(response.text)
+                if "text/html" in content_type
+                else response.text
+            )
+            return text, str(response.url), response.status_code
+
+        try:
+            with _create_http_client(timeout=self.timeout, follow_redirects=False) as client:
+                index_text = ""
+                index_url = ""
+                index_kind = ""
+                for candidate in discovery_urls:
+                    try:
+                        text, final_url, status = fetch_text(client, candidate)
+                    except (httpx.HTTPError, _SSRFRedirectError, SecurityError) as exc:
+                        attempts.append({"url": candidate, "error": str(exc)[:160]})
+                        continue
+                    attempts.append({"url": candidate, "status_code": status})
+                    if status == 404 or not text.strip():
+                        continue
+                    index_text = text
+                    index_url = final_url
+                    index_kind = final_url.rstrip("/").rsplit("/", 1)[-1].casefold()
+                    break
+
+                if index_text and index_kind in {
+                    "llms-full.txt", "llms-ctx.txt", "llms-ctx-full.txt",
+                }:
+                    truncated = len(index_text) > max_chars
+                    if truncated:
+                        suffix = "\n\n... (文档已按上下文预算截断)"
+                        content = index_text[:max(0, max_chars - len(suffix))] + suffix
+                    else:
+                        content = index_text
+                    result = {
+                        "action_type": "docs_fetch",
+                        "url": url,
+                        "strategy": "llms-full",
+                        "discovery_url": index_url,
+                        "discovery_attempts": attempts,
+                        "selected_sources": [index_url],
+                        "discovered_links": 0,
+                        "content": content,
+                        "content_length": len(content),
+                        "truncated": truncated,
+                        "success": True,
+                    }
+                    self._write_output(context, content[:5000])
+                    return result
+
+                if index_text:
+                    try:
+                        document = parse_llms_txt(index_text, index_url)
+                    except ValueError as exc:
+                        attempts.append({"url": index_url, "error": str(exc)})
+                    else:
+                        selected = select_llms_links(
+                            document, query, max_pages=max_pages
+                        )
+                        parts = [f"# {document.title}"]
+                        if document.summary:
+                            parts.append(f"> {document.summary}")
+                        if document.details:
+                            parts.append(document.details)
+                        selected_sources: list[str] = []
+                        source_errors: list[dict[str, str]] = []
+                        for link in selected:
+                            try:
+                                page, final_url, status = fetch_text(client, link.url)
+                                if status == 404 or not page.strip():
+                                    raise ValueError(f"HTTP {status}")
+                            except Exception as exc:  # isolated linked-page failure
+                                source_errors.append({
+                                    "url": link.url, "error": str(exc)[:160],
+                                })
+                                continue
+                            selected_sources.append(final_url)
+                            parts.extend([
+                                f"## {link.title}",
+                                f"Source: {final_url}",
+                                page,
+                            ])
+                            if sum(len(part) for part in parts) >= max_chars:
+                                break
+
+                        combined = "\n\n".join(parts)
+                        truncated = len(combined) > max_chars
+                        if truncated:
+                            suffix = "\n\n... (文档包已按上下文预算截断)"
+                            content = combined[:max(0, max_chars - len(suffix))] + suffix
+                        else:
+                            content = combined
+                        result = {
+                            "action_type": "docs_fetch",
+                            "url": url,
+                            "query": query,
+                            "strategy": "llms-index",
+                            "discovery_url": index_url,
+                            "discovery_attempts": attempts,
+                            "selected_sources": selected_sources,
+                            "source_errors": source_errors,
+                            "discovered_links": len(document.links),
+                            "optional_links": sum(
+                                1 for link in document.links if link.optional
+                            ),
+                            "content": content,
+                            "content_length": len(content),
+                            "truncated": truncated,
+                            "success": True,
+                        }
+                        self._write_output(context, content[:5000])
+                        return result
+
+            # No valid index: preserve usefulness by reusing the hardened web
+            # fetch path for the exact user URL.
+            fallback = ToolNode(
+                f"{self.id}:fallback",
+                action_type="web_fetch",
+                url=url,
+                timeout=self.timeout,
+                output_slot=self.output_slot,
+                security_enabled=self.security_enabled,
+            )._web_fetch(context)
+            fallback["action_type"] = "docs_fetch"
+            fallback["strategy"] = "html-fallback"
+            fallback["discovery_attempts"] = attempts
+            fallback["degraded"] = True
+            return fallback
+        except Exception as exc:
+            result = {
+                "action_type": "docs_fetch",
+                "url": url,
+                "strategy": "failed",
+                "discovery_attempts": attempts,
+                "content": "",
+                "success": False,
+                "error": str(exc),
+            }
+            self._write_output(context, f"文档抓取失败: {exc}")
             return result
 
     def _weather(self, context: AgentContext) -> dict[str, Any]:

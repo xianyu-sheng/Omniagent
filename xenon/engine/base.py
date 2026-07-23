@@ -560,7 +560,7 @@ class BaseEngine(ABC):
     # 无副作用、可安全并行的工具类型
     _PARALLEL_SAFE_TOOLS: frozenset[str] = frozenset({
         "read_file", "search_files", "list_files",
-        "code_index", "ast_analyze", "web_fetch",
+        "code_index", "ast_analyze", "web_fetch", "docs_fetch",
         "github_fetch", "weather", "datetime",
     })
 

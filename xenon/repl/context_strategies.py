@@ -174,6 +174,7 @@ _TOOL_TYPE_MAP: dict[str, ToolOutputType] = {
     # 瞬时型 — 保留退出码 + 头尾
     "command": ToolOutputType.TRANSIENT,
     "web_fetch": ToolOutputType.TRANSIENT,
+    "docs_fetch": ToolOutputType.TRANSIENT,
     "github_fetch": ToolOutputType.TRANSIENT,
     # 指针型 — 保留为路径列表
     "search_files": ToolOutputType.POINTER,

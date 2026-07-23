@@ -82,7 +82,7 @@ See [TUI.md](TUI.md) for the complete layout contract, shortcuts, and fallback b
 ### 20+ Built-in Tools
 
 `list_files` / `read_file` / `write_file` / `edit_file` / `command` / `git` /
-`web_fetch` / `github_fetch` / `clone_repo` / `search_files` / `code_index` /
+`web_fetch` / `docs_fetch` / `github_fetch` / `clone_repo` / `search_files` / `code_index` /
 `ast_analyze` / `refactor` / `lsp_goto_def` / `lsp_find_refs` / `weather` / `datetime` /
 `spawn_agent` / `batch_write` / `batch_edit` / `diff_preview`
 

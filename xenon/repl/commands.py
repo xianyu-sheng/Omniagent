@@ -1717,6 +1717,7 @@ def _cmd_tools(**kwargs: Any) -> str:
         ("search_files", "文件内容搜索", "file_path, search_pattern, file_filter"),
         ("git", "Git 操作", "git_command='status|diff|log|add|commit'"),
         ("web_fetch", "抓取网页内容", "url"),
+        ("docs_fetch", "llms.txt 优先的官方文档检索", "url, query, max_pages, max_chars"),
         ("batch_write", "批量写入多个文件", "files=[{path, content}, ...]"),
         ("batch_edit", "批量编辑多个文件", "edits=[{file_path, old_text, new_text}, ...]"),
         ("code_index", "代码符号搜索（AST 索引）", "search_pattern, file_path"),

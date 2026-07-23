@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+### llms.txt 优先文档检索
+
+- 新增只读 `docs_fetch` 工具：从文档页确定性发现站点根或 docs 子路径的
+  `llms.txt`，解析 H1、摘要、H2 文件列表和 Optional 分组，并按用户 query
+  在本地排序相关链接，不产生额外 LLM 调用。
+- 兼容 `llms-full.txt`、`llms-ctx.txt` 和 `llms-ctx-full.txt`；站点未提供
+  llms.txt 时透明降级到原 URL 的 HTML 抓取，并在结果中返回 strategy、尝试记录、
+  选中来源、失败来源和截断状态。
+- 文档抓取沿用 SSRF、DNS/IP 和逐跳重定向保护；最多发现 4 个入口、读取 8 个
+  链接页、返回 30,000 字符，单个链接失败不会推翻其余有效文档。
+- ReAct、Plan-Execute、原生工具 schema、执行策略、并行只读工具、收束预算、
+  上下文压缩和 `/tools` 已统一识别 `docs_fetch`。
+
 ### 火山方舟 Ark 一等 Provider
 
 - 新增正式 `ark/<model>` provider，默认数据面为
