@@ -20,6 +20,7 @@ from typing import Any
 import logging
 import httpx
 import yaml
+from urllib.parse import urlparse
 
 from xenon.utils.cache_telemetry import (
     MANIFEST_RESPONSE_KEY,
@@ -125,7 +126,8 @@ def _extract_usage(data: dict[str, Any] | None, provider: str) -> LLMUsage:
 
     OpenAI 兼容：``usage.{prompt,completion,total}_tokens``；
     Anthropic：``usage.{input,output}_tokens``（无 total，求和）。
-    缓存字段：``usage.prompt_cache_hit_tokens`` / ``usage.prompt_cache_miss_tokens``。
+    缓存字段：DeepSeek 风格的 ``prompt_cache_*``，以及 OpenAI/Ark 风格的
+    ``prompt_tokens_details.cached_tokens``。
     """
     if not isinstance(data, dict):
         return LLMUsage()
@@ -140,8 +142,18 @@ def _extract_usage(data: dict[str, Any] | None, provider: str) -> LLMUsage:
     c = int(u.get("completion_tokens", 0) or 0)
     t = u.get("total_tokens")
     # 缓存 token（DeepSeek / OpenAI 兼容字段，不存在则为 0）
-    hit = int(u.get("prompt_cache_hit_tokens", 0) or u.get("cache_hit_tokens", 0) or 0)
-    miss = int(u.get("prompt_cache_miss_tokens", 0) or u.get("cache_miss_tokens", 0) or 0)
+    details = u.get("prompt_tokens_details")
+    detail_hit = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
+    hit = int(
+        u.get("prompt_cache_hit_tokens", 0)
+        or u.get("cache_hit_tokens", 0)
+        or detail_hit
+        or 0
+    )
+    explicit_miss = u.get("prompt_cache_miss_tokens", 0) or u.get("cache_miss_tokens", 0)
+    # OpenAI-compatible responses only report cached prompt tokens. In that
+    # contract, the remaining prompt tokens are the cache miss portion.
+    miss = int(explicit_miss or (max(0, p - hit) if isinstance(details, dict) else 0))
     return LLMUsage(
         prompt_tokens=p, completion_tokens=c,
         total_tokens=int(t) if t else (p + c),
@@ -430,6 +442,10 @@ _PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
         "env_key": "DEEPSEEK_API_KEY",
         "max_output_tokens": 8192,
     },
+    "ark": {
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "env_key": "ARK_API_KEY",
+    },
     "google": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "env_key": "GOOGLE_API_KEY",
@@ -486,6 +502,10 @@ def _load_credentials() -> dict[str, str]:
         with open(_CREDENTIALS_PATH, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
             creds = {k.lower(): v for k, v in data.items()}
+            if not creds.get("ark"):
+                legacy_key = _legacy_ark_api_key(data)
+                if legacy_key:
+                    creds["ark"] = legacy_key
 
     # v0.4.0 修复: 环境变量作为补充（yaml 优先，env 仅在 yaml 未配置时生效）
     # 此前无条件覆盖导致 ~/.bashrc 旧 key 覆盖 yaml 新 key，对齐 provider_registry 行为
@@ -500,6 +520,26 @@ def _load_credentials() -> dict[str, str]:
         if auth_token:
             creds["anthropic"] = auth_token
     return creds
+
+
+def _legacy_ark_api_key(data: dict[str, Any]) -> str:
+    """Read one unambiguous Ark key from the pre-0.7 custom-provider shape."""
+    custom = data.get("_custom_providers", {})
+    if not isinstance(custom, dict):
+        return ""
+    candidates: list[str] = []
+    for config in custom.values():
+        if not isinstance(config, dict):
+            continue
+        try:
+            hostname = (urlparse(str(config.get("base_url", ""))).hostname or "").lower()
+        except ValueError:
+            continue
+        api_key = config.get("api_key")
+        if hostname == "ark.cn-beijing.volces.com" and isinstance(api_key, str) and api_key:
+            candidates.append(api_key)
+    unique = list(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else ""
 
 
 def parse_model_id(model_id: str) -> tuple[str, str]:
@@ -762,7 +802,7 @@ def _call_openai_compat_once(
     resp.raise_for_status()
     data = resp.json()
     # §8.8.1：提取并累加真实 usage（不再丢弃），+ model_id 用于缓存追踪
-    _acc_usage(endpoint.provider, data, endpoint.model_name)
+    _acc_usage(endpoint.provider, data, f"{endpoint.provider}/{endpoint.model_name}")
     msg = data["choices"][0]["message"]
     finish = data["choices"][0].get("finish_reason", "")
     content = msg.get("content") or ""
@@ -843,7 +883,7 @@ def _call_anthropic_once(
     resp.raise_for_status()
     data = resp.json()
     # §8.8.1：提取并累加真实 usage（Anthropic 用 input/output_tokens）
-    _acc_usage(endpoint.provider, data, endpoint.model_name)
+    _acc_usage(endpoint.provider, data, f"{endpoint.provider}/{endpoint.model_name}")
     # content 是文本块列表；拼接所有 text 块（比仅取 [0] 更鲁棒）
     blocks = data.get("content", []) or []
     text = "".join(
@@ -1122,7 +1162,7 @@ def _call_openai_compat_with_tools(
     resp.raise_for_status()
     data = resp.json()
     # §8.8.1：提取并累加真实 usage（含缓存命中数据）
-    _acc_usage(endpoint.provider, data, endpoint.model_name)
+    _acc_usage(endpoint.provider, data, f"{endpoint.provider}/{endpoint.model_name}")
     choice = data.get("choices", [{}])[0]
     msg = choice.get("message", {})
     content = msg.get("content") or ""
@@ -1197,7 +1237,7 @@ def _call_anthropic_with_tools(
     resp = client.post(url, json=payload, headers=headers, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
-    _acc_usage(endpoint.provider, data, endpoint.model_name)
+    _acc_usage(endpoint.provider, data, f"{endpoint.provider}/{endpoint.model_name}")
     blocks = data.get("content", []) or []
     text, tool_calls, _ = _parse_anthropic_tool_calls(blocks)
     # Anthropic stop_reason → OpenAI 风格 finish_reason
@@ -1303,6 +1343,10 @@ def _stream_openai_compat(
         "temperature": temperature,
         "stream": True,
     }
+    if endpoint.provider == "ark":
+        # Ark's OpenAI-compatible streaming API supports an explicit final
+        # usage chunk. Request it so /cost and /cache have provider evidence.
+        payload["stream_options"] = {"include_usage": True}
     _apply_reasoning_effort(payload, reasoning_effort)
     t0 = time.time()
     usage_data: dict[str, Any] | None = None

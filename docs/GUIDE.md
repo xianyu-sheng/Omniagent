@@ -156,8 +156,13 @@ xenon --model anthropic/claude-3-5-sonnet-20241022
 
 # Volcengine ARK (China)
 export ARK_API_KEY=your-ark-key
-xenon --model ark/deepseek-v4-pro
+xenon --model ark/doubao-seed-2-1-pro-260628
 ```
+
+Ark is a first-class provider rather than a custom endpoint alias. Xenon uses
+the official `https://ark.cn-beijing.volces.com/api/v3` data plane, filters the
+live model catalog to text-generation models, and reads context/tool metadata
+from `/models`. See [Ark Provider](ARK_PROVIDER.md) for the complete contract.
 
 Or add models permanently in `/setup`:
 ```

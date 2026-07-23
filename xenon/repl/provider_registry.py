@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 import yaml
@@ -32,6 +32,15 @@ _DEEPSEEK_RETIRED_MODEL_NAMES = frozenset({
     "deepseek-reasoner",
     "deepseek-coder",
 })
+
+ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+ARK_FALLBACK_MODELS = [
+    "doubao-seed-2-1-pro-260628",
+    "glm-5-2-260617",
+    "deepseek-v4-pro-260425",
+    "deepseek-v4-flash-260425",
+]
+MODEL_METADATA: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 @dataclass
@@ -72,6 +81,13 @@ PROVIDERS: dict[str, ProviderInfo] = {
         env_key="DEEPSEEK_API_KEY",
         models=["deepseek-v4-pro", "deepseek-v4-flash"],
         model_list_path="https://api.deepseek.com/models",
+    ),
+    "ark": ProviderInfo(
+        name="火山方舟 Ark",
+        key="ark",
+        base_url=ARK_BASE_URL,
+        env_key="ARK_API_KEY",
+        models=list(ARK_FALLBACK_MODELS),
     ),
     "google": ProviderInfo(
         name="Google Gemini",
@@ -246,6 +262,54 @@ def _parse_model_payload(payload: Any) -> list[str]:
     return [model for model, _, _ in model_rows]
 
 
+def _is_ark_chat_model(item: Any) -> bool:
+    """Reject Ark image/video/embedding models from the chat model pool."""
+    if not isinstance(item, dict):
+        return True
+    task_types = item.get("task_type")
+    if isinstance(task_types, list) and task_types:
+        return "TextGeneration" in task_types
+    modalities = item.get("modalities")
+    if isinstance(modalities, dict):
+        outputs = modalities.get("output_modalities")
+        if isinstance(outputs, list) and outputs:
+            return "text" in outputs
+    # Older compatible endpoints may omit capability metadata. Preserve those
+    # entries rather than turning a schema evolution into an empty model list.
+    return True
+
+
+def _remember_model_metadata(provider: ProviderInfo, items: list[Any]) -> None:
+    """Keep non-secret model capability metadata discovered in this process."""
+    for item in items:
+        model = _model_id_from_item(item)
+        if not model or not isinstance(item, dict):
+            continue
+        token_limits = item.get("token_limits")
+        features = item.get("features")
+        MODEL_METADATA[(provider.key, model)] = {
+            "context_window": (
+                int(token_limits.get("context_window", 0) or 0)
+                if isinstance(token_limits, dict)
+                else 0
+            ),
+            "max_output_tokens": (
+                int(token_limits.get("max_output_token_length", 0) or 0)
+                if isinstance(token_limits, dict)
+                else 0
+            ),
+            "features": dict(features) if isinstance(features, dict) else {},
+        }
+
+
+def get_model_metadata(model_id: str) -> dict[str, Any]:
+    """Return capability metadata captured by the latest model discovery."""
+    if "/" not in model_id:
+        return {}
+    provider, model = model_id.split("/", 1)
+    return dict(MODEL_METADATA.get((provider.lower(), model), {}))
+
+
 def fetch_provider_models(provider: ProviderInfo, api_key: str) -> list[str]:
     """从厂商模型列表接口实时获取模型短名；失败时返回空列表。"""
     MODEL_FETCH_ERRORS.pop(provider.key, None)
@@ -256,9 +320,14 @@ def fetch_provider_models(provider: ProviderInfo, api_key: str) -> list[str]:
     models: list[str] = []
     seen: set[str] = set()
     after_id: str | None = None
+    for key in [key for key in MODEL_METADATA if key[0] == provider.key]:
+        MODEL_METADATA.pop(key, None)
     try:
-        while True:
-            with _create_http_client(timeout=MODEL_LIST_TIMEOUT) as client:
+        # Keep one connection alive across paginated model directories. Ark's
+        # catalog is large enough that recreating TLS/proxy state per page can
+        # turn startup discovery into a minute-long operation.
+        with _create_http_client(timeout=MODEL_LIST_TIMEOUT) as client:
+            while True:
                 response = client.get(
                     _model_list_url(provider, after_id=after_id),
                     headers=_model_list_headers(provider, api_key),
@@ -272,12 +341,20 @@ def fetch_provider_models(provider: ProviderInfo, api_key: str) -> list[str]:
                     logger.debug("获取 %s 实时模型列表失败: %s", provider.key, MODEL_FETCH_ERRORS[provider.key])
                     return []
                 payload = response.json()
-                for model in _parse_model_payload(payload):
+                items = _extract_model_items(payload)
+                if provider.key == "ark":
+                    items = [item for item in items if _is_ark_chat_model(item)]
+                _remember_model_metadata(provider, items)
+                for model in _parse_model_payload(items):
                     if model not in seen:
                         models.append(model)
                         seen.add(model)
 
-                if not (isinstance(payload, dict) and payload.get("has_more") and payload.get("last_id")):
+                if not (
+                    isinstance(payload, dict)
+                    and payload.get("has_more")
+                    and payload.get("last_id")
+                ):
                     break
                 after_id = str(payload["last_id"])
     except Exception as e:
@@ -291,14 +368,49 @@ def fetch_provider_models(provider: ProviderInfo, api_key: str) -> list[str]:
 # ── 凭证管理 ──────────────────────────────────────────────
 
 def load_credentials(path: Path | None = None) -> dict[str, Any]:
-    """从文件加载凭证。"""
+    """从文件加载凭证，并兼容旧版 custom Ark 配置。
+
+    旧版 Xenon 只能把方舟注册为 ``_custom_providers``。若其中恰好只有一个
+    官方 Ark 数据面地址，运行时将它映射为一等 ``ark`` provider；这里只返回
+    兼容视图，不会静默改写用户文件。
+    """
     credentials_path = path or CREDENTIALS_PATH
-    creds: dict[str, Any] = {}
-    if credentials_path.exists():
-        with open(credentials_path, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-            creds = {k.lower(): v for k, v in data.items()}
+    creds = _read_credentials(credentials_path)
+    if not creds.get("ark"):
+        legacy_key = _legacy_ark_api_key(creds)
+        if legacy_key:
+            creds["ark"] = legacy_key
     return creds
+
+
+def _read_credentials(path: Path | None = None) -> dict[str, Any]:
+    """Read the exact on-disk mapping without compatibility projections."""
+    credentials_path = path or CREDENTIALS_PATH
+    if not credentials_path.exists():
+        return {}
+    with open(credentials_path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return {str(key).lower(): value for key, value in data.items()}
+
+
+def _legacy_ark_api_key(data: dict[str, Any]) -> str:
+    """Return one unambiguous API key from a legacy custom Ark provider."""
+    custom = data.get(_CUSTOM_PROVIDERS_KEY, {})
+    if not isinstance(custom, dict):
+        return ""
+    candidates: list[str] = []
+    for config in custom.values():
+        if not isinstance(config, dict):
+            continue
+        try:
+            hostname = (urlparse(str(config.get("base_url", ""))).hostname or "").lower()
+        except ValueError:
+            continue
+        api_key = config.get("api_key")
+        if hostname == "ark.cn-beijing.volces.com" and isinstance(api_key, str) and api_key:
+            candidates.append(api_key)
+    unique = list(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else ""
 
 
 def save_credentials(creds: dict[str, Any], path: Path | None = None) -> Path:
@@ -312,16 +424,34 @@ def save_credentials(creds: dict[str, Any], path: Path | None = None) -> Path:
 
 def set_provider_key(provider_key: str, api_key: str) -> None:
     """设置某个厂商的 API Key 并保存。"""
-    creds = load_credentials()
+    creds = _read_credentials()
     creds[provider_key] = api_key
     save_credentials(creds)
 
 
 def remove_provider_key(provider_key: str) -> None:
     """移除某个厂商的 API Key。"""
-    creds = load_credentials()
+    creds = _read_credentials()
     creds.pop(provider_key, None)
+    if provider_key == "ark":
+        custom = creds.get(_CUSTOM_PROVIDERS_KEY)
+        if isinstance(custom, dict):
+            creds[_CUSTOM_PROVIDERS_KEY] = {
+                key: config
+                for key, config in custom.items()
+                if not _is_official_ark_config(config)
+            }
     save_credentials(creds)
+
+
+def _is_official_ark_config(config: Any) -> bool:
+    if not isinstance(config, dict):
+        return False
+    try:
+        hostname = (urlparse(str(config.get("base_url", ""))).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname == "ark.cn-beijing.volces.com"
 
 
 def get_configured_providers(*, refresh_models: bool = True) -> list[ProviderInfo]:
@@ -467,7 +597,7 @@ def remove_custom_provider(key: str) -> bool:
     if key not in all_custom:
         return False
     del all_custom[key]
-    creds = load_credentials()
+    creds = _read_credentials()
     creds[_CUSTOM_PROVIDERS_KEY] = all_custom
     save_credentials(creds)
     return True
@@ -489,7 +619,7 @@ def _save_custom_provider(info: ProviderInfo) -> None:
         "name": info.name, "base_url": info.base_url,
         "api_key": info.api_key, "models": info.models,
     }
-    creds = load_credentials()
+    creds = _read_credentials()
     creds[_CUSTOM_PROVIDERS_KEY] = all_custom
     save_credentials(creds)
 
@@ -549,7 +679,7 @@ def save_mcp_server(
                 entry["env"] = env
         servers.append(entry)
 
-        creds = load_credentials(credentials_path)
+        creds = _read_credentials(credentials_path)
         creds[_MCP_SERVERS_KEY] = servers
         save_credentials(creds, credentials_path)
 
@@ -564,7 +694,7 @@ def remove_mcp_server(name: str, *, path: Path | None = None) -> bool:
         new_servers = [s for s in servers if s.get("name") != name]
         if len(new_servers) == len(servers):
             return False
-        creds = load_credentials(credentials_path)
+        creds = _read_credentials(credentials_path)
         creds[_MCP_SERVERS_KEY] = new_servers
         save_credentials(creds, credentials_path)
         return True

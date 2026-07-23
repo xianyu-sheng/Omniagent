@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 火山方舟 Ark 一等 Provider
+
+- 新增正式 `ark/<model>` provider，默认数据面为
+  `https://ark.cn-beijing.volces.com/api/v3`，支持 `ARK_API_KEY`、
+  `ARK_BASE_URL`、`/setup` 和实时 `/models` 发现；不再要求把方舟伪装成
+  custom provider。
+- 兼容读取旧 `_custom_providers` 中的官方 Ark 配置；兼容视图不静默改写文件，
+  删除 Ark 凭证时会清理旧条目而保留其他自定义厂商。
+- Ark 模型目录按 `task_type` / 输出模态过滤，只把文本生成模型加入聊天池；
+  同时读取真实上下文窗口、输出上限和 function-calling 能力元数据。
+- 模型目录分页复用单个 HTTP 连接，真实 126 条目录发现由约一分钟级降至
+  1 秒内；离线时回退到经过核对的文本模型列表。
+- 普通对话、流式输出和原生 function calling 复用统一 OpenAI-compatible
+  协议；流式请求显式启用 usage 尾帧，缓存统计兼容
+  `prompt_tokens_details.cached_tokens` 并保持 `ark/<model>` 统计身份。
+
 ### Agent Skills 兼容层
 
 - 原有 `~/.xenon/skills/*.yaml` 配方之外，新增标准目录式

@@ -244,20 +244,34 @@ class CacheTracker:
             "cache_hit_tokens",
             "cache_miss_tokens",
         }
-        cache_fields_present = any(name in usage_data for name in cache_field_names)
+        prompt_details = usage_data.get("prompt_tokens_details")
+        nested_cache_present = (
+            isinstance(prompt_details, dict) and "cached_tokens" in prompt_details
+        )
+        cache_fields_present = (
+            any(name in usage_data for name in cache_field_names)
+            or nested_cache_present
+        )
 
         # 提取缓存 token
+        nested_hit = (
+            prompt_details.get("cached_tokens", 0)
+            if isinstance(prompt_details, dict)
+            else 0
+        )
         cache_hit = int(usage_data.get("prompt_cache_hit_tokens", 0)
                         or usage_data.get("cache_hit_tokens", 0)
+                        or nested_hit
                         or 0)
-        cache_miss = int(usage_data.get("prompt_cache_miss_tokens", 0)
-                         or usage_data.get("cache_miss_tokens", 0)
-                         or 0)
 
         # 基础 token 数
         prompt = int(usage_data.get("prompt_tokens", 0)
                      or usage_data.get("input_tokens", 0)
                      or 0)
+        cache_miss = int(usage_data.get("prompt_cache_miss_tokens", 0)
+                         or usage_data.get("cache_miss_tokens", 0)
+                         or (max(0, prompt - cache_hit) if nested_cache_present else 0)
+                         or 0)
         completion = int(usage_data.get("completion_tokens", 0)
                          or usage_data.get("output_tokens", 0)
                          or 0)

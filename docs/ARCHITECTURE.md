@@ -82,7 +82,7 @@ AutoRouter（任务难度评估 + 意图检测）
 │ react-reflection · ReAct + 反思审查      │
 └─────────────────────────────────────────┘
     ↓
-    ModelPool（11 家模型商预设 · 3 Tier 分级 · 故障自动转移）
+    ModelPool（12 家模型商预设 · 3 Tier 分级 · 故障自动转移）
 ```
 
 **关键决策：**
@@ -159,13 +159,15 @@ JsonMarkdownBackend（metadata.json 权威 + Markdown 可读视图）
 
 ## 独有亮点
 
-### 1. 11 家模型商预设 · 3 Tier 分级 · 故障自动转移
+### 1. 12 家模型商预设 · 3 Tier 分级 · 故障自动转移
 
 ```
-Tier 1 · DeepSeek (主力推理)
-Tier 2 · 火山引擎 ARK / 豆包 (国内加速 + 视觉)
-Tier 3 · OpenAI / Anthropic / Google / Kimi / 智谱 / 通义千问 / Grok / OpenRouter
-Local  · Ollama / LM Studio
+内置厂商 · Ark / DeepSeek / OpenAI / Anthropic / Google / 智谱 / 通义千问
+         Kimi / 百川 / MiniMax / 小米 MiMo
+本地厂商 · Ollama
+
+模型 Tier 由能力画像决定，而不是把整个厂商固定到同一等级；同一 Ark 目录里的
+旗舰文本模型、轻量文本模型和非聊天模型会分别排序或过滤。
 ```
 
 - 按 Tier 优先级选择，同 Tier 内轮询负载均衡
@@ -231,7 +233,7 @@ xenon/
 │   ├── repl.py       · 主循环、模式分发、上下文桥接与无边框渲染
 │   ├── commands.py   · 命令注册（/cost /vision /mode /model ...）
 │   ├── status_bar.py · 输入下边界 + 自适应固定底部 toolbar
-│   ├── model_pool.py · 模型池（11 家预设 / 3 Tier / 故障转移）
+│   ├── model_pool.py · 模型池（12 家预设 / 3 Tier / 故障转移）
 │   └── auto_router.py · 任务难度评估 + 模型路由
 ├── memory/           · 用户治理记忆
 │   ├── backend.py    · 存储接口 + JSON/Markdown 后端

@@ -153,7 +153,7 @@ xenon                                                     # 启动 REPL
 | 类别 | 内容 |
 |------|------|
 | **推理范式** | 8 种（direct · react · plan-execute · reflection · novel + 4 组合） |
-| **模型商** | 11 家预设 · 3 Tier 分级 · 故障自动转移 |
+| **模型商** | 12 家预设 · Ark 一等接入 · 3 Tier 分级 · 故障自动转移 |
 | **MCP 生态** | Smithery 社区服务器 · 双传输 · 惰性加载 · `/mcp browse` 安装 |
 | **Agent Skills** | 标准 `SKILL.md` · 用户/项目四层覆盖 · 正文与资源按需加载 · 兼容旧 YAML |
 | **外部集成 CLI** | `integrations describe --json` · 原子 Skill 安装 · MCP env/header 安全注入 |

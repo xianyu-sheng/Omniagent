@@ -109,6 +109,22 @@ class ModelRegistry:
                 reasoning_effort, context_window, weight
         """
         normalized_model = model_id.lower().rsplit("/", 1)[-1]
+        ark_context_windows = {
+            "doubao-seed-2-1-pro-260628": 262_144,
+            "deepseek-v4-pro-260425": 1_048_576,
+            "deepseek-v4-flash-260425": 1_048_576,
+            "glm-5-2-260617": 1_048_576,
+        }
+        if "context_window" not in kwargs and model_id.lower().startswith("ark/"):
+            from xenon.repl.provider_registry import get_model_metadata
+
+            metadata = get_model_metadata(model_id)
+            context_window = (
+                int(metadata.get("context_window", 0) or 0)
+                or ark_context_windows.get(normalized_model)
+            )
+            if context_window:
+                kwargs["context_window"] = context_window
         if (
             "context_window" not in kwargs
             and normalized_model in {"deepseek-v4-pro", "deepseek-v4-flash"}

@@ -556,6 +556,7 @@ def _infer_capability(model_id: str) -> CapabilityProfile:
     # Cost
     cost_map = {
         "openai": 0.3, "anthropic": 0.2, "deepseek": 0.8,
+        "ark": 0.7,
         "google": 0.6, "zhipu": 0.7, "qwen": 0.7,
         "moonshot": 0.6, "ollama": 0.9, "xiaomi": 0.6,
         "baichuan": 0.7, "minimax": 0.6,
@@ -573,6 +574,17 @@ def _infer_capability(model_id: str) -> CapabilityProfile:
         ctx = max(ctx, 200000)
     elif provider == "google":
         ctx = max(ctx, 1000000)
+    elif provider == "ark":
+        from xenon.repl.provider_registry import get_model_metadata
+
+        metadata = get_model_metadata(model_id)
+        discovered_context = int(metadata.get("context_window", 0) or 0)
+        if discovered_context:
+            ctx = discovered_context
+        elif name.startswith(("deepseek-v4-", "glm-5-2-")):
+            ctx = 1048576
+        elif name.startswith("doubao-seed-2-1-pro"):
+            ctx = 262144
 
     return CapabilityProfile(
         tier=tier,
