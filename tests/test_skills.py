@@ -9,7 +9,33 @@ from pathlib import Path
 
 import pytest
 
-from xenon.repl.skill_manager import SkillManager, Skill, SkillStep
+from xenon.repl.skill_manager import SkillManager, SkillStep
+
+
+def _write_agent_skill(
+    skills_root: Path,
+    name: str,
+    *,
+    description: str = "A standard test skill",
+    body: str = "# Instructions\nDo the test task.",
+    version: str = "1.0.0",
+) -> Path:
+    skill_dir = skills_root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    path = skill_dir / "SKILL.md"
+    path.write_text(
+        "---\n"
+        f"name: {name}\n"
+        f"description: {description}\n"
+        f"version: {version}\n"
+        "metadata:\n"
+        "  requires:\n"
+        "    bins: [python]\n"
+        "---\n\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 class TestSkillManager:
@@ -204,9 +230,6 @@ class TestSkillManager:
             skill = mgr.create("test-handler", "test", [{"type": "echo", "prompt": "hi"}])
             cmd_name = f"/{skill.name}"
 
-            # 注册前不在 _HANDLERS
-            was_there = cmd_name in _HANDLERS
-
             _register_skill_handler(skill, mgr)
 
             # 注册后在 _HANDLERS
@@ -223,8 +246,8 @@ class TestSkillManager:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mgr = SkillManager(Path(tmpdir))
-            skill = mgr.create("persist-test", "persistence check",
-                              [{"type": "echo", "prompt": "test"}])
+            mgr.create("persist-test", "persistence check",
+                       [{"type": "echo", "prompt": "test"}])
 
             # 验证磁盘文件存在
             yaml_path = Path(tmpdir) / "persist-test.yaml"
@@ -237,3 +260,212 @@ class TestSkillManager:
             assert loaded.name == "persist-test"
             assert loaded.description == "persistence check"
             assert len(loaded.steps) == 1
+
+    # ── v0.8: standard Agent Skills compatibility ──
+
+    def test_agent_skill_metadata_is_loaded_lazily(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skill_path = _write_agent_skill(
+            skills_root,
+            "review-code",
+            description="Review code with project conventions",
+            body="# Review\nRead references/checklist.md only when needed.",
+        )
+
+        manager = SkillManager(skills_root)
+        skill = manager.get("review-code")
+
+        assert skill is not None
+        assert skill.is_agent_skill
+        assert skill.path == skill_path
+        assert skill.instructions is None
+        assert skill.metadata["requires"]["bins"] == ["python"]
+        assert manager.load_instructions("review-code").startswith("# Review")
+        assert skill.instructions is not None
+
+    def test_legacy_yaml_and_agent_skill_coexist(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        manager = SkillManager(skills_root)
+        manager.create("legacy", "Old recipe", [{"type": "echo", "prompt": "ok"}])
+        _write_agent_skill(skills_root, "standard", description="New standard skill")
+
+        manager.load()
+
+        assert [skill.name for skill in manager.list_all()] == ["legacy", "standard"]
+        assert manager.get("legacy").format == "xenon-yaml"
+        assert manager.get("standard").format == "agent-skill"
+
+    def test_legacy_unicode_skill_name_remains_compatible(self, tmp_path):
+        manager = SkillManager(tmp_path / "skills")
+        manager.create("代码审查", "旧版中文名", [{"type": "echo", "prompt": "ok"}])
+
+        reloaded = SkillManager(tmp_path / "skills")
+
+        assert reloaded.get("代码审查") is not None
+
+    def test_layered_skill_precedence_is_project_xenon_first(self, tmp_path):
+        shared = tmp_path / "home-shared"
+        user = tmp_path / "home-xenon"
+        project = tmp_path / "project"
+        _write_agent_skill(shared, "same", description="shared user")
+        _write_agent_skill(user, "same", description="xenon user")
+        _write_agent_skill(project / ".agents" / "skills", "same", description="shared project")
+        winning = _write_agent_skill(
+            project / ".xenon" / "skills", "same", description="xenon project"
+        )
+
+        manager = SkillManager(
+            user,
+            project_root=project,
+            shared_skills_dir=shared,
+        )
+
+        assert manager.get("same").description == "xenon project"
+        assert manager.get("same").source == "project"
+        assert manager.get("same").path == winning
+
+    def test_one_broken_skill_does_not_hide_healthy_skills(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        _write_agent_skill(skills_root, "healthy")
+        broken = skills_root / "broken" / "SKILL.md"
+        broken.parent.mkdir(parents=True)
+        broken.write_text("# no frontmatter", encoding="utf-8")
+
+        manager = SkillManager(skills_root)
+
+        assert manager.get("healthy") is not None
+        assert manager.get("broken") is None
+        assert len(manager.load_errors) == 1
+        assert str(broken) in manager.load_errors[0]
+
+    def test_agent_skill_resource_access_is_bounded(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        _write_agent_skill(skills_root, "bounded")
+        reference = skills_root / "bounded" / "references" / "guide.md"
+        reference.parent.mkdir()
+        reference.write_text("safe guide", encoding="utf-8")
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        (skills_root / "bounded" / "references" / "escape.txt").symlink_to(outside)
+
+        manager = SkillManager(skills_root)
+
+        assert manager.list_resources("bounded") == ["references/guide.md"]
+        assert manager.read_resource("bounded", "references/guide.md") == "safe guide"
+        with pytest.raises(ValueError, match="边界"):
+            manager.read_resource("bounded", "../outside.txt")
+        with pytest.raises(ValueError, match="边界"):
+            manager.read_resource("bounded", "references/escape.txt")
+
+    def test_agent_prompt_keeps_unrequested_resources_lazy(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        _write_agent_skill(
+            skills_root,
+            "lazy",
+            body="Read references/details.md only when the task needs details.",
+        )
+        details = skills_root / "lazy" / "references" / "details.md"
+        details.parent.mkdir()
+        details.write_text("RESOURCE_SECRET_SHOULD_STAY_LAZY", encoding="utf-8")
+        manager = SkillManager(skills_root)
+
+        prompt = manager.build_agent_prompt("lazy", "check this repository")
+
+        assert "check this repository" in prompt
+        assert "references/details.md" in prompt
+        assert "RESOURCE_SECRET_SHOULD_STAY_LAZY" not in prompt
+
+    def test_remove_project_override_reveals_user_skill(self, tmp_path):
+        user = tmp_path / "user"
+        project = tmp_path / "project"
+        _write_agent_skill(user, "layered", description="user copy")
+        _write_agent_skill(
+            project / ".xenon" / "skills",
+            "layered",
+            description="project copy",
+        )
+        manager = SkillManager(user, project_root=project)
+
+        assert manager.get("layered").description == "project copy"
+        assert manager.remove("layered") is True
+        assert manager.get("layered").description == "user copy"
+
+    def test_agent_skill_size_limit_is_isolated(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        _write_agent_skill(skills_root, "healthy")
+        oversized = _write_agent_skill(skills_root, "oversized")
+        with oversized.open("a", encoding="utf-8") as stream:
+            stream.write("x" * (257 * 1024))
+
+        manager = SkillManager(skills_root)
+
+        assert manager.get("healthy") is not None
+        assert manager.get("oversized") is None
+        assert any("256 KiB" in error for error in manager.load_errors)
+
+    def test_metadata_scan_does_not_decode_a_truncated_body_prefix(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        path = _write_agent_skill(skills_root, "unicode-boundary", body="placeholder")
+        header = path.read_text(encoding="utf-8").split("---\n\n", 1)[0] + "---\n\n"
+        padding = "a" * (64 * 1024 - len(header.encode("utf-8")) - 1)
+        path.write_text(header + padding + "汉字正文", encoding="utf-8")
+
+        manager = SkillManager(skills_root)
+
+        assert manager.get("unicode-boundary") is not None
+        assert manager.get("unicode-boundary").instructions is None
+
+    def test_skill_diagnostics_counts_formats_and_errors(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        manager = SkillManager(skills_root)
+        manager.create("legacy", "Legacy", [{"type": "echo", "prompt": "ok"}])
+        _write_agent_skill(skills_root, "standard")
+        broken = skills_root / "broken" / "SKILL.md"
+        broken.parent.mkdir(parents=True)
+        broken.write_text("invalid", encoding="utf-8")
+        manager.load()
+
+        report = manager.diagnostics()
+
+        assert report["skill_count"] == 2
+        assert report["agent_skill_count"] == 1
+        assert report["legacy_skill_count"] == 1
+        assert len(report["errors"]) == 1
+
+    def test_standard_skill_uses_repl_agent_loop_when_available(self, tmp_path):
+        from xenon.repl.commands import _execute_installed_skill
+
+        skills_root = tmp_path / "skills"
+        _write_agent_skill(skills_root, "tool-aware", body="Use read_file when needed.")
+        manager = SkillManager(skills_root)
+
+        class FakeRegistry:
+            @staticmethod
+            def get_role_priority(_role):
+                raise AssertionError("agent-loop path must not call the LLM fallback")
+
+        class FakeRepl:
+            prompts = []
+
+            invocations = []
+
+            def _handle_chat(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                self.invocations.append(kwargs)
+
+        repl = FakeRepl()
+        result = _execute_installed_skill(
+            manager,
+            "tool-aware",
+            "inspect pyproject.toml",
+            registry=FakeRegistry(),
+            session_state={"_repl": repl},
+        )
+
+        assert result == ""
+        assert len(repl.prompts) == 1
+        assert "Use read_file when needed." in repl.prompts[0]
+        assert "inspect pyproject.toml" in repl.prompts[0]
+        assert repl.invocations == [
+            {"skill_name": "tool-aware", "skill_args": "inspect pyproject.toml"}
+        ]

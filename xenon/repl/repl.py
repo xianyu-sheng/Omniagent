@@ -1917,7 +1917,13 @@ class REPL:
         if window > 0:
             self.ctx_mgr.max_tokens = window
 
-    def _handle_chat(self, user_input: str) -> None:
+    def _handle_chat(
+        self,
+        user_input: str,
+        *,
+        skill_name: str | None = None,
+        skill_args: str = "",
+    ) -> None:
         """处理多轮对话，支持 prompt 优化和多种思考范式。"""
         # P2-修复2: 空输入防护 — 避免空 user 消息污染 history + 浪费 LLM token
         # run() 主循环 line 165 也有防护，但 _handle_chat 是独立可调用的方法，
@@ -1940,7 +1946,9 @@ class REPL:
         # Resolve the project before a memory command so the default
         # project-local destination is deterministic and visible in its receipt.
         self._inject_project_context()
-        if self._handle_explicit_memory_request(user_input):
+        # SKILL.md is trusted installed context, not a fresh user statement.
+        # Never interpret phrases inside it as consent to persist memory.
+        if skill_name is None and self._handle_explicit_memory_request(user_input):
             return
 
         # R4: 按激活模型上下文窗口校准 token 阈值（须在 needs_compact 之前）
@@ -1956,15 +1964,20 @@ class REPL:
         self._inject_project_context()
 
         # ── 记忆注入 ──────────────────────────────────
-        self._inject_memories(user_input)
+        memory_query = skill_args if skill_name is not None else user_input
+        self._inject_memories(memory_query or skill_name or "")
 
         # ── Prompt 优化（按需） ──────────────────────────
         # 意图检测始终执行（detect_intent 纯正则，开销可忽略）：供 direct 模式路由使用——
         # query 意图（天气/价格/汇率/新闻等实时数据）必然需要工具，direct 模式不向 API
         # 传工具，须路由到 ReAct（见 _detect_tool_need）。
-        intent = self._detect_intent(user_input)
+        intent_input = skill_args if skill_name is not None else user_input
+        intent = self._detect_intent(intent_input)
         system_hint: str | None = None
-        if self.optimize_prompts:
+        if skill_name is not None:
+            optimized = user_input
+            console.print(f"[dim cyan]🧩 Agent Skill: {skill_name}（正文与资源按需加载）[/dim cyan]")
+        elif self.optimize_prompts:
             optimized, system_hint, was_optimized = optimize_prompt(user_input)
             console.print(f"[dim]🎯 意图: {get_intent_display(intent)}[/dim]")
 
@@ -2044,7 +2057,9 @@ class REPL:
         mode = self.registry.current_mode
 
         try:
-            if (
+            if skill_name is not None:
+                self._run_react_engine(turn_prompt, model_ids)
+            elif (
                 execution_policy.level is ExecutionLevel.ANSWER_ONLY
                 and intent == "write_code"
             ):
@@ -2099,7 +2114,8 @@ class REPL:
         # A suggestion is shown after the answer, at most once per turn.  It is
         # deliberately independent from XENON_ASSUME_YES: test/automation flags
         # must never become consent for long-term memory.
-        self._maybe_suggest_memory(user_input)
+        if skill_name is None:
+            self._maybe_suggest_memory(user_input)
 
     def _run_direct(
         self,
@@ -3357,20 +3373,34 @@ class REPL:
 
         # 加载技能
         try:
+            from xenon.repl.commands import _execute_installed_skill
             from xenon.repl.skill_manager import SkillManager
             skm = SkillManager()
             for sk in skm.list_all():
                 cmd_name = f"/{sk.name}"
                 if cmd_name not in _HANDLERS:
                     def make_skill_handler(sk_name):
-                        def handler(*, args: str, registry: ModelRegistry, **kwargs: Any) -> str:
-                            model_ids = registry.get_role_priority("planner")
-                            return skm.execute(sk_name, args, model_priority=model_ids)
+                        def handler(
+                            *, args: str, registry: ModelRegistry,
+                            session_state=None, **kwargs: Any,
+                        ) -> str:
+                            return _execute_installed_skill(
+                                skm,
+                                sk_name,
+                                args,
+                                registry=registry,
+                                session_state=session_state,
+                            )
                         return handler
                     _HANDLERS[cmd_name] = make_skill_handler(sk.name)
                     register_command(cmd_name, f"[技能] {sk.description}", cmd_name)
             if skm.list_all():
                 console.print(f"[dim]· 已加载 {len(skm.list_all())} 个技能[/dim]")
+            if skm.load_errors:
+                console.print(
+                    f"[yellow]⚠️  {len(skm.load_errors)} 个技能加载失败；"
+                    "运行 /skill list 查看提示[/yellow]"
+                )
         except Exception as e:
             logger.debug(f"加载技能失败: {e}")
 

@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### Agent Skills 兼容层
+
+- 原有 `~/.xenon/skills/*.yaml` 配方之外，新增标准目录式
+  `<name>/SKILL.md`；兼容共享 `~/.agents/skills`、Xenon 用户目录以及项目级
+  `.agents/skills` / `.xenon/skills`，按“共享用户 → Xenon 用户 → 共享项目 →
+  Xenon 项目”确定性覆盖。
+- 启动与 `/skill list` 只读取 YAML frontmatter；技能正文仅在命中时加载，
+  `references/`、`scripts/`、`assets/` 不会被预先塞入 Prompt。
+- 标准技能显式调用后进入 Xenon 的 ReAct 与权限链路，保留工具确认、执行边界和
+  MCP 能力；SKILL.md 中的文字不会被误判成用户的持久记忆指令。
+- 资源读取新增目录穿越、符号链接逃逸、UTF-8、单文件 128 KiB 和最多 500 个
+ 资源索引保护；单个损坏技能被隔离，不再导致整个技能注册表清空。
+- 新增 `/skill doctor`，显示扫描根、格式计数与逐文件错误；删除项目覆盖版本后，
+  下层同名用户技能会自动恢复可见。
+
 ### 会话凭证安全
 
 - 自动保存、`/save` 和旧会话迁移统一移除 `api_key`、token、authorization、password 等凭证字段；会话只保存恢复所需的非敏感模型元数据。

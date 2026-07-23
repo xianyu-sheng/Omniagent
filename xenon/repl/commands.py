@@ -2420,6 +2420,7 @@ _FUZZY_ALIASES = {
     "run": ["exec", "execute", "start"],
     "import": ["install", "get", "fetch", "clone", "load"],
     "reload": ["refresh", "rescan"],
+    "doctor": ["check", "diagnose"],
 }
 for _canonical, _aliases in _FUZZY_ALIASES.items():
     for _a in _aliases:
@@ -2449,7 +2450,7 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
 
     # v0.5.4: 模糊匹配纠正 typo
     canonical = sub
-    if sub not in {"list", "create", "run", "delete", "import", "reload"}:
+    if sub not in {"list", "create", "run", "delete", "import", "reload", "doctor"}:
         matched = _fuzzy_match_subcommand(sub)
         if matched:
             canonical = matched
@@ -2462,6 +2463,11 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
         if skills:
             lines = [f"═══ 已安装技能（{len(skills)} 个）═══\n"]
             for s in skills:
+                if s.is_agent_skill:
+                    version = f" v{s.version}" if s.version else ""
+                    lines.append(f"  /{s.name} — {s.description}")
+                    lines.append(f"    Agent Skill{version} · {s.source} · 按需加载")
+                    continue
                 type_counts: dict[str, int] = {}
                 for st in s.steps:
                     type_counts[st.type] = type_counts.get(st.type, 0) + 1
@@ -2471,6 +2477,11 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
             installed = "\n".join(lines) + "\n"
         else:
             installed = "暂无已安装技能。\n"
+        if manager.load_errors:
+            installed += (
+                f"⚠️  {len(manager.load_errors)} 个技能加载失败；"
+                "运行 /skill doctor 查看详情。\n"
+            )
 
         # 库浏览指引
         library_guide = """\
@@ -2498,8 +2509,13 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
         parts2 = sub_args.split(maxsplit=1)
         name = parts2[0]
         run_args = parts2[1] if len(parts2) > 1 else ""
-        model_ids = registry.get_role_priority("planner")
-        return manager.execute(name, run_args, model_priority=model_ids)
+        return _execute_installed_skill(
+            manager,
+            name,
+            run_args,
+            registry=registry,
+            session_state=session_state,
+        )
 
     elif canonical == "delete":
         if not sub_args:
@@ -2518,6 +2534,25 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
         skills = manager.list_all()
         return f"✅ 已从磁盘重新加载 {len(skills)} 个技能"
 
+    elif canonical == "doctor":
+        report = manager.diagnostics()
+        lines = [
+            "═══ Skill Doctor ═══",
+            f"已加载: {report['skill_count']}（Agent Skill "
+            f"{report['agent_skill_count']}，旧 YAML {report['legacy_skill_count']}）",
+            "",
+            "扫描目录:",
+        ]
+        for root in report["roots"]:
+            state = "存在" if root["exists"] else "不存在"
+            lines.append(f"  [{root['source']}] {root['path']} — {state}")
+        if report["errors"]:
+            lines.extend(["", f"加载错误（{len(report['errors'])}）:"])
+            lines.extend(f"  - {error}" for error in report["errors"])
+        else:
+            lines.extend(["", "✅ 未发现格式或读取错误"])
+        return "\n".join(lines)
+
     else:
         # v0.5.4: 自然语言技能创建 —— 仅当 args 包含实质性描述时才触发。
         # 单个 typo 词（如 /skill xyz）显示帮助而非静默创建 skill。
@@ -2535,7 +2570,7 @@ def _cmd_skill(*, args: str, registry: ModelRegistry, session_state: dict[str, A
                 hint = f"\n\n💡 你是不是想用 [bold]/skill {matched}[/bold]？"
             return (
                 f"无法识别的子命令: [bold]{sub}[/bold]{hint}\n\n"
-                f"用法: /skill [list|create|run|delete|import|reload]\n\n"
+                f"用法: /skill [list|create|run|delete|import|reload|doctor]\n\n"
                 f"📡 浏览云端库: /skill-discover | /skill-install <名称>\n"
                 f"💡 自然语言创建: /skill 帮我设计前端页面的技能"
             )
@@ -2804,14 +2839,37 @@ def _skill_manual_create(name: str, description: str, manager, pre_steps=None, p
 # ── skill 辅助函数 ─────────────────────────────────────────
 
 
+def _execute_installed_skill(manager, name, args, *, registry, session_state=None) -> str:
+    """Execute a skill through the safe agent loop when a REPL is available."""
+    skill = manager.get(name)
+    if skill is None:
+        return f"❌ 技能 /{name} 不存在"
+    if skill.is_agent_skill and session_state:
+        repl = session_state.get("_repl")
+        if repl is not None:
+            repl._handle_chat(
+                manager.build_agent_prompt(skill.name, args),
+                skill_name=skill.name,
+                skill_args=args,
+            )
+            return ""
+    model_ids = registry.get_role_priority("planner")
+    return manager.execute(name, args, model_priority=model_ids)
+
+
 def _register_skill_handler(skill, manager) -> None:
     """v0.5.4: 动态注册 skill 为命令处理器，无需重启即可用 /<name> 调用。"""
     cmd_name = f"/{skill.name}"
     if cmd_name not in _HANDLERS:
         def make_handler(sk_name):
-            def handler(*, args: str, registry, **kw: Any) -> str:
-                model_ids = registry.get_role_priority("planner")
-                return manager.execute(sk_name, args, model_priority=model_ids)
+            def handler(*, args: str, registry, session_state=None, **kw: Any) -> str:
+                return _execute_installed_skill(
+                    manager,
+                    sk_name,
+                    args,
+                    registry=registry,
+                    session_state=session_state,
+                )
             return handler
         _HANDLERS[cmd_name] = make_handler(skill.name)
         register_command(cmd_name, f"[技能] {skill.description}", cmd_name)

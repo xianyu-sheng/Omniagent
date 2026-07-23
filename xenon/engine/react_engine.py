@@ -1486,7 +1486,12 @@ class ReActEngine(BaseEngine):
                 return "暂无已安装的技能。使用 create_skill 工具或 /skill create 创建。"
             lines = [f"共 {len(skills)} 个技能:\n"]
             for s in skills:
-                lines.append(f"- /{s.name}: {s.description} ({len(s.steps)} 步)")
+                detail = (
+                    f"Agent Skill · {s.source} · 按需加载"
+                    if s.is_agent_skill
+                    else f"{len(s.steps)} 步"
+                )
+                lines.append(f"- /{s.name}: {s.description} ({detail})")
             return "\n".join(lines)
         except Exception as e:
             return f"❌ 列出技能失败: {e}"
