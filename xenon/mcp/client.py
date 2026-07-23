@@ -23,9 +23,16 @@ logger = logging.getLogger(__name__)
 class MCPClient:
     """MCP 客户端。"""
 
-    def __init__(self, transport: MCPTransport, name: str = "xenon") -> None:
+    def __init__(
+        self,
+        transport: MCPTransport,
+        name: str = "xenon",
+        *,
+        request_timeout: float = 30.0,
+    ) -> None:
         self.transport = transport
         self.name = name
+        self.request_timeout = request_timeout
         self.server_info: dict[str, Any] = {}
         self.tools: list[dict[str, Any]] = []
         self.resources: list[dict[str, Any]] = []
@@ -33,26 +40,38 @@ class MCPClient:
 
     @classmethod
     def from_command(cls, command: str, args: list[str] | None = None,
-                     env: dict[str, str] | None = None, name: str = "xenon") -> MCPClient:
+                     env: dict[str, str] | None = None, name: str = "xenon",
+                     request_timeout: float = 30.0) -> MCPClient:
         """从命令行创建 stdio 客户端。"""
         transport = StdioTransport(command, args, env)
-        return cls(transport, name)
+        return cls(transport, name, request_timeout=request_timeout)
 
     @classmethod
     def from_url(cls, url: str, headers: dict[str, str] | None = None,
-                 name: str = "xenon") -> MCPClient:
+                 name: str = "xenon", request_timeout: float = 30.0) -> MCPClient:
         """从 URL 创建 SSE 客户端。"""
-        transport = SSETransport(url, headers)
-        return cls(transport, name)
+        transport = SSETransport(url, headers, timeout=request_timeout)
+        return cls(transport, name, request_timeout=request_timeout)
+
+    def _request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Send a bounded request across either supported transport."""
+        if isinstance(self.transport, StdioTransport):
+            return self.transport.request(
+                method,
+                params,
+                timeout=self.request_timeout,
+            )
+        return self.transport.request(method, params)
 
     def initialize(self) -> dict[str, Any]:
         """初始化 MCP 连接。"""
-        result = self.transport.request("initialize", {
+        result = self._request("initialize", {
             "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-            },
+            "capabilities": {},
             "clientInfo": {
                 "name": self.name,
                 "version": __version__,
@@ -79,7 +98,7 @@ class MCPClient:
         if not self._initialized:
             self.initialize()
 
-        result = self.transport.request("tools/list")
+        result = self._request("tools/list")
         if "error" in result:
             raise RuntimeError(f"列出工具失败: {result['error']}")
 
@@ -95,7 +114,7 @@ class MCPClient:
         if arguments:
             params["arguments"] = arguments
 
-        result = self.transport.request("tools/call", params)
+        result = self._request("tools/call", params)
         if "error" in result:
             raise RuntimeError(f"调用工具 '{name}' 失败: {result['error']}")
 
@@ -106,7 +125,7 @@ class MCPClient:
         if not self._initialized:
             self.initialize()
 
-        result = self.transport.request("resources/list")
+        result = self._request("resources/list")
         if "error" in result:
             raise RuntimeError(f"列出资源失败: {result['error']}")
 
@@ -118,7 +137,7 @@ class MCPClient:
         if not self._initialized:
             self.initialize()
 
-        result = self.transport.request("resources/read", {"uri": uri})
+        result = self._request("resources/read", {"uri": uri})
         if "error" in result:
             raise RuntimeError(f"读取资源 '{uri}' 失败: {result['error']}")
 

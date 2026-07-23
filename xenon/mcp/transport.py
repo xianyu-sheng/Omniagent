@@ -251,10 +251,16 @@ class StdioTransport(MCPTransport):
 class SSETransport(MCPTransport):
     """通过 HTTP SSE 通信。"""
 
-    def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
         self.url = url
         self.headers = headers or {}
-        self._client = _create_http_client(timeout=30.0)
+        self._client = _create_http_client(timeout=timeout)
         self._request_id = 0
 
     def send(self, message: dict[str, Any]) -> None:

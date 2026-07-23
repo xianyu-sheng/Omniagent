@@ -7,12 +7,14 @@ import json
 import stat
 import sys
 import threading
+import time
 from pathlib import Path
 
 import yaml
 
 from xenon.integration_cli import run_integration_cli
 from xenon.engine.context import AgentContext
+from xenon.mcp.client import MCPClient
 from xenon.mcp.registry import MCPRegistry
 from xenon.repl.repl import REPL
 from xenon.repl.provider_registry import load_mcp_servers, save_mcp_server
@@ -32,6 +34,41 @@ def _write_skill(root: Path, name: str = "sample") -> Path:
     )
     (skill / "references" / "guide.md").write_text("guide", encoding="utf-8")
     return skill
+
+
+def _write_mcp_server(path: Path, *, hang: bool = False) -> Path:
+    if hang:
+        source = (
+            "import sys,time\n"
+            "sys.stdin.readline()\n"
+            "time.sleep(3600)\n"
+        )
+    else:
+        source = (
+            "import json,sys\n"
+            "for line in sys.stdin:\n"
+            "    message=json.loads(line)\n"
+            "    if 'id' not in message:\n"
+            "        continue\n"
+            "    method=message.get('method')\n"
+            "    if method == 'initialize':\n"
+            "        result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},"
+            "'serverInfo':{'name':'veadk-weather','version':'1.0'}}\n"
+            "    elif method == 'tools/list':\n"
+            "        result={'tools':[{'name':'get_weather','description':'Weather',"
+            "'inputSchema':{'type':'object'}}]}\n"
+            "    elif method == 'tools/call':\n"
+            "        city=message.get('params',{}).get('arguments',{}).get('city','unknown')\n"
+            "        result={'content':[{'type':'text','text':city+': sunny, 28C'}],"
+            "'isError':False}\n"
+            "    else:\n"
+            "        result={}\n"
+            "    sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':message['id'],"
+            "'result':result})+'\\n')\n"
+            "    sys.stdout.flush()\n"
+        )
+    path.write_text(source, encoding="utf-8")
+    return path
 
 
 def _run(argv, tmp_path, capsys, **kwargs):
@@ -65,6 +102,136 @@ def test_integrations_describe_json_is_machine_readable(tmp_path, capsys):
     assert str(project / ".xenon" / "skills") in payload["agent_skills"]["project_paths"]
     assert payload["mcp"]["supports_stdio_env"] is True
     assert payload["mcp"]["supports_http_headers"] is True
+    assert payload["mcp"]["protocol_version"] == "2024-11-05"
+    assert "integrations verify" in payload["mcp"]["verify_command"]
+
+
+def test_integrations_verify_static_contract(tmp_path, capsys):
+    _write_skill(tmp_path / "home" / ".agents" / "skills", "arkcli-models")
+
+    code, stdout, stderr, _, _ = _run(
+        ["integrations", "verify", "--json"], tmp_path, capsys
+    )
+
+    payload = json.loads(stdout)
+    skills = payload["checks"]["agent_skills"]
+    connectivity = payload["checks"]["mcp_connectivity"]
+    assert code == 0
+    assert stderr == ""
+    assert payload["ok"] is True
+    assert skills["agent_skill_count"] == 1
+    assert skills["error_count"] == 0
+    assert connectivity["requested"] is False
+
+
+def test_integrations_verify_real_stdio_mcp_handshake(tmp_path, capsys):
+    home = tmp_path / "home"
+    server = _write_mcp_server(tmp_path / "veadk_mcp_server.py")
+    save_mcp_server(
+        "veadk-weather",
+        command=sys.executable,
+        args=[str(server)],
+        path=home / ".xenon" / "credentials.yaml",
+    )
+
+    code, stdout, stderr, _, _ = _run(
+        [
+            "integrations",
+            "verify",
+            "--connect-mcp",
+            "--server",
+            "veadk-weather",
+            "--timeout",
+            "2",
+            "--json",
+        ],
+        tmp_path,
+        capsys,
+    )
+
+    payload = json.loads(stdout)
+    connectivity = payload["checks"]["mcp_connectivity"]
+    report = connectivity["servers"][0]
+    assert code == 0
+    assert stderr == ""
+    assert connectivity["reachable_server_count"] == 1
+    assert connectivity["tool_count"] == 1
+    assert report["protocol_version"] == "2024-11-05"
+    assert report["server_info"] == {"name": "veadk-weather", "version": "1.0"}
+    assert report["tools"] == ["get_weather"]
+    assert 0 <= report["latency_ms"] < 2_000
+
+
+def test_integrations_verify_hanging_mcp_is_bounded(tmp_path, capsys):
+    home = tmp_path / "home"
+    server = _write_mcp_server(tmp_path / "hanging_server.py", hang=True)
+    save_mcp_server(
+        "hanging",
+        command=sys.executable,
+        args=[str(server)],
+        env={"SECRET_TOKEN": "must-not-leak"},
+        path=home / ".xenon" / "credentials.yaml",
+    )
+
+    started = time.monotonic()
+    code, stdout, stderr, _, _ = _run(
+        [
+            "integrations",
+            "verify",
+            "--connect-mcp",
+            "--timeout",
+            "0.2",
+            "--json",
+        ],
+        tmp_path,
+        capsys,
+    )
+    elapsed = time.monotonic() - started
+
+    payload = json.loads(stdout)
+    report = payload["checks"]["mcp_connectivity"]["servers"][0]
+    assert code == 1
+    assert stderr == ""
+    assert payload["ok"] is False
+    assert report["ok"] is False
+    assert "超时" in report["error"]
+    assert "must-not-leak" not in stdout
+    assert elapsed < 2.0
+
+
+def test_mcp_client_full_initialize_list_call_contract(tmp_path):
+    server = _write_mcp_server(tmp_path / "veadk_mcp_server.py")
+    client = MCPClient.from_command(
+        sys.executable,
+        [str(server)],
+        name="xenon-veadk-e2e",
+        request_timeout=2,
+    )
+    try:
+        initialized = client.initialize()
+        tools = client.list_tools()
+        result = client.call_tool("get_weather", {"city": "Beijing"})
+    finally:
+        client.close()
+
+    assert initialized["protocolVersion"] == "2024-11-05"
+    assert [tool["name"] for tool in tools] == ["get_weather"]
+    assert result == {
+        "content": [{"type": "text", "text": "Beijing: sunny, 28C"}],
+        "isError": False,
+    }
+
+
+def test_integrations_verify_rejects_server_without_connect(tmp_path, capsys):
+    code, stdout, stderr, _, _ = _run(
+        ["integrations", "verify", "--server", "demo", "--json"],
+        tmp_path,
+        capsys,
+    )
+
+    assert code == 2
+    assert stderr == ""
+    assert "--connect-mcp" in json.loads(stdout)["error"]
 
 
 def test_skill_install_list_and_force_replace(tmp_path, capsys):

@@ -156,7 +156,7 @@ xenon                                                     # 启动 REPL
 | **模型商** | 12 家预设 · Ark 一等接入 · 3 Tier 分级 · 故障自动转移 |
 | **MCP 生态** | Smithery 社区服务器 · 双传输 · 惰性加载 · `/mcp browse` 安装 |
 | **Agent Skills** | 标准 `SKILL.md` · 用户/项目四层覆盖 · 正文与资源按需加载 · 兼容旧 YAML |
-| **外部集成 CLI** | `integrations describe --json` · 原子 Skill 安装 · MCP env/header 安全注入 |
+| **外部集成 CLI** | `integrations describe/verify --json` · 原子 Skill 安装 · MCP env/header 安全注入 · 有界真实握手 |
 | **官方文档检索** | `docs_fetch` · llms.txt/llms-full.txt 优先 · 关键词选页 · HTML 透明降级 |
 | **DeepSeek 缓存** | 逐请求真实 usage + `/cache` 解释/诊断/历史 + 五层前缀编译 + 保守缓存亲和路由 |
 | **视觉桥接** | `Ctrl+Alt+V` 粘贴 → 多模态转录 → DeepSeek 推理 · SHA256 去重 |
@@ -211,6 +211,7 @@ pip install -e ".[dev]"
 | `/mcp browse` `/mcp install` | MCP 生态 |
 | `/skill list` `/skill run <name>` `/skill doctor` | Agent Skills 发现、运行与诊断 |
 | `xenon integrations describe --json` | 输出可机器读取的集成能力契约 |
+| `xenon integrations verify --connect-mcp --json` | 验证 Skills 与真实 MCP 握手，输出脱敏指标 |
 | `xenon skill install <path> --json` | 非交互安装标准 Agent Skill |
 | `xenon mcp add/list/doctor --json` | 非交互 MCP 配置与诊断 |
 | `/memory status` `/memory inspect` `/memory doctor` | 查看位置、单条元数据与系统健康状态 |

@@ -22,6 +22,32 @@ Xenon 的私有 YAML。
 | `1` | 请求合法，但安装、校验或持久化失败 |
 | `2` | 命令或参数用法错误 |
 
+## 端到端验证
+
+安装器完成 Skill 或 MCP 配置后，可以运行只读的集成验证：
+
+```bash
+xenon integrations verify --json
+```
+
+默认验证四层 Skill 根目录、所有 `SKILL.md` frontmatter、MCP 配置格式、stdio
+命令可用性和凭证文件权限，不启动任何 MCP 子进程，也不访问网络。若需要验证真实
+MCP 协议链路，必须显式开启连接：
+
+```bash
+xenon integrations verify --connect-mcp --timeout 5 --json
+xenon integrations verify --connect-mcp --server dataPro-search --json
+```
+
+连接验证会对选中的服务器执行 `initialize → notifications/initialized →
+tools/list`，但不会调用工具。`--timeout` 是单次 MCP 请求的墙钟上限，允许范围为
+0.1–30 秒；一次最多验证 32 个服务器。JSON 结果包含标准 Skill 数、加载错误数、
+MCP 可达数、工具数、协商后的协议版本和每个服务器的握手耗时。env/header 值、URL
+query 和服务器返回中的控制字符不会进入报告。
+
+这一命令适合外部安装器的安装后健康检查：退出码 `0` 表示 Skill、静态 MCP 配置和
+所有已请求连接均通过，`1` 表示至少一项失败。
+
 ## 安装 Agent Skill
 
 ```bash
@@ -88,3 +114,13 @@ xenon mcp remove dataPro-search --json
 
 `list` 和写入回执只显示 env/header 的键名、参数数量与脱敏 URL；不会回显值或 URL
 query。`doctor` 只做本地格式、命令可用性与文件权限检查，不会连接远端服务器。
+
+## ArkCLI 与 VeADK 边界
+
+- ArkCLI 的 `+connect --path ~/.agents/skills` 产物是标准 Agent Skills，Xenon 会从
+  共享用户层直接发现；ArkCLI 是否自动识别 Xenon，仍取决于 ArkCLI 上游的 agent
+  注册表。
+- VeADK 使用的本地 `SKILL.md` 与 MCP stdio/HTTP 协议可以复用同一条 Xenon 加载
+  链路。`integrations verify --connect-mcp` 可作为可复现的协议兼容证据。
+- “协议兼容”不等于 VeADK 已支持 `runtime="xenon"`。后者需要 VeADK 上游新增运行时
+  适配和事件翻译；在其正式合并前，Xenon 不会把自己标记为官方 VeADK runtime。

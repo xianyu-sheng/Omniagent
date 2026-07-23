@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### ArkCLI / VeADK 生态端到端验证
+
+- 新增 `xenon integrations verify`：默认只读检查四层 Agent Skill 根目录、MCP
+  配置、stdio 命令和凭证权限；显式 `--connect-mcp` 后执行真实
+  `initialize → initialized → tools/list` 协议链路。
+- MCP 验证支持按服务器选择、0.1–30 秒单请求墙钟上限和最多 32 个服务器；报告
+  给出可达数、工具数、协商协议版本与握手耗时，不调用工具，也不回显 env/header
+  值或 URL query。
+- MCPClient 的请求超时现同时覆盖初始化、工具发现、工具调用和资源请求；HTTP
+  transport 复用同一超时配置，避免“doctor 正常但真实连接长期挂起”。
+- 使用 ArkCLI 1.0.4 的真实 `+connect --path` 产物验证：24 个内嵌 Skills 全部被
+  Xenon 发现，加载错误为 0；生态文档同时明确 VeADK 协议兼容与正式 runtime
+  适配的边界。
+- 验证结果：关联套件 79 passed、完整离线套件 1600 passed / 36 deselected；
+  VeADK 官方 `mcp==1.26.0` weather 示例完成 initialize/list/call 全链路 479.6 ms，
+  最终 wheel 的真实握手为 460.7 ms。
+
 ### llms.txt 优先文档检索
 
 - 新增只读 `docs_fetch` 工具：从文档页确定性发现站点根或 docs 子路径的

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import stat
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 import yaml
 
 from xenon import __version__
+from xenon.mcp.client import MCPClient
 from xenon.repl.provider_registry import (
     load_mcp_servers,
     remove_mcp_server,
@@ -118,10 +121,19 @@ def _run_integrations(argv: list[str], context: IntegrationContext) -> int:
     json_output, args = _remove_flag(argv, "--json")
     action = args[0] if args else "describe"
     if action in {"-h", "--help", "help"}:
-        print("usage: xenon integrations describe [--json]")
+        print(
+            "usage: xenon integrations describe [--json]\n"
+            "       xenon integrations verify [--connect-mcp] "
+            "[--server NAME] [--timeout SECONDS] [--json]"
+        )
         return 0
+    if action == "verify":
+        return _verify_integrations(args[1:], context, json_output=json_output)
     if action != "describe" or len(args) > 1:
-        _emit_error("用法: xenon integrations describe [--json]", json_output=json_output)
+        _emit_error(
+            "用法: xenon integrations describe|verify [选项] [--json]",
+            json_output=json_output,
+        )
         return 2
 
     project = context.project_root
@@ -155,6 +167,7 @@ def _run_integrations(argv: list[str], context: IntegrationContext) -> int:
             ),
         },
         "mcp": {
+            "protocol_version": "2024-11-05",
             "transports": ["stdio", "http", "sse"],
             "supports_stdio_env": True,
             "supports_http_headers": True,
@@ -162,6 +175,7 @@ def _run_integrations(argv: list[str], context: IntegrationContext) -> int:
             "add_command": "xenon mcp add <name> --config - --json",
             "list_command": "xenon mcp list --json",
             "doctor_command": "xenon mcp doctor --json",
+            "verify_command": "xenon integrations verify --connect-mcp --json",
         },
         "providers": {
             "openai_compatible": True,
@@ -182,6 +196,205 @@ def _describe_text(payload: dict[str, Any]) -> str:
         f"MCP: {', '.join(mcp['transports'])}（stdio env / HTTP headers）",
         "JSON: 所有集成命令支持 --json",
     ])
+
+
+def _verify_integrations(
+    argv: list[str],
+    context: IntegrationContext,
+    *,
+    json_output: bool,
+) -> int:
+    """Verify the real Skill discovery and optional MCP handshake paths."""
+    parser = _ArgumentParser(prog="xenon integrations verify", add_help=False)
+    parser.add_argument("--connect-mcp", action="store_true")
+    parser.add_argument("--server", action="append", default=[])
+    parser.add_argument("--timeout", type=float, default=5.0)
+    options = parser.parse_args(argv)
+    if not math.isfinite(options.timeout) or not 0.1 <= options.timeout <= 30.0:
+        raise IntegrationUsageError("--timeout 必须在 0.1 到 30 秒之间")
+    if options.server and not options.connect_mcp:
+        raise IntegrationUsageError("--server 仅能与 --connect-mcp 一起使用")
+
+    skill_report = _manager(context).diagnostics()
+    skill_check = {
+        "ok": not skill_report["errors"],
+        "skill_count": skill_report["skill_count"],
+        "agent_skill_count": skill_report["agent_skill_count"],
+        "legacy_skill_count": skill_report["legacy_skill_count"],
+        "error_count": len(skill_report["errors"]),
+        "errors": skill_report["errors"],
+        "roots": skill_report["roots"],
+    }
+    mcp_check = _doctor_mcp(context)
+    connectivity = _probe_mcp_servers(
+        context,
+        selected_names=options.server,
+        timeout=options.timeout,
+        enabled=options.connect_mcp,
+    )
+    ok = skill_check["ok"] and mcp_check["ok"] and connectivity["ok"]
+    payload = {
+        "ok": ok,
+        "schema_version": "1.0",
+        "checks": {
+            "agent_skills": skill_check,
+            "mcp_configuration": mcp_check,
+            "mcp_connectivity": connectivity,
+        },
+    }
+    text = "\n".join([
+        "Xenon 外部集成验证",
+        (
+            f"Agent Skills: {skill_check['agent_skill_count']} 个标准技能 · "
+            f"{skill_check['error_count']} 个错误"
+        ),
+        (
+            f"MCP 配置: {mcp_check['server_count']} 个 · "
+            f"静态错误 {len(mcp_check['errors'])}"
+        ),
+        (
+            "MCP 连接: 未请求"
+            if not connectivity["requested"]
+            else (
+                f"{connectivity['reachable_server_count']}/"
+                f"{connectivity['selected_server_count']} 可达 · "
+                f"{connectivity['tool_count']} 个工具"
+            )
+        ),
+        "结果: " + ("通过" if ok else "失败"),
+    ])
+    _emit(payload, json_output=json_output, text=text)
+    return 0 if ok else 1
+
+
+def _probe_mcp_servers(
+    context: IntegrationContext,
+    *,
+    selected_names: list[str],
+    timeout: float,
+    enabled: bool,
+) -> dict[str, Any]:
+    configured = load_mcp_servers(context.credentials_path)
+    by_name = {str(server.get("name", "")): server for server in configured}
+    if selected_names:
+        missing = sorted(set(selected_names) - set(by_name))
+        if missing:
+            raise ValueError(f"未配置 MCP 服务器: {missing[0]}")
+        names = list(dict.fromkeys(selected_names))
+    else:
+        names = sorted(by_name)
+
+    if not enabled:
+        return {
+            "ok": True,
+            "requested": False,
+            "timeout_seconds": timeout,
+            "selected_server_count": len(names),
+            "reachable_server_count": 0,
+            "tool_count": 0,
+            "servers": [],
+        }
+
+    reports = [
+        _probe_mcp_server(by_name[name], timeout=timeout)
+        for name in names[:32]
+    ]
+    reachable = sum(1 for report in reports if report["ok"])
+    return {
+        "ok": reachable == len(names) and len(names) <= 32,
+        "requested": True,
+        "timeout_seconds": timeout,
+        "selected_server_count": len(names),
+        "reachable_server_count": reachable,
+        "tool_count": sum(report["tool_count"] for report in reports),
+        "servers": reports,
+        **({"error": "一次最多验证 32 个 MCP 服务器"} if len(names) > 32 else {}),
+    }
+
+
+def _probe_mcp_server(server: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    name = _safe_probe_text(server.get("name"), fallback="unknown")
+    started = time.monotonic()
+    client: MCPClient | None = None
+    normalized: dict[str, Any] = {}
+    try:
+        normalized = _validate_mcp_config(server)
+        if normalized["transport"] == "stdio":
+            client = MCPClient.from_command(
+                normalized["command"],
+                normalized["args"],
+                normalized["env"],
+                name=f"xenon-verify:{name}",
+                request_timeout=timeout,
+            )
+        else:
+            client = MCPClient.from_url(
+                normalized["url"],
+                headers=normalized["headers"],
+                name=f"xenon-verify:{name}",
+                request_timeout=timeout,
+            )
+        initialized = client.initialize()
+        tools = client.list_tools()
+        if not isinstance(tools, list):
+            raise RuntimeError("tools/list 未返回数组")
+        tool_names = [
+            _safe_probe_text(tool.get("name"), fallback="unknown")
+            for tool in tools[:256]
+            if isinstance(tool, dict)
+        ]
+        server_info = initialized.get("serverInfo", {})
+        if not isinstance(server_info, dict):
+            server_info = {}
+        return {
+            "ok": True,
+            "name": name,
+            "transport": normalized["transport"],
+            "protocol_version": _safe_probe_text(
+                initialized.get("protocolVersion"),
+                fallback="unknown",
+            ),
+            "server_info": {
+                "name": _safe_probe_text(server_info.get("name"), fallback="unknown"),
+                "version": _safe_probe_text(server_info.get("version"), fallback="unknown"),
+            },
+            "tool_count": len(tools),
+            "tools": tool_names,
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "name": name,
+            "transport": normalized.get("transport", "unknown"),
+            "tool_count": 0,
+            "tools": [],
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "error": _redact_probe_error(str(exc), normalized),
+        }
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _safe_probe_text(value: Any, *, fallback: str) -> str:
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value or "")).strip()
+    return text[:128] or fallback
+
+
+def _redact_probe_error(message: str, config: dict[str, Any]) -> str:
+    redacted = message
+    secrets = [
+        *config.get("env", {}).values(),
+        *config.get("headers", {}).values(),
+    ]
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(str(secret), "<redacted>")
+    url = str(config.get("url", ""))
+    if url:
+        redacted = redacted.replace(url, _redact_url(url))
+    return _safe_probe_text(redacted, fallback="MCP 验证失败")[:500]
 
 
 def _run_skill(argv: list[str], context: IntegrationContext) -> int:
