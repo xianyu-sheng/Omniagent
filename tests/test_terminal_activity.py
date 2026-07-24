@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import io
+import threading
 import time
 
 from xenon.repl.repl import REPL
+from xenon.engine.callbacks import ConsoleCallback
 from xenon.repl.terminal_activity import (
     TerminalActivityIndicator,
     TerminalActivityState,
@@ -125,6 +128,64 @@ def test_writer_failure_disables_animation_without_raising():
 
     assert indicator.enabled is False
     assert calls == 1
+
+
+def test_console_callback_suspends_heartbeat_while_prompt_owns_stdin(monkeypatch):
+    """A confirmation prompt must not be erased by the tool progress thread."""
+    stream = io.StringIO()
+    stream.isatty = lambda: True  # type: ignore[attr-defined]
+    monkeypatch.setattr("xenon.engine.callbacks.sys.stdout", stream)
+
+    callback = ConsoleCallback(progress_interval=0.01)
+    callback.on_act("command", {"action": "npm update -g package"})
+    deadline = time.monotonic() + 1
+    while callback._progress_thread is None and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    callback.suspend_for_prompt()
+    assert callback._progress_stop is None
+    assert callback._progress_thread is None
+    assert callback._activity_visible is False
+
+    callback.resume_after_prompt("command", {"action": "npm update -g package"})
+    assert callback._progress_thread is not None
+    callback.finish_activity()
+    assert callback._progress_thread is None
+
+
+def test_permission_gate_serializes_concurrent_confirmation_callbacks():
+    """Parallel tools must queue behind one stdin confirmation at a time."""
+    from xenon.repl.permissions import PermissionGate
+
+    gate = PermissionGate()
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def confirm(*_args):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return True, ""
+
+    gate.set_confirm_callback(confirm)
+    threads = [
+        threading.Thread(
+            target=gate.check,
+            args=("command", {"action": f"echo {index}"}),
+        )
+        for index in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert max_active == 1
 
 
 def test_repl_permission_prompt_freezes_and_resumes_activity(monkeypatch):

@@ -379,10 +379,37 @@ class ConsoleCallback(EngineCallback):
         """清除瞬时活动行，不把探索细节留在滚动历史中。"""
         self._stop_progress()
         with self._activity_lock:
-            if self._activity_visible:
-                sys.stdout.write("\r\033[2K")
-                sys.stdout.flush()
-                self._activity_visible = False
+            self._clear_activity_line_locked()
+
+    def suspend_for_prompt(self) -> None:
+        """Pause transient progress output while a confirmation owns stdin.
+
+        Permission prompts are rendered by the REPL while a tool may still be
+        running in an engine worker.  The heartbeat must be stopped *before*
+        the panel is printed; otherwise its carriage-return redraw can erase
+        the prompt and leave the user with no visible input cursor.
+        """
+        self._stop_progress()
+        with self._activity_lock:
+            self._clear_activity_line_locked()
+
+    def resume_after_prompt(self, action: str, action_input: dict) -> None:
+        """Restore a concise activity line after an approval decision."""
+        if self.verbose or not getattr(sys.stdout, "isatty", lambda: False)():
+            return
+        brief = self._brief_params(action_input)
+        suffix = f" · {brief}" if brief else ""
+        self._update_activity(
+            f"⠿ executing  {action}{suffix}  ·  Ctrl+C 取消"
+        )
+        self._start_progress(action, action_input)
+
+    def _clear_activity_line_locked(self) -> None:
+        """Clear the heartbeat line; caller must hold ``_activity_lock``."""
+        if self._activity_visible:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            self._activity_visible = False
 
     # ── 辅助 ──
     @staticmethod

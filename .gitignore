@@ -62,3 +62,9 @@ omniagent.ico
 
 # Claude Code local config（用户级 sub-agent 定义不应进公共仓库）
 .claude/
+
+# 本地内容创作草稿（掘金专栏，不随 Xenon 源码发布）
+docs/juejin/
+
+# 本地开源推广作战包（发布文案、渠道计划和账号操作说明，不随源码发布）
+docs/promotion/

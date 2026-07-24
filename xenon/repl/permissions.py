@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
@@ -126,6 +127,10 @@ class PermissionGate:
         self._session_allow_exact: set[str] = set()
         # 外部确认回调：签名 (tool_name, params, risk_level) -> bool
         self._confirm_callback: Callable[[str, dict, str], Any] | None = None
+        # Engines may execute independent tool calls in worker threads.  Keep
+        # the gate's state transition and confirmation callback atomic so two
+        # workers cannot open competing stdin prompts.
+        self._ask_lock = threading.RLock()
         self._state = PermissionState.IDLE
         self._last_request: PermissionRequest | None = None
 
@@ -227,6 +232,21 @@ class PermissionGate:
         return True, ""
 
     def _ask(self, tool_name: str, params: dict, risk: str) -> tuple[bool, str]:
+        with self._ask_lock:
+            # A parallel worker may have passed the optimistic session-cache
+            # check just before another worker approved this exact operation.
+            # Re-check under the serialization lock so an [a] decision really
+            # suppresses duplicate prompts already queued by that wave.
+            if (
+                tool_name in self._session_allow
+                or self._approval_key(tool_name, params)
+                in self._session_allow_exact
+            ):
+                self._state = PermissionState.APPROVED
+                return True, ""
+            return self._ask_unlocked(tool_name, params, risk)
+
+    def _ask_unlocked(self, tool_name: str, params: dict, risk: str) -> tuple[bool, str]:
         """向用户确认。返回 (allowed, reason)。"""
         self._last_request = PermissionRequest(tool_name, dict(params), risk)
         self._state = PermissionState.PENDING

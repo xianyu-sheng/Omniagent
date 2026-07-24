@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,11 @@ class REPL:
         # OSC 标题更新不触碰终端正文；非 TTY、CI 和 dumb 终端自动禁用。
         from xenon.repl.terminal_activity import TerminalActivityIndicator
         self._terminal_activity = TerminalActivityIndicator()
+        # Permission callbacks may arrive from parallel tool workers.  Only
+        # one confirmation frontend may own stdin at a time; otherwise several
+        # Rich prompts compete for the same terminal input stream.
+        self._permission_prompt_lock = threading.RLock()
+        self._active_callback: Any = None
 
         # v0.4.0: Auto router + model pool (replaces role_priority)
         from xenon.repl.model_pool import ModelPool
@@ -360,36 +366,55 @@ class REPL:
                 "/permissions bypass 或设置 XENON_ASSUME_YES=1",
             )
 
-        # Permission input is a genuine waiting state: freeze the tab starfield
-        # before rendering the prompt, then resume the parent task afterwards.
-        with self._terminal_waiting("等待命令确认"):
-            msg = PermissionGate.format_confirm_message(tool_name, params, risk)
-            console.print()
-            console.print(Panel(msg, border_style="yellow", padding=(0, 1)))
+        # Permission callbacks can be reached by parallel engine workers.  A
+        # single lock makes stdin ownership explicit and prevents two Rich
+        # prompts from interleaving.  Stop the callback heartbeat *before*
+        # printing the panel; otherwise its carriage-return redraw erases the
+        # visible choices/input line while Prompt.ask is blocked.
+        with self._permission_prompt_lock:
+            callback = getattr(self, "_active_callback", None)
+            if hasattr(callback, "suspend_for_prompt"):
+                callback.suspend_for_prompt()
 
-            try:
-                choice = Prompt.ask(
-                    "选择", choices=["y", "n", "a", "q"], default="n",
-                    show_choices=True, case_sensitive=False,
-                )
-            except (KeyboardInterrupt, EOFError):
-                return False, "用户取消"
+            # Permission input is a genuine waiting state: freeze the tab
+            # starfield before rendering the prompt, then resume the parent
+            # task's activity only after an approval decision.
+            with self._terminal_waiting("等待命令确认"):
+                msg = PermissionGate.format_confirm_message(tool_name, params, risk)
+                console.print()
+                console.print(Panel(msg, border_style="yellow", padding=(0, 1)))
 
-        if choice == "y":
-            return True, ""
-        elif choice == "a":
-            if risk == "CRITICAL":
-                # 不按工具名放行任意未来 Shell/MCP/Git 操作，只记忆参数完全
-                # 相同的操作，既兑现 UI 文案又不扩大授权范围。
-                self._permission_gate.allow_exact(tool_name, params)
-                console.print("[dim]· 本会话将自动允许参数相同的操作[/dim]")
-                return True, ""
-            self._permission_gate.allow_always(tool_name)
-            return True, ""
-        elif choice == "q":
-            return False, "用户取消任务"
-        else:
-            return False, "用户拒绝"
+                try:
+                    choice = Prompt.ask(
+                        "选择", choices=["y", "n", "a", "q"], default="n",
+                        show_choices=True, case_sensitive=False,
+                    )
+                except (KeyboardInterrupt, EOFError):
+                    return False, "用户取消"
+
+            if choice == "y":
+                allowed = True
+                reason = ""
+            elif choice == "a":
+                if risk == "CRITICAL":
+                    # 不按工具名放行任意未来 Shell/MCP/Git 操作，只记忆参数完全
+                    # 相同的操作，既兑现 UI 文案又不扩大授权范围。
+                    self._permission_gate.allow_exact(tool_name, params)
+                    console.print("[dim]· 本会话将自动允许参数相同的操作[/dim]")
+                else:
+                    self._permission_gate.allow_always(tool_name)
+                allowed = True
+                reason = ""
+            elif choice == "q":
+                allowed = False
+                reason = "用户取消任务"
+            else:
+                allowed = False
+                reason = "用户拒绝"
+
+            if allowed and hasattr(callback, "resume_after_prompt"):
+                callback.resume_after_prompt(tool_name, params)
+            return allowed, reason
 
     def _terminal_waiting(self, detail: str):
         """Return a waiting context, with a no-op fallback for partial REPLs."""
@@ -481,7 +506,9 @@ class REPL:
     def _make_callback(self):
         """根据 verbose 状态创建引擎回调。"""
         from xenon.engine.callbacks import ConsoleCallback
-        return ConsoleCallback(verbose=self.verbose)
+        callback = ConsoleCallback(verbose=self.verbose)
+        self._active_callback = callback
+        return callback
 
     def _persist_tool_checkpoint(self, _checkpoint: dict[str, Any]) -> None:
         """Durably save an in-flight tool transition without maintenance work."""
