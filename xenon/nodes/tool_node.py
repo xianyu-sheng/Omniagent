@@ -34,6 +34,7 @@ import httpx
 from xenon.engine.context import AgentContext
 from xenon.utils.llm_client import _create_http_client
 from xenon.nodes.base import BaseNode
+from xenon.nodes.tool_result import enrich_tool_result
 from xenon.utils.atomic_write import atomic_write_bytes, atomic_write_text
 from xenon.utils.github_reference import parse_github_reference
 
@@ -609,6 +610,8 @@ class ToolNode(BaseNode):
         # list_files 参数
         pattern: str = "*",
         max_depth: int = 5,
+        limit: int | None = None,
+        cursor: str | None = None,
         # search_files 参数
         search_pattern: str = "",
         file_filter: str = "",
@@ -673,6 +676,8 @@ class ToolNode(BaseNode):
         self.append = append
         self.pattern = pattern
         self.max_depth = max_depth
+        self.limit = limit
+        self.cursor = cursor
         self.search_pattern = search_pattern
         self.file_filter = file_filter
         self.git_command = git_command
@@ -743,6 +748,7 @@ class ToolNode(BaseNode):
         "action_type", "action", "file_path", "content", "output_slot",
         "cwd", "timeout", "default_next", "encoding", "append",
         "pattern", "max_depth", "search_pattern", "file_filter",
+        "limit", "cursor",
         "git_command", "url", "start_time", "end_time", "old_text", "new_text",
         "max_pages", "max_chars",
         "files", "edits", "symbol", "query",
@@ -769,6 +775,10 @@ class ToolNode(BaseNode):
         result = dict(params)
 
         # 1. 别名映射
+        if "limit" not in result and "max_results" in result:
+            result["limit"] = result.pop("max_results")
+        if "cursor" not in result and "next_cursor" in result:
+            result["cursor"] = result.pop("next_cursor")
         for std_name, aliases in cls._PARAM_ALIASES.items():
             if (
                 std_name == "search_pattern"
@@ -967,9 +977,11 @@ class ToolNode(BaseNode):
             # 尝试从动态工具注册表中查找
             dynamic = _DYNAMIC_TOOLS.get(self.action_type)
             if dynamic:
-                return self._exec_dynamic_tool(dynamic, context)
+                return enrich_tool_result(
+                    self.action_type, self._exec_dynamic_tool(dynamic, context)
+                )
             raise ValueError(f"[{self.id}] 不支持的 action_type: {self.action_type}")
-        return handler(context)
+        return enrich_tool_result(self.action_type, handler(context))
 
     # ── 命令执行 ──────────────────────────────────────────
 
@@ -1999,17 +2011,42 @@ class ToolNode(BaseNode):
             self._write_output(context, f"路径不存在: {path}")
             return result
 
-        files = []
+        files: list[str] = []
         if path.is_file():
             files.append(str(path))
         else:
             for item in self._walk_with_depth(path, pattern, self.max_depth):
                 files.append(str(item))
 
-        display = "\n".join(files) if files else "(空目录)"
+        # Keep traversal deterministic so a cursor remains usable across
+        # follow-up calls.  ``limit`` is opt-in for backwards compatibility;
+        # without it list_files retains its historical full-list behaviour.
+        files.sort()
+        total = len(files)
+        try:
+            offset = max(0, int(self.cursor or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = int(self.limit) if self.limit is not None else None
+        except (TypeError, ValueError):
+            limit = None
+        if limit is not None:
+            limit = max(1, min(limit, 1000))
+            page = files[offset:offset + limit]
+            next_cursor = str(offset + len(page)) if offset + len(page) < total else None
+        else:
+            page = files
+            next_cursor = None
+
+        display = "\n".join(page) if page else "(空目录)"
         result = {
             "action_type": "list_files", "path": str(path),
-            "pattern": pattern, "files": files, "count": len(files), "success": True,
+            "pattern": pattern, "files": page, "count": total,
+            "returned_count": len(page), "offset": offset,
+            "limit": limit, "next_cursor": next_cursor,
+            "truncated": next_cursor is not None,
+            "success": True,
         }
         self._write_output(context, display)
         logger.info(f"[{self.id}] 列出 {len(files)} 个文件: {path}")
@@ -2072,6 +2109,21 @@ class ToolNode(BaseNode):
             regex = re.compile(re.escape(search_pattern), re.IGNORECASE)
 
         search_files = [path] if path.is_file() else self._walk_with_depth(path, file_filter or "*", self.max_depth)
+        try:
+            offset = max(0, int(self.cursor or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            page_limit = int(self.limit) if self.limit is not None else None
+        except (TypeError, ValueError):
+            page_limit = None
+        if page_limit is not None:
+            page_limit = max(1, min(page_limit, 1000))
+        # With an explicit page size, scan enough matches to report a useful
+        # total and to make cursor follow-ups deterministic.  The historical
+        # no-limit path keeps its 200-match safety cap.
+        scan_cap = 1000 if page_limit is not None else 200
+        reached_cap = False
 
         for file_path in search_files:
             try:
@@ -2083,19 +2135,32 @@ class ToolNode(BaseNode):
                             "file": str(file_path), "line": i,
                             "content": line.strip()[:200],
                         })
-                        if len(matches) >= 200:
+                        if len(matches) >= scan_cap:
+                            reached_cap = True
                             break
             except (OSError, UnicodeDecodeError):
                 continue
-            if len(matches) >= 200:
+            if reached_cap:
                 break
 
-        lines = [f"{m['file']}:{m['line']}: {m['content']}" for m in matches[:50]]
+        page = (
+            matches[offset:offset + page_limit]
+            if page_limit is not None
+            else matches
+        )
+        has_more = page_limit is not None and (
+            offset + len(page) < len(matches) or reached_cap
+        )
+        next_cursor = str(offset + len(page)) if has_more else None
+        lines = [f"{m['file']}:{m['line']}: {m['content']}" for m in page[:50]]
         display = "\n".join(lines) if lines else "(无匹配结果)"
 
         result = {
             "action_type": "search_files", "path": str(path), "pattern": search_pattern,
-            "matches": matches, "match_count": len(matches),
+            "matches": page, "match_count": len(matches),
+            "returned_count": len(page), "offset": offset,
+            "limit": page_limit, "next_cursor": next_cursor,
+            "truncated": next_cursor is not None,
             "files_scanned": files_scanned,
             "stdout": display,  # v0.5.3: 文本表示，LLM 可直接读取
             "success": True,

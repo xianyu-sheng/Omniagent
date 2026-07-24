@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+### 统一工具结果协议（第一阶段）
+
+- 所有 `ToolNode` 结果现在附带 `schema_version=1.0` 和 `tool_result` 结构化视图，
+  统一提供 `kind`、`source`、`records`、`total`、`matched`、`truncated`、
+  `next_cursor`、`filters` 字段；旧版 `content`、`files`、`matches` 等字段保持兼容。
+- `list_files` 和 `search_files` 支持稳定排序及可选 `limit` / `cursor` 分页，结果明确
+  区分总数、当前页数量和是否还有下一页。
+- `web_fetch`、`mcp_call` 的时间/关键词预筛选结果也进入同一协议，后续引擎可依赖结构化
+  记录而不是猜测文本是否被截断。
+
 ### 实时查询与长列表可靠性
 
 - `web_fetch` 与 `mcp_call` 支持在工具输出截断前按 `start_time` / `end_time`

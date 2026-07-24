@@ -152,13 +152,13 @@ BUILTIN_TOOLS = {
     },
     "list_files": {
         "name": "list_files",
-        "description": "列出本机指定目录下的文件和子目录。仅限本地目录，不能列出 GitHub 仓库文件（请用 github_fetch）。",
-        "params": {"file_path": "本地目录路径", "pattern": "glob 过滤模式，如 *.py 或 src/**/*.ts（可选，默认 *）"},
+        "description": "列出本机指定目录下的文件和子目录。仅限本地目录，不能列出 GitHub 仓库文件（请用 github_fetch）。结果支持 limit/cursor 分页，必须先使用返回的 next_cursor 获取下一页。",
+        "params": {"file_path": "本地目录路径", "pattern": "glob 过滤模式，如 *.py 或 src/**/*.ts（可选，默认 *）", "limit": "每页数量（可选，1-1000）", "cursor": "上一页返回的 next_cursor（可选）"},
     },
     "search_files": {
         "name": "search_files",
-        "description": "在本机指定目录中搜索包含关键词的文件，返回匹配的文件路径和行内容。类似 grep 功能。",
-        "params": {"file_path": "搜索的根目录", "search_pattern": "要搜索的文本关键词或正则表达式", "file_filter": "文件名过滤，如 *.py（可选）"},
+        "description": "在本机指定目录中搜索包含关键词的文件，返回匹配的文件路径和行内容。类似 grep 功能。结果支持 limit/cursor 分页。",
+        "params": {"file_path": "搜索的根目录", "search_pattern": "要搜索的文本关键词或正则表达式", "file_filter": "文件名过滤，如 *.py（可选）", "limit": "每页数量（可选，1-1000）", "cursor": "上一页返回的 next_cursor（可选）"},
     },
     "git": {
         "name": "git",

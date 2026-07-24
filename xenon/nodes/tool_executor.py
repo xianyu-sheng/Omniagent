@@ -22,6 +22,7 @@ from xenon.engine.circuit_breaker import BreakerRegistry
 from xenon.engine.context import AgentContext
 from xenon.engine.tool_tracker import ToolExecutionTracker
 from xenon.nodes.tool_node import ToolNode, _DYNAMIC_TOOLS
+from xenon.nodes.tool_result import ToolResult, enrich_tool_result
 from xenon.engine.callbacks import mask_sensitive_params
 
 logger = logging.getLogger(__name__)
@@ -276,6 +277,20 @@ class ToolExecuteResult:
     tool_class: str = "INFO"
     attempts: int = 1
     raw: dict[str, Any] | None = field(default=None, repr=False)
+    structured: ToolResult | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        """Always expose a structured result, including early failures."""
+        if self.structured is None:
+            raw = self.raw
+            if raw is None:
+                raw = {
+                    "action_type": self.tool_name,
+                    "success": self.success,
+                    "content": self.observation,
+                    "error": self.error,
+                }
+            self.structured = ToolResult.from_raw(self.tool_name, raw)
 
     def format_observation(self) -> str:
         """供引擎回填给 LLM 的观察文本。"""
@@ -459,7 +474,7 @@ class ToolExecutor:
             attempts = attempt
             try:
                 node = ToolNode(f"exec_{tool_name}", action_type=tool_name, **params)
-                result = node.execute(context)
+                result = enrich_tool_result(tool_name, node.execute(context))
                 raw = result
                 if result.get("success", False):
                     breaker.record_success()
