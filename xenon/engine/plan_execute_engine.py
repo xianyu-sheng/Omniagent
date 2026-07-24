@@ -321,6 +321,9 @@ class PlanExecuteEngine(BaseEngine):
             ctx.set(f"step_{step_id}_status", "ok" if outcome.success else "failed")
             self.callback.on_step_done(step_id, outcome.success, outcome.content[:200])
             logger.debug(f"步骤 {step_id} 完成: {outcome.content[:100]}")
+            if ctx.get("_task_cancelled"):
+                self.callback.on_warning("用户取消任务，停止后续计划步骤")
+                break
         return results
 
     # ── Phase 2: DAG 波次执行（P2-E2） ────────────────────────
@@ -413,6 +416,10 @@ class PlanExecuteEngine(BaseEngine):
                     failed_ids.add(sid)
                 self.callback.on_step_done(sid, outcome.success, outcome.content[:200])
                 logger.debug(f"步骤 {sid} 完成: {outcome.content[:100]}")
+
+            if ctx.get("_task_cancelled"):
+                self.callback.on_warning("用户取消任务，停止后续计划步骤")
+                break
 
         return results
 
@@ -610,6 +617,9 @@ class PlanExecuteEngine(BaseEngine):
                         hint = raw_observation.next_hint()
                         if hint:
                             observation += f"\n{hint}"
+                    if getattr(raw_observation, "cancelled", False) or ctx.get("_task_cancelled"):
+                        self.callback.on_warning("用户取消任务，停止当前执行步骤")
+                        return "⏹️ 用户取消任务，已停止执行。"
                 except Exception as e:  # noqa: BLE001 — 工具失败转观察，不中断迷你 ReAct
                     observation = f"⚠️ 工具执行失败: {e}"
                     logger.warning("迷你 ReAct 工具 %s 异常: %s", action, e)

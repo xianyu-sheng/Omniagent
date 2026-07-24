@@ -865,6 +865,16 @@ class ReActEngine(BaseEngine):
                         )
                     observation = "\n\n".join(observations)
 
+                # PermissionGate marks the shared context when the user
+                # chooses [q].  Stop before asking the model for another
+                # action; a cancellation is a task boundary, not a retryable
+                # tool failure.
+                if ctx.get("_task_cancelled"):
+                    cancelled = "⏹️ 用户取消任务，已停止执行。"
+                    self.callback.on_warning(cancelled)
+                    self.callback.on_finish(cancelled)
+                    return cancelled
+
                 # F6: 接近上下文窗口时拒绝大 observation（截断），防止下一轮超限
                 if self._near_context_window(messages):
                     self.callback.on_warning("接近上下文窗口，已截断本次工具输出")

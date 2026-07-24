@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+from typing import Any, Callable
 
 from rich.markup import escape
 
@@ -24,6 +25,39 @@ class PermissionMode(Enum):
     ACCEPT_EDITS = "accept_edits" # 自动批准编辑
     BYPASS = "bypass"            # 跳过确认
     PLAN = "plan"                # 只读模式
+
+
+class PermissionState(Enum):
+    """State of the most recent permission decision.
+
+    Keeping this state in the gate makes the confirmation lifecycle observable
+    without changing the historical ``check() -> (bool, reason)`` contract.
+    """
+
+    IDLE = "idle"
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class PermissionDecision(Enum):
+    """Normalized decisions accepted by future confirmation frontends."""
+
+    ALLOW_ONCE = "allow_once"
+    DENY = "deny"
+    ALLOW_SESSION = "allow_session"
+    CANCEL = "cancel"
+
+
+@dataclass(frozen=True)
+class PermissionRequest:
+    """Immutable description of one operation awaiting user approval."""
+
+    tool_name: str
+    params: dict[str, Any]
+    risk: str
 
 
 # ── 工具分类 ────────────────────────────────────────────
@@ -47,6 +81,35 @@ _DANGEROUS_GIT_COMMANDS: frozenset[str] = frozenset({
     "pull", "remote", "config", "branch -d", "branch -D", "tag -d",
 })
 
+_SENSITIVE_DISPLAY_KEYS: frozenset[str] = frozenset({
+    "content", "token", "api_key", "apikey", "password", "secret",
+    "credential", "credentials", "authorization", "python_function",
+    "command_template",
+})
+
+
+def _safe_display_value(key: str, value: Any) -> Any:
+    """Recursively summarize confirmation parameters without leaking secrets."""
+    if key.casefold() in _SENSITIVE_DISPLAY_KEYS:
+        size = len(value) if isinstance(value, str) else "?"
+        return f"<masked len={size}>"
+    if isinstance(value, dict):
+        return {
+            str(child_key): _safe_display_value(str(child_key), child_value)
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_display_value(key, child) for child in value[:50]]
+    text = str(value)
+    return text if len(text) <= 500 else text[:497] + "..."
+
+
+def _safe_display_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): _safe_display_value(str(key), value)
+        for key, value in params.items()
+    }
+
 
 class PermissionGate:
     """工具执行权限门控。
@@ -62,15 +125,33 @@ class PermissionGate:
         # CRITICAL 工具不能按工具名整体放行；只记忆参数完全相同的操作。
         self._session_allow_exact: set[str] = set()
         # 外部确认回调：签名 (tool_name, params, risk_level) -> bool
-        self._confirm_callback: Callable[[str, dict, str], bool] | None = None
+        self._confirm_callback: Callable[[str, dict, str], Any] | None = None
+        self._state = PermissionState.IDLE
+        self._last_request: PermissionRequest | None = None
 
-    def set_confirm_callback(self, cb: Callable[[str, dict, str], bool]) -> None:
+    def set_confirm_callback(self, cb: Callable[[str, dict, str], Any]) -> None:
         """设置确认回调（由 REPL 层注入）。"""
         self._confirm_callback = cb
 
     def set_mode(self, mode: PermissionMode) -> None:
         """切换权限模式。"""
         self.mode = mode
+        self._state = PermissionState.IDLE
+
+    @property
+    def state(self) -> PermissionState:
+        """Current state of the last permission check."""
+        return self._state
+
+    @property
+    def last_request(self) -> PermissionRequest | None:
+        """Most recent request, useful for UI/tests and audit logs."""
+        return self._last_request
+
+    @property
+    def session_allowed_tools(self) -> tuple[str, ...]:
+        """Read-only view used by the permissions status command."""
+        return tuple(sorted(self._session_allow))
 
     def _classify(self, tool_name: str, params: dict | None = None) -> str:
         """分类工具风险级别。"""
@@ -110,11 +191,14 @@ class PermissionGate:
         # PLAN 模式：只允许 READ
         if self.mode == PermissionMode.PLAN:
             if risk != "READ":
+                self._state = PermissionState.DENIED
                 return False, f"PLAN 模式禁止 {risk} 操作: {tool_name}"
+            self._state = PermissionState.APPROVED
             return True, ""
 
         # BYPASS 模式：全部允许
         if self.mode == PermissionMode.BYPASS:
+            self._state = PermissionState.APPROVED
             return True, ""
 
         # 会话级别记忆
@@ -122,30 +206,75 @@ class PermissionGate:
             tool_name in self._session_allow
             or self._approval_key(tool_name, params or {}) in self._session_allow_exact
         ):
+            self._state = PermissionState.APPROVED
             return True, ""
 
         # ACCEPT_EDITS 模式：仅 CRITICAL 需要确认
         if self.mode == PermissionMode.ACCEPT_EDITS:
             if risk == "CRITICAL":
                 return self._ask(tool_name, params or {}, risk)
+            self._state = PermissionState.APPROVED
             return True, ""
 
         # DEFAULT 模式：CRITICAL + WRITE 需要确认
         if self.mode == PermissionMode.DEFAULT:
             if risk in ("CRITICAL", "WRITE"):
                 return self._ask(tool_name, params or {}, risk)
+            self._state = PermissionState.APPROVED
             return True, ""
 
+        self._state = PermissionState.APPROVED
         return True, ""
 
     def _ask(self, tool_name: str, params: dict, risk: str) -> tuple[bool, str]:
         """向用户确认。返回 (allowed, reason)。"""
+        self._last_request = PermissionRequest(tool_name, dict(params), risk)
+        self._state = PermissionState.PENDING
         if self._confirm_callback is not None:
-            return self._confirm_callback(tool_name, params, risk)
+            try:
+                response = self._confirm_callback(tool_name, params, risk)
+            except Exception as exc:  # noqa: BLE001 - fail closed at the gate
+                self._state = PermissionState.FAILED
+                return False, f"确认回调失败: {exc}"
+            allowed, reason, decision = self._normalize_response(response)
+            if allowed:
+                if decision is PermissionDecision.ALLOW_SESSION:
+                    if risk == "CRITICAL":
+                        self.allow_exact(tool_name, params)
+                    else:
+                        self.allow_always(tool_name)
+                self._state = PermissionState.APPROVED
+            elif decision is PermissionDecision.CANCEL or "取消" in reason:
+                self._state = PermissionState.CANCELLED
+            else:
+                self._state = PermissionState.DENIED
+            return allowed, reason
 
         # 没有交互确认能力时必须 fail closed。自动化调用方如确实需要跳过
         # 确认，应显式选择 BYPASS，而不是让 DEFAULT 静默失效。
+        self._state = PermissionState.FAILED
         return False, f"{risk} 操作需要确认，但当前没有可用的确认回调"
+
+    @staticmethod
+    def _normalize_response(
+        response: Any,
+    ) -> tuple[bool, str, PermissionDecision | None]:
+        """Accept legacy tuples/bools and the new decision enum."""
+        if isinstance(response, PermissionDecision):
+            if response is PermissionDecision.ALLOW_ONCE:
+                return True, "", response
+            if response is PermissionDecision.ALLOW_SESSION:
+                return True, "", response
+            if response is PermissionDecision.CANCEL:
+                return False, "用户取消任务", response
+            return False, "用户拒绝", response
+        if isinstance(response, tuple) and len(response) == 2:
+            allowed, reason = response
+            if isinstance(allowed, bool):
+                return allowed, str(reason or ""), None
+        if isinstance(response, bool):
+            return response, "" if response else "用户拒绝", None
+        return False, "确认回调返回了无效结果", None
 
     def allow_always(self, tool_name: str) -> None:
         """会话级别：总是允许此工具。"""
@@ -172,6 +301,8 @@ class PermissionGate:
         """清除会话级别记忆。"""
         self._session_allow.clear()
         self._session_allow_exact.clear()
+        self._state = PermissionState.IDLE
+        self._last_request = None
 
     @staticmethod
     def format_confirm_message(tool_name: str, params: dict, risk: str) -> str:
@@ -203,6 +334,19 @@ class PermissionGate:
             server = escape(raw_server or "自动路由")
             target = escape(raw_target)
             lines.append(f"   MCP: [bold white]{server} / {target}[/bold white]")
+
+        # Keep the approval surface useful for tools that do not have a
+        # bespoke one-line renderer (batch writes, refactors, dynamic tools,
+        # and future MCP wrappers).  Sensitive values are summarized rather
+        # than printed into terminal history.
+        if tool_name not in {
+            "command", "write_file", "edit_file", "git", "create_directory", "mcp_call",
+        } and params:
+            safe = _safe_display_params(params)
+            rendered = json.dumps(safe, ensure_ascii=False, sort_keys=True)
+            lines.append(
+                f"   参数: [bold white]{escape(rendered)}[/bold white]"
+            )
 
         lines.append("")
         always_label = "本会话允许相同操作" if risk == "CRITICAL" else "本次会话总是允许"

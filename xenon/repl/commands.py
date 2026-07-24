@@ -3296,7 +3296,8 @@ def _cmd_permissions(*, args: str, session_state: dict[str, Any] | None = None, 
             "  [bold]plan[/bold]         — 只读模式，拒绝所有写入",
             "",
             "用法: /permissions <模式名>",
-            "已记忆允许的工具: " + (", ".join(sorted(gate._session_allow)) if gate._session_allow else "(无)"),
+            f"最近确认状态: {gate.state.value}",
+            "已记忆允许的工具: " + (", ".join(gate.session_allowed_tools) if gate.session_allowed_tools else "(无)"),
         ]
         return "\n".join(lines)
 

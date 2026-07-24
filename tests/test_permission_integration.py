@@ -10,8 +10,15 @@ from rich.console import Console
 from rich.panel import Panel
 
 from xenon.engine.context import AgentContext
+from xenon.engine.callbacks import SilentCallback
+from xenon.engine.react_engine import BUILTIN_TOOLS, ReActEngine
 from xenon.nodes.tool_executor import ToolExecutor, classify_tool
-from xenon.repl.permissions import PermissionGate, PermissionMode
+from xenon.repl.permissions import (
+    PermissionDecision,
+    PermissionGate,
+    PermissionMode,
+    PermissionState,
+)
 
 
 def test_default_gate_fails_closed_without_confirmation_callback():
@@ -21,6 +28,80 @@ def test_default_gate_fails_closed_without_confirmation_callback():
 
     assert allowed is False
     assert "需要确认" in reason
+    assert gate.state is PermissionState.FAILED
+    assert gate.last_request is not None
+    assert gate.last_request.tool_name == "write_file"
+
+
+def test_permission_state_machine_tracks_approval_denial_and_cancel():
+    gate = PermissionGate(PermissionMode.DEFAULT)
+    responses = iter([
+        PermissionDecision.ALLOW_ONCE,
+        PermissionDecision.DENY,
+        PermissionDecision.CANCEL,
+    ])
+    gate.set_confirm_callback(lambda *_args: next(responses))
+
+    assert gate.check("command", {"action": "echo once"}) == (True, "")
+    assert gate.state is PermissionState.APPROVED
+    assert gate.check("command", {"action": "echo no"}) == (False, "用户拒绝")
+    assert gate.state is PermissionState.DENIED
+    assert gate.check("command", {"action": "echo cancel"}) == (False, "用户取消任务")
+    assert gate.state is PermissionState.CANCELLED
+
+
+def test_session_decision_is_applied_by_the_gate():
+    gate = PermissionGate(PermissionMode.DEFAULT)
+    gate.set_confirm_callback(lambda *_args: PermissionDecision.ALLOW_SESSION)
+
+    assert gate.check("write_file", {"file_path": "a.txt"}) == (True, "")
+    assert gate.check("write_file", {"file_path": "b.txt"}) == (True, "")
+    assert gate.state is PermissionState.APPROVED
+
+
+def test_cancel_decision_marks_context_and_tool_result_cancelled():
+    gate = PermissionGate(PermissionMode.DEFAULT)
+    gate.set_confirm_callback(lambda *_args: (False, "用户取消任务"))
+    context = AgentContext()
+
+    result = ToolExecutor(permission_gate=gate).execute(
+        "command",
+        {"action": "echo should-not-run"},
+        context,
+    )
+
+    assert result.success is False
+    assert result.cancelled is True
+    assert context.get("_task_cancelled") is True
+    assert gate.state is PermissionState.CANCELLED
+
+
+def test_react_stops_without_a_second_model_turn_after_cancel(monkeypatch):
+    gate = PermissionGate(PermissionMode.DEFAULT)
+    gate.set_confirm_callback(lambda *_args: (False, "用户取消任务"))
+    callback = SilentCallback()
+    engine = ReActEngine(
+        ["test/model"],
+        tools={"command": BUILTIN_TOOLS["command"]},
+        callback=callback,
+        native_fc=False,
+        permission_gate=gate,
+    )
+    responses = iter([
+        '{"thought":"execute","action":"command","action_input":{"action":"echo hi"}}',
+        '{"final_answer":"this must not be requested"}',
+    ])
+    calls = {"count": 0}
+
+    def fake_llm(*_args, **_kwargs):
+        calls["count"] += 1
+        return next(responses)
+
+    monkeypatch.setattr(engine, "_call_llm_for_phase", fake_llm)
+    result = engine.run("执行命令 echo hi", context=AgentContext())
+
+    assert "用户取消任务" in result
+    assert calls["count"] == 1
 
 
 def test_command_confirmation_displays_normalized_action_and_escapes_markup():
@@ -53,6 +134,21 @@ def test_confirmation_key_hints_survive_real_rich_panel_rendering(risk):
     assert "[n] 拒绝" in rendered
     assert "[a]" in rendered
     assert "[q] 取消任务" in rendered
+
+
+def test_confirmation_message_shows_generic_tool_params_without_secrets():
+    message = PermissionGate.format_confirm_message(
+        "batch_write",
+        {
+            "files": [{"path": "a.py", "content": "secret-value"}],
+            "token": "should-not-print",
+        },
+        "WRITE",
+    )
+
+    assert '"files"' in message
+    assert "should-not-print" not in message
+    assert "masked" in message
 
 
 def test_critical_exact_approval_does_not_allow_a_different_command():

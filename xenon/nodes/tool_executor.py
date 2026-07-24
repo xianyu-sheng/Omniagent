@@ -278,9 +278,12 @@ class ToolExecuteResult:
     attempts: int = 1
     raw: dict[str, Any] | None = field(default=None, repr=False)
     structured: ToolResult | None = field(default=None, repr=False)
+    cancelled: bool = False
 
     def __post_init__(self) -> None:
         """Always expose a structured result, including early failures."""
+        if not self.cancelled:
+            self.cancelled = "取消任务" in (self.error or "")
         if self.structured is None:
             raw = self.raw
             if raw is None:
@@ -439,6 +442,12 @@ class ToolExecutor:
             )
             if not allowed:
                 logger.info(f"权限拒绝: {tool_name} — {reason}")
+                cancelled = "取消任务" in reason
+                if cancelled:
+                    # Engines share this context, so a user pressing q stops
+                    # the current task instead of merely feeding a denial back
+                    # to the model for another attempt.
+                    context.set("_task_cancelled", True)
                 if tracker:
                     tracker.record(tool_name, params, False, reason, error=reason)
                 return ToolExecuteResult(
@@ -446,6 +455,7 @@ class ToolExecutor:
                     f"⛔ 操作被拒绝: {reason}",
                     error=reason,
                     tool_class=tool_class,
+                    cancelled=cancelled,
                 )
         elif tool_class == "SENSITIVE":
             # 无 PermissionGate 时保持旧行为：仅记录

@@ -5,6 +5,18 @@
 
 ## [Unreleased]
 
+### 权限确认与终端交互（第二阶段）
+
+- `PermissionGate` 增加可观测状态机：`PENDING`、`APPROVED`、`DENIED`、
+  `CANCELLED`、`FAILED`，并保留最近一次 `PermissionRequest`，兼容原有
+  `check() -> (allowed, reason)` 接口。
+- 确认面板覆盖批量写入、重构、克隆和动态工具等通用参数，并递归脱敏内容、token、
+  密钥和凭证；`[y] / [n] / [a] / [q]` 显示保持可见。
+- 用户选择 `[q]` 会在共享执行上下文中标记任务取消，ReAct、Plan-Execute 和迷你
+  ReAct 停止后续工具调用，不再把取消误当成普通工具失败继续询问模型。
+- 终端标签页从等待状态恢复运行时先保持首帧一个动画间隔，避免确认面板关闭瞬间出现
+  帧竞争和界面闪烁。
+
 ### 统一工具结果协议（第一阶段）
 
 - 所有 `ToolNode` 结果现在附带 `schema_version=1.0` 和 `tool_result` 结构化视图，

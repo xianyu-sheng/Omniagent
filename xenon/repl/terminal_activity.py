@@ -210,6 +210,19 @@ class TerminalActivityIndicator:
                 )
                 if self._closed:
                     return
+                # ``set_state(RUNNING)`` already emits the first frame.  Wait
+                # one interval before emitting the next one so a WAITING →
+                # RUNNING transition cannot race the confirmation UI or
+                # produce an unexpected frame immediately after it resumes.
+                stopped = self._condition.wait_for(
+                    lambda: self._closed
+                    or self._state is not TerminalActivityState.RUNNING,
+                    timeout=self._interval,
+                )
+                if self._closed:
+                    return
+                if stopped or self._state is not TerminalActivityState.RUNNING:
+                    continue
                 title = self._frames[self._frame_index % len(self._frames)]
                 self._frame_index += 1
                 self._emit_locked(title)
